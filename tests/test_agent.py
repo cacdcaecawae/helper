@@ -116,5 +116,27 @@ class AgentPluginGateTests(unittest.TestCase):
                 self.assertFalse(self.plugin._wanted(message))
 
 
+class AgentPluginConversationTests(unittest.TestCase):
+    """私聊多轮：第二轮能看到第一轮的问答；空行分隔的回复按条发送。"""
+
+    def setUp(self):
+        from wxbot_framework.personality import PersonalityState
+        self.plugin = Plugin()
+        self.plugin.members, self.plugin.friends, self.plugin.tools = None, frozenset({"wxid_friend"}), frozenset()
+        self.plugin.image, self.plugin.memory = None, {}
+        self.sent, self.llm = [], ScriptedLLM({"reply": "推荐《星际穿越》。\n\n周末看正合适。"}, {"reply": "讲的是穿越虫洞找新家园。"})
+        self.ctx = SimpleNamespace(
+            llm=SimpleNamespace(provider="openai_compatible"), logger=SimpleNamespace(warning=lambda *a: None),
+            personality=lambda message: PersonalityState(message.chat_id), personality_guard=lambda state: None,
+            llm_for=lambda message, personality=None: self.llm, trace=lambda *a: None,
+            reply=lambda message, text, delivery_guard=None: self.sent.append(text) or True)
+
+    def test_second_turn_sees_first_turn_and_replies_are_split(self):
+        self.plugin.on_message(Message("推荐个电影", "wxid_friend", "wxid_friend"), self.ctx)
+        self.plugin.on_message(Message("它讲什么的？", "wxid_friend", "wxid_friend"), self.ctx)
+        self.assertEqual(self.sent, ["推荐《星际穿越》。", "周末看正合适。", "讲的是穿越虫洞找新家园。"])
+        self.assertEqual(self.llm.calls[1][1]["history"], [{"对方": "推荐个电影", "你": "推荐《星际穿越》。\n周末看正合适。"}])
+
+
 if __name__ == "__main__":
     unittest.main()
