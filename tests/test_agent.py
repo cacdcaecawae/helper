@@ -197,6 +197,9 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.timeline = FakeTimeline()
         self.plugin = Plugin()
         self.plugin.members = self.timeline
+        wait = patch("plugins.agent_chat.PRIVATE_WAIT", 0)  # 测试里私聊不真等
+        wait.start()
+        self.addCleanup(wait.stop)
         self.plugin.tools, self.plugin.image, self.plugin.per_minute, self.plugin.recent = frozenset(), None, 5, {}
         self.traces = []
         self.sent, self.llm = [], ScriptedLLM({"reply": "推荐《星际穿越》。\n\n周末看正合适。"}, {"reply": "讲的是穿越虫洞找新家园。"})
@@ -256,6 +259,19 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.plugin.on_message(Message("周六有空吗", "wxid_friend", "wxid_friend"), self.ctx)
         self.assertEqual(self.llm.calls[0][1]["chat"], ["10-23 14:00 小王：在吗"])  # 前一条在上下文里
         self.assertEqual(self.llm.calls[0][1]["current"], "周六有空吗")
+
+    def test_private_reply_waits_five_seconds_from_receipt_counting_time_already_queued(self):
+        import time
+        with patch("plugins.agent_chat.PRIVATE_WAIT", 5), patch("plugins.agent_chat.time.sleep") as sleep:
+            for queued in (2, 10):  # 刚收到 2 秒：再等约 3 秒；在队列里已排了 10 秒：不再等
+                self.timeline.add("小王", f"排队{queued}秒")
+                self.plugin.on_message(Message(f"排队{queued}秒", "wxid_friend", "wxid_friend",
+                                               received_at=time.monotonic() - queued), self.ctx)
+            self.say("群里的话", chat="123@chatroom", sender="wxid_x", is_group=True)  # 群聊不等
+        waits = [call.args[0] for call in sleep.call_args_list]
+        self.assertEqual(len(waits), 2)
+        self.assertAlmostEqual(waits[0], 3, delta=0.5)
+        self.assertEqual(waits[1], 0)
 
     def test_rate_limit_skips_replies_beyond_the_per_minute_cap(self):
         self.plugin.per_minute = 2

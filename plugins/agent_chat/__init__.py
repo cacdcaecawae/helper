@@ -22,6 +22,7 @@ from wxbot_framework.speech import deliver_model_reply
 
 TOOLS = ("draw_image", "search_history", "web_search")
 MAX_PARTS = 3
+PRIVATE_WAIT = 5  # 私聊收到后等几秒再回，对方连发的几条合成一次回复
 # 记忆超过 MEMORY_CHARS 字时，像 Codex 的自动压缩一样，把较早部分（连同旧摘要）压成摘要，最近约 KEEP_CHARS 字保留原文。
 # 每次回复都把记忆整份发给模型：发多少只取决于这个上限，与群里聊多少无关，聊得多只会压缩得更勤。
 # 5 万字实测约 7 万 token，约占 gpt-6.1-sol 50 万窗口的 15%。
@@ -80,9 +81,12 @@ class Plugin:
         def trace(kind, text="", status=None):
             ctx.trace(message, run, {"kind": kind, "text": text, **({"status": status} if status else {})})
 
-        if not message.is_group and self.members.has_newer(message):
-            trace("done", "对方又发了消息，合并到最新一条一起回", status="done")
-            return
+        if not message.is_group:
+            # 私聊先等对方说完：从收到起满 PRIVATE_WAIT 秒再看（排队时已等过的不重复等），期间又来了就留给最新那条一起回。
+            time.sleep(max(0.0, PRIVATE_WAIT - (time.monotonic() - message.received_at)))
+            if self.members.has_newer(message):
+                trace("done", "对方又发了消息，合并到最新一条一起回", status="done")
+                return
         if self._too_frequent(message.chat_id):  # 防刷屏：每个会话每分钟最多回 per_minute 次，额度不被刷光
             trace("error", f"一分钟内已回复 {self.per_minute} 次，这条先不回（防刷屏）", status="error")
             return
