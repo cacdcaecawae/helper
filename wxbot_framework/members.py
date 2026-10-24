@@ -190,7 +190,9 @@ class MemberStore:
                     PRIMARY KEY(account,room));
                 CREATE TABLE IF NOT EXISTS agent_turns (
                     id INTEGER PRIMARY KEY, account TEXT NOT NULL, chat TEXT NOT NULL, sender TEXT NOT NULL,
-                    at TEXT NOT NULL, asked TEXT NOT NULL, answered TEXT NOT NULL);
+                    at TEXT NOT NULL, asked TEXT NOT NULL, answered TEXT NOT NULL, speaker TEXT NOT NULL DEFAULT '');
+                CREATE TABLE IF NOT EXISTS agent_summaries (
+                    account TEXT NOT NULL, chat TEXT NOT NULL, summary TEXT NOT NULL, PRIMARY KEY(account,chat));
                 CREATE INDEX IF NOT EXISTS agent_turns_lookup ON agent_turns(account, chat, sender, id);
                 INSERT OR IGNORE INTO room_members SELECT DISTINCT account,room,sender_id FROM messages;
             """)
@@ -198,6 +200,8 @@ class MemberStore:
                 db.execute("ALTER TABLE people ADD COLUMN self_named INTEGER NOT NULL DEFAULT 0")
             if "bot_generated" not in {row["name"] for row in db.execute("PRAGMA table_info(messages)")}:
                 db.execute("ALTER TABLE messages ADD COLUMN bot_generated INTEGER NOT NULL DEFAULT 0")
+            if "speaker" not in {row["name"] for row in db.execute("PRAGMA table_info(agent_turns)")}:
+                db.execute("ALTER TABLE agent_turns ADD COLUMN speaker TEXT NOT NULL DEFAULT ''")
             with db:
                 for room, key, name, display, wxid, aliases in self.profiles:
                     existing = db.execute("SELECT wxid FROM people WHERE account=? AND room=? AND person_key=?",
@@ -250,6 +254,7 @@ class MemberStore:
                 # 智能体对话记忆和聊天记录同一规则：开启每日清理时一起清。
                 if self.daily_clear:
                     db.execute("DELETE FROM agent_turns WHERE account=? AND at<?", (self.account, start))
+                    db.execute("DELETE FROM agent_summaries WHERE account=?", (self.account,))  # 摘要只含今天之前的内容
             self._active_day = day
             return True
 
@@ -261,6 +266,7 @@ class MemberStore:
             with self._connection() as db:
                 count = db.execute("DELETE FROM messages WHERE account=? AND room=?", (self.account, room)).rowcount
                 db.execute("DELETE FROM agent_turns WHERE account=? AND chat=?", (self.account, room))
+                db.execute("DELETE FROM agent_summaries WHERE account=? AND chat=?", (self.account, room))
                 db.execute("UPDATE chat_buffers SET generation=generation+1 WHERE account=? AND room=?",
                            (self.account, room))
             return count
@@ -590,23 +596,32 @@ class MemberStore:
                  int(message.is_self), int(bool(message.data.get("bot_generated")))))
             return result.rowcount > 0
 
-    def agent_history(self, chat, sender, *, limit, since):
-        """智能体和某人在某会话里最近几轮问答（按时间顺序），只取 since 之后的；重启后仍在。"""
+    def agent_memory(self, chat):
+        """智能体在一个群或一个私聊里的记忆：更早对话的摘要，加之后的全部问答（按时间顺序）；重启后仍在。"""
         with self._lock:
             self.rollover()
-            rows = self._connection().execute("""SELECT asked,answered FROM agent_turns
-                WHERE account=? AND chat=? AND sender=? AND at>=? ORDER BY id DESC LIMIT ?""",
-                (self.account, chat, sender, since.astimezone(timezone.utc).isoformat(), limit)).fetchall()
-            return [(row["asked"], row["answered"]) for row in reversed(rows)]
+            db = self._connection()
+            row = db.execute("SELECT summary FROM agent_summaries WHERE account=? AND chat=?", (self.account, chat)).fetchone()
+            turns = db.execute("SELECT id,at,speaker,asked,answered FROM agent_turns WHERE account=? AND chat=? ORDER BY id",
+                               (self.account, chat)).fetchall()
+            return (row[0] if row else ""), [dict(turn) for turn in turns]
 
-    def remember_agent_turn(self, chat, sender, asked, answered, *, keep=20):
-        """记下一轮问答；每个人每个会话只留最近 keep 轮。"""
+    def remember_agent_turn(self, chat, sender, speaker, asked, answered):
+        """记下一轮问答和提问人；不限条数，过长时由调用方用 compact_agent_memory 压缩。"""
         with self._lock, self._connection() as db:
-            db.execute("INSERT INTO agent_turns(account,chat,sender,at,asked,answered) VALUES(?,?,?,?,?,?)",
-                       (self.account, chat, sender, self._now().astimezone(timezone.utc).isoformat(), asked, answered))
-            db.execute("""DELETE FROM agent_turns WHERE account=? AND chat=? AND sender=? AND id NOT IN
-                (SELECT id FROM agent_turns WHERE account=? AND chat=? AND sender=? ORDER BY id DESC LIMIT ?)""",
-                (self.account, chat, sender, self.account, chat, sender, keep))
+            db.execute("INSERT INTO agent_turns(account,chat,sender,speaker,at,asked,answered) VALUES(?,?,?,?,?,?,?)",
+                       (self.account, chat, sender, speaker, self._now().astimezone(timezone.utc).isoformat(), asked, answered))
+
+    def compact_agent_memory(self, chat, summary, upto):
+        """用摘要替换 id<=upto 的问答。期间被 /清空 或跨天清理过（upto 已不在）就放弃，不把清掉的内容写回。"""
+        with self._lock, self._connection() as db:
+            if not db.execute("SELECT 1 FROM agent_turns WHERE account=? AND chat=? AND id=?",
+                              (self.account, chat, upto)).fetchone():
+                return False
+            db.execute("""INSERT INTO agent_summaries VALUES(?,?,?)
+                ON CONFLICT(account,chat) DO UPDATE SET summary=excluded.summary""", (self.account, chat, summary))
+            db.execute("DELETE FROM agent_turns WHERE account=? AND chat=? AND id<=?", (self.account, chat, upto))
+            return True
 
     def search(self, room, keyword, *, limit=20):
         """在本群已保存的群友文字里按关键词查找，按时间顺序返回；不含机器人自己的发言。"""

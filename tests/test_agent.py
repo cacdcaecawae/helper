@@ -117,15 +117,19 @@ class AgentPluginGateTests(unittest.TestCase):
 
 
 class AgentPluginConversationTests(unittest.TestCase):
-    """私聊多轮：第二轮能看到第一轮的问答；空行分隔的回复按条发送。"""
+    """私聊多轮：第二轮能看到第一轮的问答和提问人；空行分隔的回复按条发送；记忆过长时压缩较早部分。"""
 
     def setUp(self):
         from wxbot_framework.personality import PersonalityState
-        turns = []
+        self.turns, self.compacted = [], []
+        turns = self.turns
         self.plugin = Plugin()
         self.plugin.members = SimpleNamespace(
-            agent_history=lambda chat, sender, limit, since: [(a, b) for c, s, a, b in turns if (c, s) == (chat, sender)][-limit:],
-            remember_agent_turn=lambda chat, sender, asked, answered: turns.append((chat, sender, asked, answered)))
+            agent_memory=lambda chat: ("", [turn for turn in turns if turn["chat"] == chat]),
+            remember_agent_turn=lambda chat, sender, speaker, asked, answered: turns.append(
+                {"chat": chat, "id": len(turns) + 1, "at": "2026-10-23T06:00:00+00:00",
+                 "speaker": speaker, "asked": asked, "answered": answered}),
+            compact_agent_memory=lambda chat, summary, upto: self.compacted.append((chat, summary, upto)))
         self.plugin.friends, self.plugin.tools, self.plugin.image = frozenset({"wxid_friend"}), frozenset(), None
         self.sent, self.llm = [], ScriptedLLM({"reply": "推荐《星际穿越》。\n\n周末看正合适。"}, {"reply": "讲的是穿越虫洞找新家园。"})
         self.ctx = SimpleNamespace(
@@ -135,10 +139,25 @@ class AgentPluginConversationTests(unittest.TestCase):
             reply=lambda message, text, delivery_guard=None: self.sent.append(text) or True)
 
     def test_second_turn_sees_first_turn_and_replies_are_split(self):
-        self.plugin.on_message(Message("推荐个电影", "wxid_friend", "wxid_friend"), self.ctx)
-        self.plugin.on_message(Message("它讲什么的？", "wxid_friend", "wxid_friend"), self.ctx)
+        data = {"sender_wechat_name": "小王"}
+        self.plugin.on_message(Message("推荐个电影", "wxid_friend", "wxid_friend", data=data), self.ctx)
+        self.plugin.on_message(Message("它讲什么的？", "wxid_friend", "wxid_friend", data=data), self.ctx)
         self.assertEqual(self.sent, ["推荐《星际穿越》。", "周末看正合适。", "讲的是穿越虫洞找新家园。"])
-        self.assertEqual(self.llm.calls[1][1]["history"], [{"对方": "推荐个电影", "你": "推荐《星际穿越》。\n周末看正合适。"}])
+        second = self.llm.calls[1][1]
+        self.assertEqual((second["scene"], second["name"], second["summary"]), ("私聊", "小王", ""))
+        self.assertEqual(second["history"], [{"时间": "10-23 14:00", "提问人": "小王", "问": "推荐个电影",
+                                              "你答": "推荐《星际穿越》。\n周末看正合适。"}])
+        self.assertEqual(self.compacted, [])
+
+    def test_long_memory_compacts_older_turns_and_keeps_recent_ones(self):
+        from plugins.agent_chat import KEEP_RECENT, MEMORY_CHARS
+        for index in range(KEEP_RECENT + 5):
+            self.plugin.members.remember_agent_turn("wxid_friend", "wxid_friend", "小王", f"问{index}", "长" * (MEMORY_CHARS // 10))
+        summarizer = SimpleNamespace(calls=[], complete_json=lambda system, user: summarizer.calls.append(json.loads(user))
+                                     or {"summary": "小王问过 5 个问题"})
+        self.plugin._compact("wxid_friend", SimpleNamespace(llm=summarizer))
+        self.assertEqual([turn["问"] for turn in summarizer.calls[0]["turns"]], [f"问{index}" for index in range(5)])
+        self.assertEqual(self.compacted, [("wxid_friend", "小王问过 5 个问题", 5)])
 
 
 if __name__ == "__main__":

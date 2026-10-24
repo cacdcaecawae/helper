@@ -53,20 +53,23 @@ class MemberTests(unittest.TestCase):
     def message(self, text="中文消息 🌸", sender=JING, sequence=1, **kwargs):
         return Message(text, ROOM, sender_id=sender, is_group=True, sequence=sequence, session_id="first", **kwargs)
 
-    def test_agent_turns_survive_a_new_store_and_follow_clear_and_limits(self):
-        from datetime import datetime, timedelta, timezone
-        since = datetime.now(timezone.utc) - timedelta(hours=1)
+    def test_agent_memory_is_shared_per_chat_survives_restart_compacts_and_follows_clear(self):
         for index in range(25):
-            self.store.remember_agent_turn(ROOM, JING, f"问{index}", f"答{index}")
-        self.store.remember_agent_turn("wxid_friend", "wxid_friend", "私聊问", "私聊答")
+            sender, speaker = (JING, "成员乙") if index % 2 else (SMALL, "成员甲")
+            self.store.remember_agent_turn(ROOM, sender, speaker, f"问{index}", f"答{index}")
+        self.store.remember_agent_turn("wxid_friend", "wxid_friend", "好友", "私聊问", "私聊答")
         reopened = self.create_store()  # 模拟重启：新的连接读同一个库
-        self.assertEqual(reopened.agent_history(ROOM, JING, limit=3, since=since), [("问22", "答22"), ("问23", "答23"), ("问24", "答24")])
-        self.assertEqual(len(reopened.agent_history(ROOM, JING, limit=100, since=since)), 20)
-        self.assertEqual(reopened.agent_history(ROOM, SMALL, limit=6, since=since), [])
-        self.assertEqual(reopened.agent_history(ROOM, JING, limit=6, since=datetime.now(timezone.utc) + timedelta(minutes=1)), [])
+        summary, turns = reopened.agent_memory(ROOM)
+        self.assertEqual((summary, len(turns)), ("", 25))  # 不限条数，群里所有人共用一份
+        self.assertEqual([(turn["speaker"], turn["asked"]) for turn in turns[:2]], [("成员甲", "问0"), ("成员乙", "问1")])
+        self.assertTrue(reopened.compact_agent_memory(ROOM, "前 20 轮的摘要", turns[19]["id"]))
+        summary, turns = reopened.agent_memory(ROOM)
+        self.assertEqual((summary, [turn["asked"] for turn in turns]), ("前 20 轮的摘要", [f"问{i}" for i in range(20, 25)]))
         reopened.clear(ROOM)
-        self.assertEqual(reopened.agent_history(ROOM, JING, limit=6, since=since), [])
-        self.assertEqual(reopened.agent_history("wxid_friend", "wxid_friend", limit=6, since=since), [("私聊问", "私聊答")])
+        self.assertEqual(reopened.agent_memory(ROOM), ("", []))
+        self.assertFalse(reopened.compact_agent_memory(ROOM, "清空后不能写回", turns[-1]["id"]))
+        self.assertEqual(reopened.agent_memory(ROOM), ("", []))
+        self.assertEqual([turn["asked"] for turn in reopened.agent_memory("wxid_friend")[1]], ["私聊问"])
 
     def test_keyword_search_returns_room_text_in_order_without_bot_replies(self):
         self.store.record(self.message("周六晚上开黑", sequence=1))
