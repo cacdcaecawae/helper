@@ -10,7 +10,16 @@ from ipaddress import ip_address
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    # 请求都带密钥；urllib 跟随重定向时会把 Authorization 带到新地址（可能是别的域名或明文 HTTP），一律不跟随。
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+urlopen = build_opener(_NoRedirect()).open
 
 
 class LLMError(RuntimeError):

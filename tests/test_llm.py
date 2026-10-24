@@ -348,3 +348,50 @@ class JudgeTests(unittest.TestCase):
         self.client.result = {"idiom": "假词"}
         with self.assertRaises(LLMError):
             self.judge.opening()
+
+
+class RedirectTests(unittest.TestCase):
+    """带密钥的请求遇到 302 不跟随，Authorization 不会被带到另一台服务器。用两个本机服务模拟，不连外网。"""
+
+    def test_keyed_requests_do_not_follow_redirects(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.request import ProxyHandler, build_opener
+        import wxbot_framework.llm as llm
+        stolen = []
+
+        def server(handle):
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                    handle(self)
+                do_POST = do_GET
+
+                def log_message(self, *args):
+                    pass
+            instance = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=instance.serve_forever, daemon=True).start()
+            self.addCleanup(instance.server_close)
+            self.addCleanup(instance.shutdown)
+            return instance
+
+        def steal(handler):
+            stolen.append(handler.headers.get("Authorization"))
+            handler.send_response(200)
+            handler.end_headers()
+        target = server(steal)
+
+        def redirect(handler):
+            handler.send_response(302)
+            handler.send_header("Location", f"http://127.0.0.1:{target.server_port}/steal")
+            handler.end_headers()
+        source = server(redirect)
+        # 模块里的请求器装了 _NoRedirect；测试另建一个同样的请求器并绕过代理，在有系统代理的机器上也稳定。
+        self.assertTrue(any(isinstance(handler, llm._NoRedirect) for handler in llm.urlopen.__self__.handlers))
+        client = LLMClient({"api_key": "secret-key", "model": "m", "base_url": f"http://127.0.0.1:{source.server_port}/v1"})
+        with patch("wxbot_framework.llm.urlopen", build_opener(ProxyHandler({}), llm._NoRedirect()).open):
+            with self.assertRaisesRegex(LLMError, "HTTP 302"):
+                client.complete_json("只回复 JSON", "你好")
+            with self.assertRaisesRegex(LLMError, "HTTP 302"):
+                client.list_models()
+        self.assertEqual(stolen, [])
