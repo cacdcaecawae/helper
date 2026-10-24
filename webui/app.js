@@ -8,7 +8,7 @@
     const button = document.querySelector('#theme-toggle');
     if (!button) return;
     const target = theme === 'dark' ? '亮色' : '暗色';
-    button.querySelector('span').textContent = target;
+    button.querySelector('span').textContent = '切换到' + target;
     button.setAttribute('aria-label', '切换到' + target); button.title = '切换到' + target;
   }
   const preferredTheme = () => preference || (systemTheme.matches ? 'dark' : 'light');
@@ -101,7 +101,12 @@ function renderRobotOptions() {
   // 左上角和微信一样显示当前账号的头像。
   const current=robotRows.find(row=>row.id===robot),name=current?profileLabel(current):'';
   $('.brand').innerHTML=name?chatAvatar(name):'';
-  $('#robot-select').title=name?'当前账号：'+name:'切换账号';
+  $('.brand').title=name||'账号菜单';$('#account-label').textContent=name;
+  // 头像菜单：账号列表由隐藏的 #robot-select 生成，切换仍走它的 change 事件。
+  const locked=$('#robot-select').disabled,selected=options.find(row=>row.value===robot);
+  $('#menu-account-name').textContent=name||'未选择账号';
+  $('#menu-account-state').textContent=selected?selected.label.split(' · ').pop():'';
+  $('#menu-accounts').innerHTML=options.map(row=>`<button type="button" class="menu-item" role="menuitemradio" aria-checked="${row.value===robot}" data-robot="${escape(row.value)}" ${row.disabled||locked?'disabled':''}><span class="menu-text">${escape(row.label)}</span>${row.value===robot?'<svg class="menu-trail" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>':''}</button>`).join('');
 }
 function renderState() {
   const unavailable=!serviceAvailable;
@@ -568,6 +573,11 @@ async function switchRobot(identifier){
   $('#discovered-chats').className='empty';$('#discovered-chats').textContent='暂无已接收消息的群。';
   await loadConfig();await poll();navigate();
 }
+$('#account-menu').addEventListener('click',event=>{
+  const item=event.target.closest('.menu-item');if(!item||item.disabled)return;
+  if(item.dataset.robot&&item.dataset.robot!==robot){const select=$('#robot-select');select.value=item.dataset.robot;select.dispatchEvent(new Event('change'));}
+  $('#account-menu').hidePopover();
+});
 $('#robot-select').onchange=event=>{
   const value=event.target.value;
   action(async()=>{
