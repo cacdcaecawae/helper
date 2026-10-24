@@ -124,7 +124,7 @@ function renderRobotOptions() {
 }
 function renderState() {
   const unavailable=!serviceAvailable;
-  $('#robot-select').disabled=busy||unavailable;
+  $('#robot-select').disabled=busy||unavailable||!!pendingSend;  // 发送途中不能切换账号
   $('#discover-chats').disabled=busy||unavailable||!state||!activeStates.includes(state.state);
   renderRobotOptions();renderAccounts();renderMessages();
   const running=!!state&&activeStates.includes(state.state);
@@ -402,7 +402,12 @@ async function pollSendStatus() {
     if(result.status==='sent'){$('#send-content').value='';chatDrafts.delete(job.robot+':'+job.chat);sendFeedback('已发送');}
     else sendFeedback(result.error||'发送未完成，请核对微信后再重发',true);
     renderSendState();
-  } catch(error) {if(pendingSend===job)sendFeedback('暂时无法查询发送结果，请先核对微信。不会自动重发。',true);}
+  } catch(error) {
+    if(pendingSend!==job)return;
+    // 服务端明确答复（如发送记录已失效）就结束等待，不让输入框和账号切换一直锁着；连不上服务时继续重查。
+    if(error.status){pendingSend=null;renderSendState();}
+    sendFeedback('暂时无法查询发送结果，请先核对微信。不会自动重发。',true);
+  }
   finally {sendPolling=false;}
 }
 async function submitSendNow(event){
@@ -661,6 +666,8 @@ $('#account-menu').addEventListener('click',event=>{
 });
 $('#robot-select').onchange=event=>{
   const value=event.target.value;
+  // 切走会丢掉发送跟踪，切回后已发出的正文又成了草稿，容易重发；头像菜单的切换也走这里。
+  if(pendingSend){event.target.value=robot;toast('消息正在发送，等结果出来再切换账号',true);return;}
   action(async()=>{
     if(value.startsWith('account:')) {
       const account=loggedAccounts.find(row=>'account:'+accountKey(row)===value);
