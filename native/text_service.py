@@ -282,6 +282,10 @@ class NativeTextService(NativeFileHelperService):
         except ValueError:
             return None
 
+    def remember_chat(self, chat):
+        """登记一个本次还没来消息的会话（如开了长期记忆的），顺带读名字。"""
+        self._remember_chat(chat, chat.endswith("@chatroom"))
+
     def _remember_chat(self, chat, group):
         entry = self.chats.setdefault(chat, {"chat_id": chat, "is_group": group})
         if not entry.get("name"):

@@ -5,6 +5,7 @@ from collections import deque
 from concurrent.futures import TimeoutError as ControlTimeout
 from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime
 import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -443,9 +444,42 @@ class PanelController:
 
     def chats(self):
         def query(app):
-            rows = app.backend.chats() if app.backend and hasattr(app.backend, 'chats') else []
-            members = getattr(app, 'members', None)  # 每个会话带上聊天页的两个开关
-            return [dict(row, **members.chat_setting(row['chat_id'])) if members else dict(row) for row in rows]
+            backend, members = app.backend, getattr(app, 'members', None)
+            rows = backend.chats() if backend and hasattr(backend, 'chats') else []
+            if members is None:
+                return [dict(row) for row in rows]
+            # 开了长期记忆、本次还没来消息的会话也列出来（重开管理台后能点进去看以前的聊天）
+            known = {row['chat_id'] for row in rows}
+            missing = [chat for chat in members.remembered_chats() if chat not in known]
+            if missing and hasattr(backend, 'remember_chat'):
+                for chat in missing:
+                    backend.remember_chat(chat)
+                rows = backend.chats()
+            result = []
+            for row in rows:
+                item = dict(row, **members.chat_setting(row['chat_id']))  # 每个会话带上聊天页的两个开关
+                last = members.chat_history(row['chat_id'], limit=1)
+                if last:
+                    item['preview'] = self._history_row(row['chat_id'], last[0])
+                result.append(item)
+            return result
+        return self._call(query)
+
+    @staticmethod
+    def _history_row(chat, line):
+        stamp = datetime.fromisoformat(line['at']).timestamp()
+        return {'id': 'h' + str(line['id']), 'history': True, 'chat_id': chat, 'is_group': chat.endswith('@chatroom'),
+                'timestamp': stamp, 'date': beijing(stamp, '%Y-%m-%d'), 'time': beijing(stamp, '%H:%M:%S'),
+                'sender_name': line['name'], 'content': line['text'], 'direction': 'outgoing' if line['own'] else 'incoming'}
+
+    def chat_history(self, chat, before=None):
+        """开了长期记忆的会话以前的聊天，接在管理台本次显示的消息前面。"""
+        chat = validate_target(chat)
+        before = float(before) if before not in (None, '') else None
+        def query(app):
+            members = getattr(app, 'members', None)
+            lines = members.chat_history(chat, before=before) if members is not None else []
+            return {'rows': [self._history_row(chat, line) for line in lines]}
         return self._call(query)
 
     def set_chat_settings(self, data):
@@ -662,6 +696,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return self.send(200, hub.logged_accounts() if hub is not None else {'accounts': controller.accounts()})
             if path == '/api/chats':
                 return self.send(200, {'chats': controller.chats()})
+            if path == '/api/chat-history':
+                query = parse_qs(parsed.query)
+                return self.send(200, controller.chat_history(query.get('chat', [''])[0], query.get('before', [None])[0]))
             if path == '/api/group-members':
                 return self.send(200, controller.group_members(parse_qs(parsed.query).get('room', [''])[0]))
             if path == '/api/send-connection':

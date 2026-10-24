@@ -92,6 +92,9 @@ class NativeTextBackend(NativeFileHelperBackend):
     def chats(self):
         return list(self.raw.chats.values())
 
+    def remember_chat(self, chat_id):
+        self.raw.remember_chat(chat_id)
+
     def send_at_text(self, room_wxid, content, at_list):
         return self.raw.send_at_text(room_wxid, content, at_list)
 

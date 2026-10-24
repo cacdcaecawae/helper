@@ -133,6 +133,9 @@ class RobotProxy:
     def plugin_action(self, data): return self.request('plugin', data)
     def llm_models(self, data): return self.request('llm-models', data)
     def set_chat_settings(self, data): return self.request('chat-settings', data)
+    def chat_history(self, chat, before=None):
+        from urllib.parse import urlencode
+        return self.request('chat-history?' + urlencode({'chat': chat, **({'before': before} if before else {})}))
 
 
 class RobotHub:

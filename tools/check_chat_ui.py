@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import threading
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 ROOT=Path(__file__).resolve().parents[1]
 TOKEN='synthetic-ui-token'
@@ -13,6 +13,11 @@ TOKEN='synthetic-ui-token'
 class Fixture:
     def __init__(self):
         self.switches={}
+        # 开了长期记忆、本次还没来消息的会话：重开管理台后从库里取以前的聊天
+        self.history=[{'id':'h1','history':True,'chat_id':'wxid_ui_old','is_group':False,'timestamp':1792300000,'date':'2026-10-18','time':'20:26:40',
+                       'sender_name':'老同学','content':'下周同学聚会你来吗？','direction':'incoming'},
+                      {'id':'h2','history':True,'chat_id':'wxid_ui_old','is_group':False,'timestamp':1792300100,'date':'2026-10-18','time':'20:28:20',
+                       'sender_name':'我','content':'来，记得订位','direction':'outgoing'}]
         self.sent=[]
         self.messages=[
             {'id':1,'revision':1,'chat_id':'wxid_ui_peer','sender_id':'wxid_ui_peer','sender_name':'周屿','content':'这是一条合成消息，仅供界面测试。','date':'2026-10-23','time':'09:30','is_group':False,'direction':'incoming'},
@@ -28,7 +33,11 @@ class Fixture:
         if name=='logs':return {'rows':[],'cursor':0}
         if name=='messages':return {'rows':self.messages,'cursor':len(self.messages),'stream_id':'synthetic-stream'}
         if name=='chats':return {'chats':[{'chat_id':'wxid_ui_peer','name':'周屿','is_group':False,**self.switches.get('wxid_ui_peer',{'memory':False,'reply':False})},
-                                          {'chat_id':'fixture_group@chatroom','name':'课题组','is_group':True,**self.switches.get('fixture_group@chatroom',{'memory':True,'reply':False})}]}
+                                          {'chat_id':'fixture_group@chatroom','name':'课题组','is_group':True,**self.switches.get('fixture_group@chatroom',{'memory':True,'reply':False})},
+                                          {'chat_id':'wxid_ui_old','name':'老同学','is_group':False,'memory':True,'reply':False,'preview':self.history[-1]}]}
+        if name=='chat-history':
+            chat=parse_qs(urlsplit(path).query).get('chat',[''])[0]
+            return {'rows':self.history if chat=='wxid_ui_old' else []}
         if name=='send-connection':return {'session_id':'synthetic-session'}
         if name=='group-members':return {'session_id':'synthetic-session','members':[{'wxid':'wxid_ui_member','nickname':'成员甲','role':'admin'}]}
         if name=='send-status':return {'status':'sent'}

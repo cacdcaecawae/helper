@@ -38,6 +38,19 @@ let sendMembers = [], mentionSelection = new Set(), sendSession = '', sendGenera
 let chatRows=[], chatLoadKey='', chatTimelineSignature='', chatConfirm=null, chatDraftId='';
 let chatListMarkup='', chatTimelineTarget='';
 const chatDrafts=new Map();
+// 开了长期记忆的会话，点开时从库里取以前的聊天，接在本次收到的消息前面。
+const chatHistory=new Map(),historyLoading=new Set();
+async function loadChatHistory(chat){
+  const key=robot+':'+chat,requested=robot;
+  if(!chat||chatHistory.has(key)||historyLoading.has(key))return;
+  historyLoading.add(key);
+  const live=messages.filter(message=>message.chat_id===chat&&message.timestamp).map(message=>message.timestamp);
+  const before=live.length?Math.min(...live):0;  // 只取本次已显示消息之前的，两段接上不重复
+  try{
+    const {rows}=await api('chat-history?chat='+encodeURIComponent(chat)+(before?'&before='+before:''),undefined,requested);
+    if(requested===robot){chatHistory.set(key,rows);chatTimelineSignature='';renderChatWorkspace();}
+  }catch{}finally{historyLoading.delete(key);}
+}
 const accountKey = row => row.pid + ':' + row.wxid;
 const activeStates = ['starting','running','stopping'];
 const profileLabel = row => loggedAccounts.find(account=>account.wxid===row?.account)?.name || row?.account || (row?.id==='default'?'默认配置':row?.name) || '当前账号';
@@ -336,7 +349,9 @@ async function loadSendChats() {
     if(!rows.some(row=>row.chat_id==='filehelper'))rows.unshift({chat_id:'filehelper',name:'文件传输助手'});
     chatRows=rows;
     $('#send-chat').innerHTML='<option value="">选择会话</option>'+rows.map(row=>`<option value="${escape(row.chat_id)}">${escape(row.name||row.chat_id)}${row.name?' · '+escape(row.chat_id):''}</option>`).join('');
-    if(rows.some(row=>row.chat_id===previous))$('#send-chat').value=previous;
+    // 重开管理台时回到上次看的会话
+    let wanted=previous;if(!wanted)try{wanted=localStorage.getItem('helper-last-chat:'+requested)||'';}catch{}
+    if(rows.some(row=>row.chat_id===wanted)){$('#send-chat').value=wanted;if(wanted!==previous)restoreChatDraft(wanted);}
     sendSession=connection.session_id;sendFeedback('');
   } catch(error) {if(requested===robot&&generation===sendGeneration)sendFeedback(error.message,true);}
   finally {if(requested===robot&&generation===sendGeneration){sendLoading=false;renderSendState();}}
@@ -348,6 +363,7 @@ async function selectSendChat() {
   $('#send-group').classList.toggle('hidden',!room.endsWith('@chatroom'));renderSendMembers();
   renderChatWorkspace();
   if(!room){renderSendState();return;}
+  loadChatHistory(room);
   sendSession='';sendLoading=true;sendFeedback('正在读取…');renderSendState();
   try {
     const data=await api(room.endsWith('@chatroom')?'group-members?room='+encodeURIComponent(room):'send-connection',undefined,requested);
@@ -455,13 +471,16 @@ function renderChatWorkspace(){
     if(!all.has(message.chat_id))all.set(message.chat_id,{chat_id:message.chat_id,name:message.chat_name||message.chat_id});
     all.get(message.chat_id).last=message;
   }
+  for(const row of all.values())if(!row.last&&row.preview)row.last=row.preview;  // 本次没来消息的，用库里最后一条做预览
   if(connected&&[...all.values()].some(row=>!row.name||row.name===row.chat_id))refreshChatNames();
   const selected=$('#send-chat').value,query=$('#chat-filter').value.trim().toLowerCase();
   const rows=[...all.values()].filter(row=>!query||[row.name,row.chat_id,row.last?.content].some(v=>String(v||'').toLowerCase().includes(query)));
-  rows.sort((a,b)=>(b.last?.id||0)-(a.last?.id||0));
+  // 本次有消息的按到达先后排在前面；只有以前聊天的（库里预览）排在后面，按时间。
+  const rank=row=>row.last?(row.last.history?1:2):0;
+  rows.sort((a,b)=>rank(b)-rank(a)||(rank(a)===2?(b.last.id||0)-(a.last.id||0):(b.last?.timestamp||0)-(a.last?.timestamp||0)));
   const listMarkup=rows.map(row=>{
     const name=row.name&&row.name!==row.chat_id?row.name:shortChatId(row.chat_id),last=row.last;
-    return `<button type="button" class="hc-session ${row.chat_id===selected?'selected':''}" data-chat="${escape(row.chat_id)}" aria-label="打开会话 ${escape(name)}" ${pendingSend?'disabled':''}>${chatAvatar(name)}<span class="hc-session-info"><span class="hc-session-row"><strong>${escape(name)}</strong><time>${escape(last?.time||'')}</time></span><span class="hc-preview">${escape(last?.content||'暂无本次连接的消息')}</span></span></button>`;
+    return `<button type="button" class="hc-session ${row.chat_id===selected?'selected':''}" data-chat="${escape(row.chat_id)}" aria-label="打开会话 ${escape(name)}" ${pendingSend?'disabled':''}>${chatAvatar(name)}<span class="hc-session-info"><span class="hc-session-row"><strong>${escape(name)}</strong><time>${escape(last?.history?String(last.date).slice(5)+' '+String(last.time).slice(0,5):last?.time||'')}</time></span><span class="hc-preview">${escape(last?.content||'暂无本次连接的消息')}</span></span></button>`;
   }).join('')||`<p class="hc-empty-list">${query?'没有匹配的会话':connected?'等待消息，或刷新会话':'先在账号管理中启动一个账号'}</p>`;
   if(listMarkup!==chatListMarkup){chatListMarkup=listMarkup;$('#chat-conversations').innerHTML=listMarkup;}
   const row=all.get(selected),name=row?.name&&row.name!==selected?row.name:shortChatId(selected);
@@ -472,7 +491,7 @@ function renderChatWorkspace(){
   $('#chat-switch-hint').textContent=switchHint.chat===selected?switchHint.text:'';
   $('#chat-mention-toggle').classList.toggle('hidden',!selected.endsWith('@chatroom'));
   $('#chat-mention-toggle').textContent='@'+(mentionSelection.size?' '+mentionSelection.size:'');
-  const timeline=messages.filter(message=>message.chat_id===selected);
+  const timeline=[...(chatHistory.get(robot+':'+selected)||[]),...messages.filter(message=>message.chat_id===selected)];
   const signature=JSON.stringify([robot,selected,timeline,connected]);
   if(signature===chatTimelineSignature)return;
   chatTimelineSignature=signature;
@@ -529,6 +548,7 @@ $('#chat-conversations').onclick=event=>{
     const option=document.createElement('option');option.value=id;option.textContent=id;$('#send-chat').append(option);
   }
   $('#send-chat').value=id;restoreChatDraft(id);
+  try{localStorage.setItem('helper-last-chat:'+robot,id);}catch{}
   $('#page-chat').classList.add('chat-detail-open');$('#chat-conversation').classList.remove('chat-mentions-open');
   selectSendChat();
 };

@@ -116,6 +116,24 @@ class MemberTests(unittest.TestCase):
         self.assertEqual(self.store.backfill(friend, rows), 0)  # 再补一次不会重复
         self.assertEqual(self.store.backfill("wxid_off", rows), 0)  # 没开长期记忆的会话不补
 
+    def test_chat_history_for_reopening_the_console(self):
+        clock = [datetime(2026, 10, 19, 4, 0, tzinfo=timezone.utc)]
+        store = MemberStore(self.config_path, ROBOT, now=lambda: clock[0])
+        self.stores.append(store)
+        friend = "wxid_friend"
+        self.assertEqual(store.chat_history(friend), [])  # 没开长期记忆，没有以前的聊天
+        store.set_chat(friend, memory=True, reply=False)
+        for index, text in enumerate(("第一句", "第二句", "第三句"), 1):
+            store.record(Message(text, friend, ROBOT if index == 2 else friend, is_self=index == 2,
+                                 session_id="first", sequence=index, data={"sender_wechat_name": "小王"}))
+            clock[0] += timedelta(minutes=1)
+        self.assertEqual([(row["name"], row["text"]) for row in store.chat_history(friend)],
+                         [("小王", "第一句"), ("我", "第二句"), ("小王", "第三句")])
+        self.assertEqual([row["text"] for row in store.chat_history(friend, limit=1)], ["第三句"])
+        third = datetime(2026, 10, 19, 4, 2, tzinfo=timezone.utc).timestamp()  # 本次窗口从第三句开始显示
+        self.assertEqual([row["text"] for row in store.chat_history(friend, before=third)], ["第一句", "第二句"])
+        self.assertIn(friend, store.remembered_chats())
+
     def test_private_chat_and_spoken_replies_are_recorded(self):
         friend = "wxid_friend"
         private = lambda text, sequence, chat=friend, **kwargs: Message(text, chat, chat, session_id="first",

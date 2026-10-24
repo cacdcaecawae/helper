@@ -156,6 +156,12 @@ class ControllerTests(PanelFixture):
             def backfill(self, chat, rows):
                 self.backfilled.append([row['content'] for row in rows])
                 return len(rows)
+
+            def remembered_chats(self):
+                return [chat for chat, setting in self.settings.items() if setting['memory']]
+
+            def chat_history(self, chat, **options):
+                return []
         self.controller.start()
         self.controller.app.members = members = Members()
         self.controller.messages.append(Message('周六有空吗', '123@chatroom', 'wxid_a', is_group=True), account='wxid_test_robot')
@@ -170,6 +176,37 @@ class ControllerTests(PanelFixture):
         self.assertEqual({key: self.controller.chats()[0][key] for key in ('memory', 'reply')}, {'memory': True, 'reply': False})
         with self.assertRaises(ValueError):
             self.controller.set_chat_settings({'chat_id':'../x', 'memory':True, 'reply':False})
+        self.wait_stopped()
+
+    def test_remembered_chats_are_listed_and_history_loads_after_restart(self):
+        class Members:
+            def remembered_chats(self):
+                return ['wxid_old_friend']
+
+            def chat_setting(self, chat):
+                return {'memory': chat == 'wxid_old_friend', 'reply': False}
+
+            def chat_history(self, chat, *, before=None, limit=200):
+                if chat != 'wxid_old_friend':
+                    return []
+                lines = [{'id': 7, 'at': '2026-10-21T00:00:00+00:00', 'text': '周六见', 'own': False, 'name': '老王'},
+                         {'id': 8, 'at': '2026-10-21T00:01:00+00:00', 'text': '好', 'own': True, 'name': '我'}]
+                return lines[-limit:]
+        self.controller.start()
+        app = self.controller.app
+        native = [{'chat_id':'123@chatroom','is_group':True}]
+        app.backend = SimpleNamespace(pid=1234, chats=lambda: list(native),
+                                      remember_chat=lambda chat: native.append({'chat_id': chat, 'is_group': False, 'name': '老王'}))
+        app.members = Members()
+        rows = {row['chat_id']: row for row in self.controller.chats()}
+        # 本次还没来消息、但开了长期记忆的会话也列出来，名字照常由原生层读，预览是库里最后一条
+        self.assertEqual((rows['wxid_old_friend']['name'], rows['wxid_old_friend']['preview']['content']), ('老王', '好'))
+        self.assertNotIn('preview', rows['123@chatroom'])
+        history = self.controller.chat_history('wxid_old_friend')['rows']
+        self.assertEqual([(row['sender_name'], row['content'], row['direction'], row['date'], row['time']) for row in history],
+                         [('老王', '周六见', 'incoming', '2026-10-21', '08:00:00'), ('我', '好', 'outgoing', '2026-10-21', '08:01:00')])
+        with self.assertRaises(ValueError):
+            self.controller.chat_history('../x')
         self.wait_stopped()
 
     def test_multi_account_requires_explicit_binding_and_stale_selection_rejected(self):

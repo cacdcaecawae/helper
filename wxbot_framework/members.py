@@ -590,6 +590,28 @@ class MemberStore:
         self._settings()
         return chat in self.reply_chats
 
+    def remembered_chats(self):
+        self._settings()
+        return sorted(self.groups | self.private_chats)
+
+    def chat_history(self, chat, *, before=None, limit=200):
+        """聊天页重开时显示的以前的聊天：开了长期记忆的会话最近 limit 条原文（含已压缩的），按时间顺序。
+        before 为 Unix 时间时只取它 2 秒之前的，和管理台本次已显示的消息接上而不重复。"""
+        if not self.remembers(chat):
+            return []
+        sql, values = "SELECT id,sender_id,text,received_at,is_self FROM messages WHERE account=? AND room=?", [self.account, chat]
+        if before is not None:
+            sql += " AND received_at<?"
+            values.append(datetime.fromtimestamp(before - 2, timezone.utc).isoformat())
+        with self._lock:
+            rows = self._connection().execute(sql + " ORDER BY id DESC LIMIT ?", values + [limit]).fetchall()
+            names = {}
+            for row in rows:
+                if not row["is_self"] and row["sender_id"] not in names:
+                    names[row["sender_id"]] = self.display_name(row["sender_id"], chat) or "群友"
+            return [{"id": row["id"], "at": row["received_at"], "text": row["text"], "own": bool(row["is_self"]),
+                     "name": "我" if row["is_self"] else names[row["sender_id"]]} for row in reversed(rows)]
+
     def chat_setting(self, chat):
         return {"memory": self.remembers(chat), "reply": self.replies(chat)}
 
