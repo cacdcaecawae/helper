@@ -156,14 +156,24 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.assertIn("search_memory", self.plugin._toolbox(message, self.ctx, None, compacted=True))
 
     def test_long_memory_compacts_older_turns_and_keeps_recent_ones(self):
-        from plugins.agent_chat import KEEP_RECENT, MEMORY_CHARS
-        for index in range(KEEP_RECENT + 5):
-            self.plugin.members.remember_agent_turn("wxid_friend", "wxid_friend", "小王", f"问{index}", "长" * (MEMORY_CHARS // 10))
+        from plugins.agent_chat import KEEP_CHARS, MEMORY_CHARS
+        self.assertEqual(MEMORY_CHARS, 2 * KEEP_CHARS)
+        # 每轮约 KEEP_CHARS/4 字，9 轮超过上限；最近 3 轮（不到 KEEP_CHARS）留原文，前 6 轮压缩。
+        for index in range(9):
+            self.plugin.members.remember_agent_turn("wxid_friend", "wxid_friend", "小王", f"问{index}", "长" * (KEEP_CHARS // 4))
         summarizer = SimpleNamespace(calls=[], complete_json=lambda system, user: summarizer.calls.append(json.loads(user))
-                                     or {"summary": "小王问过 5 个问题"})
+                                     or {"summary": "小王问过 6 个问题"})
         self.plugin._compact("wxid_friend", SimpleNamespace(llm=summarizer))
-        self.assertEqual([turn["问"] for turn in summarizer.calls[0]["turns"]], [f"问{index}" for index in range(5)])
-        self.assertEqual(self.compacted, [("wxid_friend", "小王问过 5 个问题", 5)])
+        self.assertEqual([turn["问"] for turn in summarizer.calls[0]["turns"]], [f"问{index}" for index in range(6)])
+        self.assertEqual(self.compacted, [("wxid_friend", "小王问过 6 个问题", 6)])
+
+    def test_compaction_always_keeps_the_last_two_turns(self):
+        from plugins.agent_chat import MEMORY_CHARS
+        for index in range(3):  # 单轮就超过保留字数时，仍至少留最近 2 轮原文
+            self.plugin.members.remember_agent_turn("wxid_friend", "wxid_friend", "小王", f"问{index}", "长" * MEMORY_CHARS)
+        summarizer = SimpleNamespace(complete_json=lambda system, user: {"summary": "很长的第一轮"})
+        self.plugin._compact("wxid_friend", SimpleNamespace(llm=summarizer))
+        self.assertEqual(self.compacted, [("wxid_friend", "很长的第一轮", 1)])
 
 
 if __name__ == "__main__":
