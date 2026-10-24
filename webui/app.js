@@ -242,6 +242,9 @@ $('#llm-model-select').onchange = e => {
   if (e.target.value) input.value = e.target.value; else input.focus();
 };
 $('#llm-form').elements.provider.onchange = () => loadModels(true);
+// 开自动回复会一并开长期记忆；关长期记忆会一并关自动回复（自动回复离不开聊天记录）。
+$('#chat-memory').onchange = e => saveChatSwitch(e.target.checked, e.target.checked && $('#chat-reply').checked);
+$('#chat-reply').onchange = e => saveChatSwitch($('#chat-memory').checked || e.target.checked, e.target.checked);
 $('#llm-form').elements.base_url.onchange = $('#llm-form').elements.api_key.onchange = () => loadModels();
 $('#llm-load-models').onclick = () => loadModels();
 const lines = value => [...new Set(value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean))];
@@ -416,7 +419,17 @@ function chatAvatar(name){
   return `<span class="hc-avatar hc-color-${color}" aria-hidden="true">${escape([...String(name||'聊')][0])}</span>`;
 }
 const shortChatId=id=>String(id||'').replace(/@chatroom$/,'');
-let chatNamesAt=0;
+let chatNamesAt=0,switchHint={chat:'',text:''};
+async function saveChatSwitch(memory,reply){
+  const chat=$('#send-chat').value,requested=robot;if(!chat)return;
+  try{
+    const setting=await api('chat-settings',{chat_id:chat,memory,reply},requested);if(requested!==robot)return;
+    const known=chatRows.find(row=>row.chat_id===chat);
+    if(known)Object.assign(known,setting);else chatRows.push({chat_id:chat,...setting});
+    switchHint={chat,text:setting.notice||''};
+  }catch(error){switchHint={chat,text:error.message};}
+  chatListMarkup='';renderChatWorkspace();
+}
 async function refreshChatNames(){
   // 只合并名字，不动发送状态；10 秒内最多一次。
   if(Date.now()-chatNamesAt<10000)return;
@@ -453,6 +466,10 @@ function renderChatWorkspace(){
   if(listMarkup!==chatListMarkup){chatListMarkup=listMarkup;$('#chat-conversations').innerHTML=listMarkup;}
   const row=all.get(selected),name=row?.name&&row.name!==selected?row.name:shortChatId(selected);
   $('#chat-heading').textContent=name||'';
+  // 每个会话两个开关；没连上微信时改不了，先藏起来。
+  $('#chat-switches').classList.toggle('hidden',!selected||!connected);
+  $('#chat-memory').checked=!!row?.memory;$('#chat-reply').checked=!!row?.reply;
+  $('#chat-switch-hint').textContent=switchHint.chat===selected?switchHint.text:'';
   $('#chat-mention-toggle').classList.toggle('hidden',!selected.endsWith('@chatroom'));
   $('#chat-mention-toggle').textContent='@'+(mentionSelection.size?' '+mentionSelection.size:'');
   const timeline=messages.filter(message=>message.chat_id===selected);

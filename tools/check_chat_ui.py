@@ -12,6 +12,7 @@ TOKEN='synthetic-ui-token'
 
 class Fixture:
     def __init__(self):
+        self.switches={}
         self.sent=[]
         self.messages=[
             {'id':1,'revision':1,'chat_id':'wxid_ui_peer','sender_id':'wxid_ui_peer','sender_name':'周屿','content':'这是一条合成消息，仅供界面测试。','date':'2026-10-23','time':'09:30','is_group':False,'direction':'incoming'},
@@ -26,7 +27,8 @@ class Fixture:
         if name=='config':return {'groups':[],'chat_allowlist':[],'plugins':{'echo':{'enabled':False}},'llm':{},'tts':{},'text_send_delay':{'enabled':False,'characters_per_group':10,'min_seconds':0,'max_seconds':0}}
         if name=='logs':return {'rows':[],'cursor':0}
         if name=='messages':return {'rows':self.messages,'cursor':len(self.messages),'stream_id':'synthetic-stream'}
-        if name=='chats':return {'chats':[{'chat_id':'wxid_ui_peer','name':'周屿','is_group':False},{'chat_id':'fixture_group@chatroom','name':'课题组','is_group':True}]}
+        if name=='chats':return {'chats':[{'chat_id':'wxid_ui_peer','name':'周屿','is_group':False,**self.switches.get('wxid_ui_peer',{'memory':False,'reply':False})},
+                                          {'chat_id':'fixture_group@chatroom','name':'课题组','is_group':True,**self.switches.get('fixture_group@chatroom',{'memory':True,'reply':False})}]}
         if name=='send-connection':return {'session_id':'synthetic-session'}
         if name=='group-members':return {'session_id':'synthetic-session','members':[{'wxid':'wxid_ui_member','nickname':'成员甲','role':'admin'}]}
         if name=='send-status':return {'status':'sent'}
@@ -53,6 +55,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get('X-Helper-Token')!=TOKEN:return self.reply(403,{'error':'token'})
         data=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         if urlsplit(self.path).path=='/api/llm-models':return self.reply(200,{'models':['synthetic-model-a','synthetic-model-b']})
+        if urlsplit(self.path).path=='/api/chat-settings':
+            setting={'memory':bool(data['memory'] or data['reply']),'reply':bool(data['reply'])}
+            self.server.fixture.switches[data['chat_id']]=setting
+            return self.reply(200,setting)
         if urlsplit(self.path).path!='/api/send-text':return self.reply(400,{'error':'Unexpected mutation in UI test'})
         if data.get('session_id')!='synthetic-session':return self.reply(409,{'error':'session changed'})
         self.server.fixture.sent.append(data)
@@ -79,6 +85,14 @@ def main():
             page.get_by_role('button',name='打开会话 周屿',exact=True).click()
             expect(page.locator('#chat-heading')).to_have_text('周屿')
             expect(page.locator('#send-content')).to_be_enabled()
+            # 聊天页顶部两个开关：默认只接收；开自动回复会一并开长期记忆，关长期记忆会一并关自动回复
+            expect(page.locator('#chat-memory')).not_to_be_checked();expect(page.locator('#chat-reply')).not_to_be_checked()
+            page.locator('#chat-reply').check()
+            expect(page.locator('#chat-memory')).to_be_checked()
+            assert server.fixture.switches['wxid_ui_peer']=={'memory':True,'reply':True}
+            page.locator('#chat-memory').uncheck()
+            expect(page.locator('#chat-reply')).not_to_be_checked()
+            assert server.fixture.switches['wxid_ui_peer']=={'memory':False,'reply':False}
             assert page.locator('.hc-layout').bounding_box()['height'] >= 830
             assert page.locator('#chat-timeline script').count()==0
             assert page.evaluate('() => window.uiXss') is None
