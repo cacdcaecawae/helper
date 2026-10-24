@@ -102,6 +102,20 @@ class MemberTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(MemberError):
                 self.store.set_chat(friend, memory=value, reply=False)
 
+    def test_backfill_adds_only_lines_after_the_last_record(self):
+        friend = "wxid_friend"
+        self.store.set_chat(friend, memory=True, reply=False)
+        self.store.record(Message("已经记过的", friend, friend, session_id="first", sequence=1))
+        last = datetime.fromisoformat(self.store.memory(friend)[1][-1]["at"]).timestamp()
+        rows = [{"timestamp": last - 60, "content": "已经记过的", "direction": "incoming", "sender_id": friend, "sender_name": "小王"},
+                {"timestamp": last + 60, "content": "周六有空吗", "direction": "incoming", "sender_id": friend, "sender_name": "小王"},
+                {"timestamp": last + 120, "content": "有空", "direction": "outgoing", "sender_id": ROBOT, "sender_name": "我"}]
+        self.assertEqual(self.store.backfill(friend, rows), 2)
+        self.assertEqual([(line["name"], line["text"]) for line in self.store.memory(friend)[1]],
+                         [("小王", "已经记过的"), ("小王", "周六有空吗"), ("你", "有空")])
+        self.assertEqual(self.store.backfill(friend, rows), 0)  # 再补一次不会重复
+        self.assertEqual(self.store.backfill("wxid_off", rows), 0)  # 没开长期记忆的会话不补
+
     def test_private_chat_and_spoken_replies_are_recorded(self):
         friend = "wxid_friend"
         private = lambda text, sequence, chat=friend, **kwargs: Message(text, chat, chat, session_id="first",

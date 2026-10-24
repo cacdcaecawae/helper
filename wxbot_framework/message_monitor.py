@@ -184,6 +184,12 @@ class MessageBuffer:
                     'content':'[撤回消息] 原消息未捕获', 'message_id':identifier,
                     'recalled':True, 'recalled_at':now, 'recall_notice':notice, 'recall_missing':True})
 
+    def texts(self, chat):
+        """这个会话本次连接显示过的文字消息（按时间顺序），打开长期记忆时补记用。"""
+        with self.lock:
+            return [dict(row) for row in self.rows if row.get('chat_id') == chat and row.get('type') == 1
+                    and not row.get('forwarded') and row.get('kind') != 'agent']
+
     def trace(self, message, run, step, *, account=''):
         """智能体每次运行占一行（kind=agent），每走一步追加 step 并提升 revision，前端增量刷新。"""
         step = {key: self._text(step.get(key), 2000) if isinstance(step.get(key), str) else step.get(key)

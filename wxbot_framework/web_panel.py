@@ -455,9 +455,17 @@ class PanelController:
             members = getattr(app, 'members', None)
             if members is None:
                 raise PanelError('请先在主配置设置 members_config_file')
+            before = members.remembers(chat)
             setting = members.set_chat(chat, memory=data.get('memory'), reply=data.get('reply'))
+            notices = []
+            if setting['memory'] and not before:  # 刚打开长期记忆：窗口里已经看到的消息也补进去
+                count = members.backfill(chat, self.messages.texts(chat))
+                if count:
+                    notices.append(f'已把窗口里的 {count} 条消息补进长期记忆')
             if setting['reply'] and not (app.plugins.is_active('agent_chat') or app.plugins.is_active('mention_chat')):
-                setting['notice'] = '还需在插件管理中开启“智能体”才会自动回复'
+                notices.append('还需在插件管理中开启“智能体”才会自动回复')
+            if notices:
+                setting['notice'] = '；'.join(notices)
             return setting
         return self._call(apply)
 

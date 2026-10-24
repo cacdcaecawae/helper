@@ -692,6 +692,31 @@ class MemberStore:
                 WHERE excluded.upto>agent_summaries.upto""", (self.account, chat, summary, upto))
             return True
 
+    def backfill(self, chat, rows):
+        """打开长期记忆时补记管理台已显示的文字（MessageBuffer.texts 的行），按原来的时间；
+        只补库里这个会话最后一条之后的，之前记过的不会重复。返回补了几条。"""
+        if not self.history_enabled or not self.remembers(chat):
+            return 0
+        with self._lock, self._connection() as db:
+            last = db.execute("SELECT MAX(received_at) FROM messages WHERE account=? AND room=?",
+                              (self.account, chat)).fetchone()[0] or ""
+            count = 0
+            for row in rows:
+                at, text = datetime.fromtimestamp(row["timestamp"], timezone.utc).isoformat(), row["content"].strip()
+                if at <= last or not text:
+                    continue
+                own = row["direction"] == "outgoing"
+                sender = self.account if own else row["sender_id"] or chat
+                if not own and row.get("sender_name") and self.display_name(sender, chat) is None:
+                    try:  # 补记的人没有原生名字缓存，用窗口里显示的名字，模型才知道是谁说的
+                        self.remember_wechat_name(sender, row["sender_name"])
+                    except (MemberError, ValueError):
+                        pass
+                db.execute("""INSERT INTO messages(account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated)
+                    VALUES(?,?,?,?,?,'backfill',0,?,?)""", (self.account, chat, sender, text, at, int(own), int(own)))
+                count += 1
+            return count
+
     def record_spoken(self, message, text):
         """语音回复没有文字回传；补记机器人说的话，聊天记录（也就是智能体的记忆）里才有。sequence 为 0，不与原生消息冲突。"""
         if not self.history_enabled or not self.remembers(message.chat_id):

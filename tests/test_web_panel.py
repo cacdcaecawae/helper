@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from wxbot_framework.config import ConfigStore
 from wxbot_framework.runtime import BotApplication
+from wxbot_framework.sdk import Message
 from wxbot_framework.web_panel import LogBuffer, PanelController, PanelError, PanelServer, read_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -140,21 +141,33 @@ class ControllerTests(PanelFixture):
 
     def test_chat_switches_come_with_chats_and_save_while_running(self):
         class Members:
-            settings = {}
+            settings, backfilled = {}, []
 
             def chat_setting(self, chat):
                 return dict(self.settings.get(chat, {'memory': False, 'reply': False}))
 
+            def remembers(self, chat):
+                return self.chat_setting(chat)['memory']
+
             def set_chat(self, chat, *, memory, reply):
                 self.settings[chat] = {'memory': memory or reply, 'reply': reply}
                 return self.chat_setting(chat)
+
+            def backfill(self, chat, rows):
+                self.backfilled.append([row['content'] for row in rows])
+                return len(rows)
         self.controller.start()
-        self.controller.app.members = Members()
+        self.controller.app.members = members = Members()
+        self.controller.messages.append(Message('周六有空吗', '123@chatroom', 'wxid_a', is_group=True), account='wxid_test_robot')
         self.assertEqual(self.controller.chats(), [{'chat_id':'123@chatroom','is_group':True,'memory':False,'reply':False}])
-        # 运行中直接改，不用停机；智能体没开时提醒一句
+        # 运行中直接改，不用停机；刚打开长期记忆时把窗口里的消息补进去；智能体没开时提醒一句
         self.assertEqual(self.controller.set_chat_settings({'chat_id':'123@chatroom','memory':False,'reply':True}),
-                         {'memory':True, 'reply':True, 'notice':'还需在插件管理中开启“智能体”才会自动回复'})
-        self.assertEqual(self.controller.chats()[0]['reply'], True)
+                         {'memory':True, 'reply':True,
+                          'notice':'已把窗口里的 1 条消息补进长期记忆；还需在插件管理中开启“智能体”才会自动回复'})
+        self.assertEqual(members.backfilled, [['周六有空吗']])
+        self.controller.set_chat_settings({'chat_id':'123@chatroom','memory':True,'reply':False})
+        self.assertEqual(len(members.backfilled), 1)  # 本来就开着，不再补
+        self.assertEqual({key: self.controller.chats()[0][key] for key in ('memory', 'reply')}, {'memory': True, 'reply': False})
         with self.assertRaises(ValueError):
             self.controller.set_chat_settings({'chat_id':'../x', 'memory':True, 'reply':False})
         self.wait_stopped()
