@@ -59,7 +59,7 @@ class Plugin:
                 context = {"name": snapshot.speaker_name, "current": strip_at_labels(snapshot.current),
                            "previous": [strip_at_labels(row["text"]) for row in snapshot.messages]}
             else:
-                # ponytail: 私聊只带本条消息，没有历史；需要上下文时再给私聊加记录表。
+                # 私聊的上文全靠下面的问答记忆。
                 context = {"current": message.text}
             sender = message.sender_id or message.chat_id
             since = datetime.now(timezone.utc) - timedelta(hours=MEMORY_HOURS)
