@@ -85,8 +85,28 @@ def history_tool(members, room):
             raise ToolError(str(error)) from None
         if not rows:
             return f"本群记录里没有包含“{keyword}”的发言（只保存 helper 运行期间收到的群聊）"
-        return "\n".join(f"{row['received_at'][:16].replace('T', ' ')} {row['name']}：{row['text'][:200]}" for row in rows)
+        return "\n".join(f"{beijing_time(row['received_at'])} {row['name']}：{row['text'][:200]}" for row in rows)
     return ("{\"keyword\":\"关键词\"}：在本群 helper 保存的聊天记录里查找包含关键词的发言，最多 20 条", search)
+
+
+def memory_tool(members, chat):
+    def search(args):
+        keyword = args.get("keyword")
+        if not isinstance(keyword, str) or not keyword.strip():
+            raise ToolError("需要 keyword 参数")
+        try:
+            rows = members.search_agent_memory(chat, keyword[:100])
+        except MemberError as error:
+            raise ToolError(str(error)) from None
+        if not rows:
+            return f"早期对话里没有包含“{keyword}”的内容"
+        return "\n".join(f"{beijing_time(row['at'])} {row['speaker'] or '对方'}问：{row['asked'][:150]}｜你答：{row['answered'][:150]}"
+                         for row in rows)
+    return ("{\"keyword\":\"关键词\"}：summary 里细节不够时，在已压缩的早期对话原文里查找（提问人、问题和你的回答都查），最多 6 条", search)
+
+
+def beijing_time(at):
+    return datetime.fromisoformat(at).astimezone(BEIJING).strftime("%m-%d %H:%M")
 
 
 def search_tool(llm):

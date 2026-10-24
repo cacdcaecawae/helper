@@ -192,7 +192,8 @@ class MemberStore:
                     id INTEGER PRIMARY KEY, account TEXT NOT NULL, chat TEXT NOT NULL, sender TEXT NOT NULL,
                     at TEXT NOT NULL, asked TEXT NOT NULL, answered TEXT NOT NULL, speaker TEXT NOT NULL DEFAULT '');
                 CREATE TABLE IF NOT EXISTS agent_summaries (
-                    account TEXT NOT NULL, chat TEXT NOT NULL, summary TEXT NOT NULL, PRIMARY KEY(account,chat));
+                    account TEXT NOT NULL, chat TEXT NOT NULL, summary TEXT NOT NULL, upto INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(account,chat));
                 CREATE INDEX IF NOT EXISTS agent_turns_lookup ON agent_turns(account, chat, sender, id);
                 INSERT OR IGNORE INTO room_members SELECT DISTINCT account,room,sender_id FROM messages;
             """)
@@ -202,6 +203,8 @@ class MemberStore:
                 db.execute("ALTER TABLE messages ADD COLUMN bot_generated INTEGER NOT NULL DEFAULT 0")
             if "speaker" not in {row["name"] for row in db.execute("PRAGMA table_info(agent_turns)")}:
                 db.execute("ALTER TABLE agent_turns ADD COLUMN speaker TEXT NOT NULL DEFAULT ''")
+            if "upto" not in {row["name"] for row in db.execute("PRAGMA table_info(agent_summaries)")}:
+                db.execute("ALTER TABLE agent_summaries ADD COLUMN upto INTEGER NOT NULL DEFAULT 0")
             with db:
                 for room, key, name, display, wxid, aliases in self.profiles:
                     existing = db.execute("SELECT wxid FROM people WHERE account=? AND room=? AND person_key=?",
@@ -597,14 +600,29 @@ class MemberStore:
             return result.rowcount > 0
 
     def agent_memory(self, chat):
-        """智能体在一个群或一个私聊里的记忆：更早对话的摘要，加之后的全部问答（按时间顺序）；重启后仍在。"""
+        """智能体在一个群或一个私聊里的记忆：更早对话的摘要，加摘要之后的全部问答（按时间顺序）；重启后仍在。"""
         with self._lock:
             self.rollover()
             db = self._connection()
-            row = db.execute("SELECT summary FROM agent_summaries WHERE account=? AND chat=?", (self.account, chat)).fetchone()
-            turns = db.execute("SELECT id,at,speaker,asked,answered FROM agent_turns WHERE account=? AND chat=? ORDER BY id",
-                               (self.account, chat)).fetchall()
-            return (row[0] if row else ""), [dict(turn) for turn in turns]
+            row = db.execute("SELECT summary,upto FROM agent_summaries WHERE account=? AND chat=?", (self.account, chat)).fetchone()
+            summary, upto = tuple(row) if row else ("", 0)
+            turns = db.execute("""SELECT id,at,speaker,asked,answered FROM agent_turns
+                WHERE account=? AND chat=? AND id>? ORDER BY id""", (self.account, chat, upto)).fetchall()
+            return summary, [dict(turn) for turn in turns]
+
+    def search_agent_memory(self, chat, keyword, *, limit=6):
+        """在已压缩进摘要的问答原文里按关键词查找（提问人、问、答都查），按时间顺序返回。"""
+        if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > 100:
+            raise MemberError("搜索关键词应为 1–100 个字符")
+        keyword = keyword.strip()
+        with self._lock:
+            self.rollover()
+            rows = self._connection().execute("""SELECT t.at,t.speaker,t.asked,t.answered FROM agent_turns t
+                JOIN agent_summaries s ON s.account=t.account AND s.chat=t.chat
+                WHERE t.account=? AND t.chat=? AND t.id<=s.upto
+                AND (instr(t.asked,?)>0 OR instr(t.answered,?)>0 OR instr(t.speaker,?)>0) ORDER BY t.id DESC LIMIT ?""",
+                (self.account, chat, keyword, keyword, keyword, limit)).fetchall()
+            return [dict(row) for row in reversed(rows)]
 
     def remember_agent_turn(self, chat, sender, speaker, asked, answered):
         """记下一轮问答和提问人；不限条数，过长时由调用方用 compact_agent_memory 压缩。"""
@@ -613,14 +631,16 @@ class MemberStore:
                        (self.account, chat, sender, speaker, self._now().astimezone(timezone.utc).isoformat(), asked, answered))
 
     def compact_agent_memory(self, chat, summary, upto):
-        """用摘要替换 id<=upto 的问答。期间被 /清空 或跨天清理过（upto 已不在）就放弃，不把清掉的内容写回。"""
+        """摘要从此代替 id<=upto 的问答给模型看；原文保留，供 search_agent_memory 查找。
+        期间被 /清空 或跨天清理过（upto 已不在）就放弃，不把清掉的内容写回。"""
+        # ponytail: 原文只在 /清空 或每日清理时删除，不开每日清理会一直增长（每轮几百字）；真占地方再加保留天数。
         with self._lock, self._connection() as db:
             if not db.execute("SELECT 1 FROM agent_turns WHERE account=? AND chat=? AND id=?",
                               (self.account, chat, upto)).fetchone():
                 return False
-            db.execute("""INSERT INTO agent_summaries VALUES(?,?,?)
-                ON CONFLICT(account,chat) DO UPDATE SET summary=excluded.summary""", (self.account, chat, summary))
-            db.execute("DELETE FROM agent_turns WHERE account=? AND chat=? AND id<=?", (self.account, chat, upto))
+            db.execute("""INSERT INTO agent_summaries(account,chat,summary,upto) VALUES(?,?,?,?)
+                ON CONFLICT(account,chat) DO UPDATE SET summary=excluded.summary,upto=excluded.upto
+                WHERE excluded.upto>agent_summaries.upto""", (self.account, chat, summary, upto))
             return True
 
     def search(self, room, keyword, *, limit=20):

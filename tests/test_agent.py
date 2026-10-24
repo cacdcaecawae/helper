@@ -149,6 +149,12 @@ class AgentPluginConversationTests(unittest.TestCase):
                                               "你答": "推荐《星际穿越》。\n周末看正合适。"}])
         self.assertEqual(self.compacted, [])
 
+    def test_memory_search_is_offered_only_after_compaction(self):
+        self.plugin.tools = frozenset({"search_memory"})
+        message = Message("你好", "wxid_friend", "wxid_friend")
+        self.assertNotIn("search_memory", self.plugin._toolbox(message, self.ctx, None))
+        self.assertIn("search_memory", self.plugin._toolbox(message, self.ctx, None, compacted=True))
+
     def test_long_memory_compacts_older_turns_and_keeps_recent_ones(self):
         from plugins.agent_chat import KEEP_RECENT, MEMORY_CHARS
         for index in range(KEEP_RECENT + 5):

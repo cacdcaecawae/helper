@@ -3,7 +3,6 @@
 开启后代替“艾特对话”；每一步思考和工具调用都推送到管理台聊天页。
 插件选项：private_friends 私聊白名单（微信 ID 列表）；tools 可用工具；image_server 本机画图服务地址。
 """
-from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -11,14 +10,15 @@ import tempfile
 import time
 import uuid
 
-from wxbot_framework.agent import Agent, ImageServer, ToolError, draw_tool, history_tool, search_tool
+from wxbot_framework.agent import (Agent, ImageServer, ToolError, beijing_time, draw_tool, history_tool, memory_tool,
+                                   search_tool)
 from wxbot_framework.llm import LLMError
-from wxbot_framework.members import BEIJING, SnapshotExpired
+from wxbot_framework.members import SnapshotExpired
 from wxbot_framework.mentions import strip_at_labels
 from wxbot_framework.personality import personality_text
 from wxbot_framework.speech import deliver_model_reply
 
-TOOLS = ("draw_image", "search_history", "web_search")
+TOOLS = ("draw_image", "search_history", "search_memory", "web_search")
 MAX_PARTS = 3
 # 记忆不限条数，每个群或私聊一份，存在本账号的成员库里，重启不丢。
 # 问答总字数超过 MEMORY_CHARS 时，像 Codex 的自动压缩一样，把较早的部分压成摘要，最近 KEEP_RECENT 轮保留原文。
@@ -30,7 +30,7 @@ earlier_summary 是更早的摘要，要合并进来。只输出 JSON：{"summar
 
 
 def history(turns):
-    return [{"时间": datetime.fromisoformat(turn["at"]).astimezone(BEIJING).strftime("%m-%d %H:%M"),
+    return [{"时间": beijing_time(turn["at"]),
              "提问人": turn["speaker"] or "对方", "问": turn["asked"], "你答": turn["answered"]} for turn in turns]
 
 
@@ -78,7 +78,7 @@ class Plugin:
             context["history"] = history(turns)
             trace("start", context["current"][:300])
             reply = Agent(ctx.llm_for(message, personality=personality),
-                          self._toolbox(message, ctx, guard), trace).run(context)
+                          self._toolbox(message, ctx, guard, compacted=bool(context["summary"])), trace).run(context)
             # 像真人一样可以分几条发：空行分隔，最多三条；群里只有第一条艾特对方。
             parts = [personality_text(part.strip(), personality.name)
                      for part in re.split(r"\n\s*\n", reply) if part.strip()][:MAX_PARTS]
@@ -119,7 +119,7 @@ class Plugin:
         if isinstance(text, str) and text.strip():
             self.members.compact_agent_memory(chat, text.strip()[:3000], older[-1]["id"])
 
-    def _toolbox(self, message, ctx, guard):
+    def _toolbox(self, message, ctx, guard, *, compacted=False):
         tools = {}
         codex = getattr(ctx.llm, "provider", "") == "codex"
         if "draw_image" in self.tools and (codex or self.image is not None):
@@ -132,6 +132,8 @@ class Plugin:
             tools["draw_image"] = draw_tool(ctx.llm if codex else self.image, send)
         if "search_history" in self.tools and message.is_group:
             tools["search_history"] = history_tool(self.members, message.chat_id)
+        if "search_memory" in self.tools and compacted:  # 压缩过才有原文可查
+            tools["search_memory"] = memory_tool(self.members, message.chat_id)
         if "web_search" in self.tools and codex:
             tools["web_search"] = search_tool(ctx.llm)
         return tools

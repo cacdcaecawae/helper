@@ -65,8 +65,13 @@ class MemberTests(unittest.TestCase):
         self.assertTrue(reopened.compact_agent_memory(ROOM, "前 20 轮的摘要", turns[19]["id"]))
         summary, turns = reopened.agent_memory(ROOM)
         self.assertEqual((summary, [turn["asked"] for turn in turns]), ("前 20 轮的摘要", [f"问{i}" for i in range(20, 25)]))
+        # 压缩掉的原文还能按关键词查到；没压缩的不在搜索范围（模型已经直接看得到）
+        self.assertEqual([(row["speaker"], row["asked"]) for row in reopened.search_agent_memory(ROOM, "问3")], [("成员乙", "问3")])
+        self.assertEqual([row["asked"] for row in reopened.search_agent_memory(ROOM, "成员甲")], [f"问{i}" for i in range(8, 20, 2)])
+        self.assertEqual(reopened.search_agent_memory(ROOM, "问21"), [])
         reopened.clear(ROOM)
         self.assertEqual(reopened.agent_memory(ROOM), ("", []))
+        self.assertEqual(reopened.search_agent_memory(ROOM, "问3"), [])
         self.assertFalse(reopened.compact_agent_memory(ROOM, "清空后不能写回", turns[-1]["id"]))
         self.assertEqual(reopened.agent_memory(ROOM), ("", []))
         self.assertEqual([turn["asked"] for turn in reopened.agent_memory("wxid_friend")[1]], ["私聊问"])
