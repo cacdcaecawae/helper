@@ -22,7 +22,8 @@ TOOLS = ("draw_image", "search_history", "search_memory", "web_search")
 MAX_PARTS = 3
 # 记忆不限条数，每个群或私聊一份，存在本账号的成员库里，重启不丢。
 # 问答总字数超过 MEMORY_CHARS 时，像 Codex 的自动压缩一样，把较早的部分压成摘要，最近约 KEEP_CHARS 字保留原文。
-MEMORY_CHARS, KEEP_CHARS = 20000, 10000
+# 5 万字实测约 7 万 token，约占 gpt-6.1-sol 50 万窗口的 15%；每次回复都要整份发送，所以不设到窗口上限。
+MEMORY_CHARS, KEEP_CHARS = 50000, 25000
 COMPACT = """把微信里较早的对话压缩成一段摘要，供你之后接着聊。
 保留：谁说过什么、各人的情况和偏好、约定和待办、你推荐或答应过的事、没聊完的话题；按人写清楚，标出大致时间；去掉寒暄和重复。
 earlier_summary 是更早的摘要，要合并进来。只输出 JSON：{"summary":"摘要正文"}，不超过 1500 字。
