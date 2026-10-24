@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from plugins.agent_chat import Plugin
-from wxbot_framework.agent import Agent, ImageServer, ToolError, draw_tool
+from wxbot_framework.agent import Agent, ImageServer, ToolError, draw_tool, history_tool
 from wxbot_framework.llm import LLMError
 from wxbot_framework.message_monitor import MessageBuffer
 from wxbot_framework.sdk import Message
@@ -46,6 +46,12 @@ class AgentTests(unittest.TestCase):
         self.assertIn("不存在", results[0])
         self.assertEqual(results[1], "失败：服务未启动")
         self.assertIn("不存在", results[2])  # 工具名不是字符串（不可哈希）也只是一条观察，不会抛 TypeError
+
+    def test_history_tool_treats_blank_arguments_as_missing(self):
+        seen = []
+        members = SimpleNamespace(search=lambda room, keyword, date=None, name=None: seen.append((keyword, date, name)) or [])
+        self.assertIn("没有符合条件", history_tool(members, "123@chatroom")[1]({"keyword": "", "date": "2026-10-20", "name": ""}))
+        self.assertEqual(seen, [(None, "2026-10-20", None)])
 
     def test_tool_calls_are_bounded_and_must_end_with_a_valid_reply(self):
         loop = {"tool": "lookup", "args": {}}

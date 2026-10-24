@@ -76,17 +76,20 @@ class Agent:
 
 def history_tool(members, room):
     def search(args):
-        keyword = args.get("keyword")
-        if not isinstance(keyword, str) or not keyword.strip():
-            raise ToolError("需要 keyword 参数")
+        # 模型常把不用的参数填成空字符串，按没给处理。
+        keyword, date, name = (args.get(key) or None for key in ("keyword", "date", "name"))
         try:
-            rows = members.search(room, keyword[:100])
+            rows = members.search(room, keyword[:100] if isinstance(keyword, str) else keyword, date=date, name=name)
         except MemberError as error:
             raise ToolError(str(error)) from None
         if not rows:
-            return f"本群记录里没有包含“{keyword}”的发言（只保存 helper 运行期间收到的群聊）"
-        return "\n".join(f"{beijing_time(row['received_at'])} {row['name']}：{row['text'][:200]}" for row in rows)
-    return ("{\"keyword\":\"关键词\"}：在本群 helper 保存的聊天记录里查找包含关键词的发言，最多 20 条", search)
+            return "本群记录里没有符合条件的发言（只保存 helper 运行期间收到的群聊）"
+        lines = [f"{beijing_time(row['received_at'])} {row['name']}：{row['text'][:200]}" for row in rows]
+        if len(rows) == 20:
+            lines.append("（只显示符合条件的最近 20 条，可再加关键词、日期或发言人缩小范围）")
+        return "\n".join(lines)
+    return ("{\"keyword\":\"关键词\",\"date\":\"YYYY-MM-DD\",\"name\":\"群友称呼\"}（三项任选，至少一项）："
+            "查本群 helper 保存的群聊原文，可按关键词、某一天（北京时间）、某人筛选，返回最近 20 条", search)
 
 
 def memory_tool(members, chat):

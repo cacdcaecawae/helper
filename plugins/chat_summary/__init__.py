@@ -8,8 +8,9 @@ from wxbot_framework.summary import ChatSummarizer, conversation_rows, split_tex
 class Plugin:
     def on_load(self, ctx):
         self.members = ctx.members
-        if not self.members.history_enabled or not self.members.daily_clear:
-            raise ValueError("聊天总结需要成员配置 history_enabled 和 daily_clear 都为 true")
+        # 总结只读当天的记录，与是否每日清理无关；关掉清理可让智能体查前几天的群聊。
+        if not self.members.history_enabled:
+            raise ValueError("聊天总结需要成员配置 history_enabled: true")
         self.summarizer = ChatSummarizer(ctx.llm, chunk_chars=ctx.config.get("chunk_chars", 16000))
 
     def on_message(self, message, ctx):

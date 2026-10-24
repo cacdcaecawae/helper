@@ -88,6 +88,23 @@ class MemberTests(unittest.TestCase):
                                                        snapshot=self.store.conversation_snapshot(message)))
         self.assertEqual(len(self.store.agent_memory(ROOM)[1]), 1)
 
+    def test_search_combines_day_speaker_and_keyword(self):
+        clock = [datetime(2026, 10, 19, 4, 0, tzinfo=timezone.utc)]  # 北京 10-19 12:00
+        store = MemberStore(self.config_path, ROBOT, now=lambda: clock[0])
+        self.stores.append(store)
+        store.record(self.message("周日去爬山", sender=SMALL, sequence=1))
+        clock[0] += timedelta(days=1)
+        store.record(self.message("今天下雨不去了", sender=SMALL, sequence=2))
+        store.record(self.message("那改周六", sequence=3))
+        texts = lambda **criteria: [row["text"] for row in store.search(ROOM, **criteria)]
+        self.assertEqual(texts(date="2026-10-19"), ["周日去爬山"])
+        self.assertEqual(texts(date="2026-10-20"), ["今天下雨不去了", "那改周六"])
+        self.assertEqual(texts(name="成员甲"), ["周日去爬山", "今天下雨不去了"])
+        self.assertEqual(texts(name="成员甲", date="2026-10-20", keyword="下雨"), ["今天下雨不去了"])
+        for criteria in ({}, {"date": "10-20"}, {"name": "成员乙"}, {"name": "不存在的人"}):
+            with self.subTest(criteria=criteria), self.assertRaises(MemberError):
+                store.search(ROOM, **criteria)
+
     def test_keyword_search_returns_room_text_in_order_without_bot_replies(self):
         self.store.record(self.message("周六晚上开黑", sequence=1))
         self.store.record(self.message("周六见", sender=SMALL, sequence=2))
@@ -163,9 +180,14 @@ class MemberTests(unittest.TestCase):
         self.assertEqual(len(self.store.history("成员乙")), 2)
 
     def test_limit_and_time_filter_return_chronological_records(self):
+        # 固定时钟：Windows 上 now() 精度不足，since 可能和第一句拿到同一个时间戳
+        clock = [datetime(2026, 10, 19, 4, 0, tzinfo=timezone.utc)]
+        self.store = MemberStore(self.config_path, ROBOT, now=lambda: clock[0])
+        self.stores.append(self.store)
         self.store.bind("成员乙", ROOM, JING)
         self.store.record(self.message("第一句", sequence=1))
-        since = datetime.now(timezone.utc)
+        clock[0] += timedelta(seconds=1)
+        since = clock[0]
         self.store.record(self.message("第二句", sequence=2))
         self.assertEqual([r["text"] for r in self.store.history("成员乙", limit=1)], ["第二句"])
         self.assertEqual([r["text"] for r in self.store.history("成员乙", since=since)], ["第二句"])

@@ -645,17 +645,38 @@ class MemberStore:
                 WHERE excluded.upto>agent_summaries.upto""", (self.account, chat, summary, upto))
             return True
 
-    def search(self, room, keyword, *, limit=20):
-        """在本群已保存的群友文字里按关键词查找，按时间顺序返回；不含机器人自己的发言。"""
+    def search(self, room, keyword=None, *, date=None, name=None, limit=20):
+        """在本群已保存的群友文字里查找，关键词、日期（北京时间 YYYY-MM-DD）、发言人称呼可任意组合，至少给一项。
+        返回符合条件的最近 limit 条，按时间顺序；不含机器人自己的发言。"""
         if room not in self.groups:
             raise MemberError("这个群尚未启用聊天记录")
-        if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > 100:
-            raise MemberError("搜索关键词应为 1–100 个字符")
+        if keyword is None and date is None and name is None:
+            raise MemberError("至少需要关键词、日期或发言人之一")
+        sql, values = " FROM messages WHERE account=? AND room=? AND bot_generated=0", [self.account, room]
+        if keyword is not None:
+            if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > 100:
+                raise MemberError("搜索关键词应为 1–100 个字符")
+            sql += " AND instr(text,?)>0"
+            values.append(keyword.strip())
+        if date is not None:
+            try:
+                start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=BEIJING)
+            except (TypeError, ValueError):
+                raise MemberError("日期格式应为 YYYY-MM-DD") from None
+            sql += " AND received_at>=? AND received_at<?"
+            values += [start.astimezone(timezone.utc).isoformat(), (start + timedelta(days=1)).astimezone(timezone.utc).isoformat()]
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise MemberError("发言人应为群友称呼")
         with self._lock:
             self.rollover()
-            rows = self._connection().execute("""SELECT sender_id,text,received_at FROM messages
-                WHERE account=? AND room=? AND bot_generated=0 AND instr(text,?)>0 ORDER BY id DESC LIMIT ?""",
-                (self.account, room, keyword.strip(), limit)).fetchall()
+            if name is not None:
+                member = self.resolve(name.strip(), room)
+                if member.wxid is None:
+                    raise MemberError(f"{member.name} 尚未绑定微信 ID")
+                sql += " AND sender_id=?"
+                values.append(member.wxid)
+            rows = self._connection().execute("SELECT sender_id,text,received_at" + sql + " ORDER BY id DESC LIMIT ?",
+                                              values + [limit]).fetchall()
             return [dict(row, name=self.display_name(row["sender_id"], room) or "群友") for row in reversed(rows)]
 
     def history(self, name, room=None, *, limit=100, since=None):
