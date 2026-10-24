@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -193,7 +193,7 @@ class MemberStore:
                     PRIMARY KEY(account,room));
                 CREATE TABLE IF NOT EXISTS chat_settings (
                     account TEXT NOT NULL, chat TEXT NOT NULL, memory INTEGER NOT NULL, reply INTEGER NOT NULL,
-                    PRIMARY KEY(account,chat));
+                    cleared_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(account,chat));
                 CREATE TABLE IF NOT EXISTS agent_summaries (
                     account TEXT NOT NULL, chat TEXT NOT NULL, summary TEXT NOT NULL, upto INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(account,chat));
@@ -205,6 +205,13 @@ class MemberStore:
                 db.execute("ALTER TABLE messages ADD COLUMN bot_generated INTEGER NOT NULL DEFAULT 0")
             if "upto" not in {row["name"] for row in db.execute("PRAGMA table_info(agent_summaries)")}:
                 db.execute("ALTER TABLE agent_summaries ADD COLUMN upto INTEGER NOT NULL DEFAULT 0")
+            if "cleared_at" not in {row["name"] for row in db.execute("PRAGMA table_info(chat_settings)")}:
+                db.execute("ALTER TABLE chat_settings ADD COLUMN cleared_at TEXT NOT NULL DEFAULT ''")
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_turns'").fetchone():
+                # 旧版单独的问答表：摘要游标 upto 指的是它的 id，换成聊天记录后对不上，作废旧摘要和旧表。
+                with db:
+                    db.execute("DELETE FROM agent_summaries")
+                    db.execute("DROP TABLE agent_turns")
             for row in db.execute("SELECT chat,memory,reply FROM chat_settings WHERE account=?", (self.account,)):
                 self._apply_setting(row["chat"], bool(row["memory"]), bool(row["reply"]))
             with db:
@@ -453,6 +460,10 @@ class MemberStore:
                                              (self.account, wxid)).fetchone()
             return row[0] if row else None
 
+    def speaker_name(self, wxid, chat):
+        """给模型和聊天页看的发言人名字；读不到时群里叫“群友”，私聊叫“对方”。"""
+        return self.display_name(wxid, chat) or ("群友" if chat.endswith("@chatroom") else "对方")
+
     def display_name(self, wxid, room):
         """群内绑定优先；其他群的绑定永远不作为默认名字。"""
         member = self.find_by_wxid(wxid, room)
@@ -608,9 +619,37 @@ class MemberStore:
             names = {}
             for row in rows:
                 if not row["is_self"] and row["sender_id"] not in names:
-                    names[row["sender_id"]] = self.display_name(row["sender_id"], chat) or "群友"
+                    names[row["sender_id"]] = self.speaker_name(row["sender_id"], chat)
             return [{"id": row["id"], "at": row["received_at"], "text": row["text"], "own": bool(row["is_self"]),
                      "name": "我" if row["is_self"] else names[row["sender_id"]]} for row in reversed(rows)]
+
+    @contextmanager
+    def reply_guard(self, chat, inner=None):
+        """自动回复发送前再确认一次：生成途中关掉了“自动回复”就不发。inner 为插件原有的发送保护。"""
+        with self._lock:
+            if chat not in self.reply_chats:
+                raise SnapshotExpired("自动回复已关闭")
+            with inner() if inner is not None else nullcontext():
+                yield
+
+    def forget(self, chat):
+        """清空这个会话的长期记忆（聊天记录和摘要），开关不变，之后的新消息照常记录。
+        记下清空时间：之后再打开长期记忆补记时，不会把清空前窗口里的消息补回来。"""
+        validate_target(chat)
+        with self._lock:
+            if chat in self.groups:
+                count = self.clear(chat)  # 群里同 /清空：进行中的回复也会取消
+            else:
+                with self._connection() as db:
+                    count = db.execute("DELETE FROM messages WHERE account=? AND room=?", (self.account, chat)).rowcount
+                    db.execute("DELETE FROM agent_summaries WHERE account=? AND chat=?", (self.account, chat))
+            setting = self.chat_setting(chat)
+            with self._connection() as db:
+                db.execute("""INSERT INTO chat_settings(account,chat,memory,reply,cleared_at) VALUES(?,?,?,?,?)
+                    ON CONFLICT(account,chat) DO UPDATE SET cleared_at=excluded.cleared_at""",
+                    (self.account, chat, int(setting["memory"]), int(setting["reply"]),
+                     self._now().astimezone(timezone.utc).isoformat()))
+            return count
 
     def chat_setting(self, chat):
         return {"memory": self.remembers(chat), "reply": self.replies(chat)}
@@ -630,7 +669,7 @@ class MemberStore:
         if memory and not self.history_enabled:
             raise MemberError("请先在群聊配置中开启“记录当天文字”")
         with self._lock, self._connection() as db:
-            db.execute("""INSERT INTO chat_settings VALUES(?,?,?,?) ON CONFLICT(account,chat)
+            db.execute("""INSERT INTO chat_settings(account,chat,memory,reply) VALUES(?,?,?,?) ON CONFLICT(account,chat)
                 DO UPDATE SET memory=excluded.memory,reply=excluded.reply""", (self.account, chat, int(memory), int(reply)))
             if memory and chat.endswith("@chatroom"):  # 新开记录的群也要有当天缓冲，艾特时才能取到当前消息
                 db.execute("INSERT OR IGNORE INTO chat_buffers(account,room,local_day) VALUES(?,?,?)",
@@ -686,7 +725,7 @@ class MemberStore:
                 if not text or "WXBOT_AT_CHAT_PROBE" in text or text.split(maxsplit=1)[0] in CONTROL:
                     continue
                 if row["sender_id"] not in names:
-                    names[row["sender_id"]] = self.display_name(row["sender_id"], chat) or "群友"
+                    names[row["sender_id"]] = self.speaker_name(row["sender_id"], chat)
                 lines.append({"id": row["id"], "at": row["received_at"], "text": text[:MEMORY_LINE_CHARS],
                               "name": "你" if row["is_self"] else names[row["sender_id"]]})
             return summary, lines
@@ -720,8 +759,9 @@ class MemberStore:
         if not self.history_enabled or not self.remembers(chat):
             return 0
         with self._lock, self._connection() as db:
-            last = db.execute("SELECT MAX(received_at) FROM messages WHERE account=? AND room=?",
-                              (self.account, chat)).fetchone()[0] or ""
+            last = db.execute("""SELECT MAX(COALESCE((SELECT MAX(received_at) FROM messages WHERE account=? AND room=?),''),
+                COALESCE((SELECT cleared_at FROM chat_settings WHERE account=? AND chat=?),''))""",
+                (self.account, chat, self.account, chat)).fetchone()[0]
             count = 0
             for row in rows:
                 at, text = datetime.fromtimestamp(row["timestamp"], timezone.utc).isoformat(), row["content"].strip()
@@ -739,15 +779,16 @@ class MemberStore:
                 count += 1
             return count
 
-    def record_spoken(self, message, text):
-        """语音回复没有文字回传；补记机器人说的话，聊天记录（也就是智能体的记忆）里才有。sequence 为 0，不与原生消息冲突。"""
-        if not self.history_enabled or not self.remembers(message.chat_id):
+    def record_own(self, chat, text, session_id):
+        """补记本账号发出的话（语音、私聊文字都没有原生回传），聊天记录（也就是智能体的记忆）里才有。
+        sequence 为 0，不与原生消息冲突；没开长期记忆的会话不记。"""
+        if not self.history_enabled or not self.remembers(chat) or not isinstance(text, str) or not text.strip():
             return False
         with self._lock, self._connection() as db:
             self.rollover()
             db.execute("""INSERT INTO messages(account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated)
-                VALUES(?,?,?,?,?,?,0,1,1)""", (self.account, message.chat_id, self.account, text,
-                                               self._now().astimezone(timezone.utc).isoformat(), message.session_id or "spoken"))
+                VALUES(?,?,?,?,?,?,0,1,1)""", (self.account, chat, self.account, text,
+                                               self._now().astimezone(timezone.utc).isoformat(), session_id or "own"))
             return True
 
     def _speaker_wxid(self, name, room):
@@ -796,7 +837,7 @@ class MemberStore:
                 values.append(self.account if name.strip() == "你" else self._speaker_wxid(name.strip(), room))
             rows = self._connection().execute("SELECT sender_id,text,received_at,is_self" + sql + " ORDER BY id DESC LIMIT ?",
                                               values + [limit]).fetchall()
-            return [dict(row, name="你" if row["is_self"] else self.display_name(row["sender_id"], room) or "群友")
+            return [dict(row, name="你" if row["is_self"] else self.speaker_name(row["sender_id"], room))
                     for row in reversed(rows)]
 
     def history(self, name, room=None, *, limit=100, since=None):

@@ -472,6 +472,16 @@ class PanelController:
                 'timestamp': stamp, 'date': beijing(stamp, '%Y-%m-%d'), 'time': beijing(stamp, '%H:%M:%S'),
                 'sender_name': line['name'], 'content': line['text'], 'direction': 'outgoing' if line['own'] else 'incoming'}
 
+    def forget_chat(self, data):
+        """聊天页“清空记忆”：清掉这个会话的长期记忆，开关不变。"""
+        chat = validate_target(data.get('chat_id'))
+        def apply(app):
+            members = getattr(app, 'members', None)
+            if members is None:
+                raise PanelError('请先在主配置设置 members_config_file')
+            return {'cleared': members.forget(chat)}
+        return self._call(apply)
+
     def chat_history(self, chat, before=None):
         """开了长期记忆的会话以前的聊天，接在管理台本次显示的消息前面。"""
         chat = validate_target(chat)
@@ -679,6 +689,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                     return self.send(200, controller.llm_models(data))
                 if path == '/api/chat-settings':
                     return self.send(200, controller.set_chat_settings(data))
+                if path == '/api/chat-forget':
+                    return self.send(200, controller.forget_chat(data))
                 actions = {'/api/start': lambda: controller.start(), '/api/stop': lambda: controller.stop(),
                     '/api/restart': lambda: controller.restart(),
                     '/api/account': lambda: controller.bind_account(data),

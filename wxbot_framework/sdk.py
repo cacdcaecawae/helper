@@ -78,6 +78,7 @@ class ServiceFacade:
         self.text_delay = TextSendDelay.from_config(text_delay)
         self.message_observer = None
         self.trace_observer = None  # 管理台设置：接收智能体每一步，显示在聊天时间线
+        self.sent_recorder = None  # 运行时设置：发出的文字交给它补记进聊天记录
 
     def _sent(self, result, backend, chat_id, msg_type, *, text='', path=''):
         observer = self.message_observer
@@ -89,6 +90,12 @@ class ServiceFacade:
                           'file_name': str(path).replace('\\', '/').rsplit('/', 1)[-1] if path else ''}))
             except Exception:
                 logger.warning('发送已完成，消息监控记录暂不可用')
+        recorder = self.sent_recorder
+        if recorder is not None and result is not False and msg_type == 1 and text:
+            try:
+                recorder(chat_id, text, backend.session_id)
+            except Exception:
+                logger.warning('发送已完成，聊天记录暂未写入')
         return result
 
     def bind(self, backend):

@@ -24,7 +24,7 @@ class Plugin:
         personality = ctx.personality(message)
         try:
             snapshot = self.members.conversation_snapshot(message)
-            guard = lambda: ctx.response_guard(snapshot, personality)
+            guard = lambda: self.members.reply_guard(message.chat_id, lambda: ctx.response_guard(snapshot, personality))
             reply = personality_text(Dialogue(ctx.llm_for(message, personality=personality)).reply(snapshot),
                                      personality.name)
             display = self.members.display_name(message.sender_id, message.chat_id) or snapshot.speaker_name

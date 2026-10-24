@@ -41,7 +41,7 @@
         
       </aside>
       <div class="hc-conversation" id="chat-conversation">
-        <header class="hc-chat-header"><button id="chat-back" type="button" aria-label="返回会话列表">‹</button><div><h2 id="chat-heading">选择一个会话</h2><small id="chat-switch-hint" class="hc-switch-hint" role="status"></small></div><div id="chat-switches" class="hc-chat-switches hidden"><label class="hc-switch" title="记录这个会话的全部聊天，机器人长期记得"><input type="checkbox" role="switch" id="chat-memory">长期记忆</label><label class="hc-switch" title="群里被艾特、私聊收到消息时自动回复（会一并开启长期记忆）"><input type="checkbox" role="switch" id="chat-reply">自动回复</label></div></header>
+        <header class="hc-chat-header"><button id="chat-back" type="button" aria-label="返回会话列表">‹</button><div><h2 id="chat-heading">选择一个会话</h2><small id="chat-switch-hint" class="hc-switch-hint" role="status"></small></div><div id="chat-switches" class="hc-chat-switches hidden"><label class="hc-switch" title="记录这个会话的全部聊天，机器人长期记得"><input type="checkbox" role="switch" id="chat-memory">长期记忆</label><label class="hc-switch" title="群里被艾特、私聊收到消息时自动回复（会一并开启长期记忆）"><input type="checkbox" role="switch" id="chat-reply">自动回复</label><button type="button" id="chat-forget" class="hc-forget hidden" title="机器人忘掉这个会话以前的聊天；开关不变，之后的新消息照常记">清空记忆</button></div></header>
         <section id="chat-timeline" class="hc-timeline" aria-label="聊天消息" aria-live="polite"></section>
             <section class="settings-section manual-send hc-composer" aria-labelledby="send-heading">
       <div class="section-heading"><h2 id="send-heading">发送消息</h2><button id="refresh-send-chats" class="secondary small" type="button">刷新会话</button></div>

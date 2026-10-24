@@ -258,6 +258,15 @@ $('#llm-form').elements.provider.onchange = () => loadModels(true);
 // 开自动回复会一并开长期记忆；关长期记忆会一并关自动回复（自动回复离不开聊天记录）。
 $('#chat-memory').onchange = e => saveChatSwitch(e.target.checked, e.target.checked && $('#chat-reply').checked);
 $('#chat-reply').onchange = e => saveChatSwitch($('#chat-memory').checked || e.target.checked, e.target.checked);
+$('#chat-forget').onclick = async () => {
+  const chat=$('#send-chat').value,requested=robot,name=$('#chat-heading').textContent;
+  if(!chat||!confirm(`清空「${name}」的长期记忆？\n机器人会忘掉以前的聊天，开关不变，之后的新消息照常记录。`))return;
+  try{
+    const {cleared}=await api('chat-forget',{chat_id:chat},requested);if(requested!==robot)return;
+    chatHistory.delete(requested+':'+chat);switchHint={chat,text:`已清空 ${cleared} 条记忆`};
+  }catch(error){switchHint={chat,text:error.message};}
+  chatListMarkup='';chatTimelineSignature='';renderChatWorkspace();
+};
 $('#llm-form').elements.base_url.onchange = $('#llm-form').elements.api_key.onchange = () => loadModels();
 $('#llm-load-models').onclick = () => loadModels();
 const lines = value => [...new Set(value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean))];
@@ -488,6 +497,7 @@ function renderChatWorkspace(){
   // 每个会话两个开关；没连上微信时改不了，先藏起来。
   $('#chat-switches').classList.toggle('hidden',!selected||!connected);
   $('#chat-memory').checked=!!row?.memory;$('#chat-reply').checked=!!row?.reply;
+  $('#chat-forget').classList.toggle('hidden',!row?.memory);
   $('#chat-switch-hint').textContent=switchHint.chat===selected?switchHint.text:'';
   $('#chat-mention-toggle').classList.toggle('hidden',!selected.endsWith('@chatroom'));
   $('#chat-mention-toggle').textContent='@'+(mentionSelection.size?' '+mentionSelection.size:'');

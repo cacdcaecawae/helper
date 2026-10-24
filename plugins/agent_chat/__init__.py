@@ -3,8 +3,9 @@
 开启后代替“艾特对话”；每一步思考和工具调用都推送到管理台聊天页。
 哪些会话记录、哪些自动回复，由聊天页顶部每个会话的“长期记忆”“自动回复”两个开关决定。
 记忆就是这个群或私聊的完整聊天记录（所有人＋机器人自己说的），太长时把较早部分压成摘要，原文都保留可查。
-插件选项：tools 可用工具；image_server 本机画图服务地址。
+插件选项：tools 可用工具；image_server 本机画图服务地址；replies_per_minute 每个会话每分钟最多自动回复几次（默认 5，防刷屏）。
 """
+from collections import deque
 import json
 from pathlib import Path
 import re
@@ -44,6 +45,10 @@ class Plugin:
         if not isinstance(tools, list) or not set(tools) <= set(TOOLS):
             raise ValueError("tools 只能包含 " + "、".join(TOOLS))
         self.tools = frozenset(tools)
+        self.per_minute = ctx.config.get("replies_per_minute", 5)
+        if type(self.per_minute) is not int or not 1 <= self.per_minute <= 60:
+            raise ValueError("replies_per_minute 应为 1–60 的整数")
+        self.recent = {}  # 会话 → 最近一分钟开始回复的时刻
         self.image = ImageServer(ctx.config.get("image_server", "http://127.0.0.1:7860")) if "draw_image" in tools else None
         ctx.llm  # 启动时核对配置，不请求接口。
 
@@ -54,6 +59,15 @@ class Plugin:
             return False
         return not message.is_group or ("WXBOT_AT_CHAT_PROBE" not in message.text and bool(message.data.get("is_at_self"))
                                          and self.members.account in message.data.get("at_members", ()))
+
+    def _too_frequent(self, chat):
+        now, recent = time.monotonic(), self.recent.setdefault(chat, deque())
+        while recent and now - recent[0] > 60:
+            recent.popleft()
+        if len(recent) >= self.per_minute:
+            return True
+        recent.append(now)
+        return False
 
     def on_message(self, message, ctx):
         # 每来一条消息都看看记忆是否超长（不只在艾特时），艾特时拼出的材料就不会超过上限。
@@ -66,12 +80,16 @@ class Plugin:
         def trace(kind, text="", status=None):
             ctx.trace(message, run, {"kind": kind, "text": text, **({"status": status} if status else {})})
 
+        if self._too_frequent(message.chat_id):  # 防刷屏：每个会话每分钟最多回 per_minute 次，额度不被刷光
+            trace("error", f"一分钟内已回复 {self.per_minute} 次，这条先不回（防刷屏）", status="error")
+            return
         personality = ctx.personality(message)
-        guard = lambda: ctx.personality_guard(personality)
+        # 每次发送前都再确认“自动回复”还开着：生成途中关掉就不发。
+        guard = lambda: self.members.reply_guard(message.chat_id, lambda: ctx.personality_guard(personality))
         try:
             if message.is_group:
                 snapshot = self.members.conversation_snapshot(message)
-                guard = lambda: ctx.response_guard(snapshot, personality)
+                guard = lambda: self.members.reply_guard(message.chat_id, lambda: ctx.response_guard(snapshot, personality))
                 name, current = snapshot.speaker_name, strip_at_labels(snapshot.current)
             else:
                 name, current = message.data.get("sender_wechat_name") or "对方", message.text
@@ -87,12 +105,12 @@ class Plugin:
             display = None
             if message.is_group:
                 display = self.members.display_name(message.sender_id, message.chat_id) or snapshot.speaker_name
-            # 发出的文字由原生层回传、语音由语音模块补记，都会进聊天记录，这里不用另存。
+            # 发出的话都会进聊天记录：群里文字由原生层回传，私聊文字在发送时补记，语音由语音模块补记。
             for index, part in enumerate(parts):
                 deliver_model_reply(ctx, message, part, display_name=display if index == 0 else None, delivery_guard=guard)
             trace("done", f"{len(parts)} 条回复，用时 {time.monotonic() - started:.1f} 秒", status="done")
         except SnapshotExpired:
-            trace("error", "已取消：聊天记录或人格已变更", status="error")
+            trace("error", "已取消：自动回复已关闭，或聊天记录、人格已变更", status="error")
         except LLMError as error:
             trace("error", str(error), status="error")
             ctx.logger.warning("智能体回复失败：%s", error)

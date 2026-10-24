@@ -134,16 +134,77 @@ class MemberTests(unittest.TestCase):
         self.assertEqual([row["text"] for row in store.chat_history(friend, before=third)], ["第一句", "第二句"])
         self.assertIn(friend, store.remembered_chats())
 
+    def test_runtime_records_switched_chats_past_old_allowlist_and_own_private_texts(self):
+        (self.root / "plugins").mkdir()
+        path = self.root / "bot_config.json"
+        path.write_text(json.dumps({"backend": "native_text", "wechat_account": ROBOT, "chat_allowlist": ["filehelper"],
+                                    "members_config_file": self.config_path.name}), encoding="utf-8")
+        app = BotApplication(self.root, ConfigStore(path))
+        friend = "wxid_friend"
+        try:
+            app.members.set_chat(friend, memory=True, reply=True)
+            with patch.object(app.plugins, "dispatch") as dispatch:
+                app._emit(Message("在吗", friend, friend, session_id="first", sequence=1))
+            dispatch.assert_called_once()  # 不在旧白名单里，但开了开关
+            backend = Mock(session_id="first")
+            backend.send_text.return_value = True
+            app.service.bind(backend)
+            # 私聊里自己发的话原生层不回传，发送时补记，下一轮上下文里才有机器人上一轮的回答
+            app.service.send_text(friend, "在的", expected_session="first")
+            self.assertEqual([(line["name"], line["text"]) for line in app.members.memory(friend)[1]],
+                             [("对方", "在吗"), ("你", "在的")])
+        finally:
+            app.stop()
+
+    def test_reply_guard_blocks_sending_after_auto_reply_is_switched_off(self):
+        from wxbot_framework.members import SnapshotExpired
+        friend = "wxid_friend"
+        self.store.set_chat(friend, memory=True, reply=True)
+        with self.store.reply_guard(friend):
+            pass
+        self.store.set_chat(friend, memory=True, reply=False)  # 生成途中关掉自动回复
+        with self.assertRaises(SnapshotExpired):
+            with self.store.reply_guard(friend):
+                self.fail("不应发送")
+
+    def test_forget_clears_memory_keeps_switches_and_blocks_backfilling_older_lines(self):
+        friend = "wxid_friend"
+        self.store.set_chat(friend, memory=True, reply=True)
+        self.store.record(Message("以前的话", friend, friend, session_id="first", sequence=1))
+        shown = datetime.now(timezone.utc).timestamp()
+        self.assertEqual(self.store.forget(friend), 1)
+        self.assertEqual((self.store.memory(friend), self.store.chat_setting(friend)), (("", []), {"memory": True, "reply": True}))
+        row = {"timestamp": shown, "content": "清空前窗口里的话", "direction": "incoming", "sender_id": friend, "sender_name": "小王"}
+        self.assertEqual(self.store.backfill(friend, [row]), 0)  # 清空前的不会被补回来
+        self.store.record(self.message("群里以前的话", sequence=2))
+        self.assertEqual(self.store.forget(ROOM), 1)  # 群里同 /清空
+        self.assertEqual(self.store.memory(ROOM), ("", []))
+
+    def test_legacy_question_table_and_its_summary_cursor_are_retired(self):
+        import sqlite3
+        db = sqlite3.connect(self.root / "data.sqlite3")
+        db.executescript("""CREATE TABLE agent_turns (id INTEGER PRIMARY KEY, account TEXT, chat TEXT, sender TEXT,
+                                at TEXT, asked TEXT, answered TEXT);
+                            CREATE TABLE agent_summaries (account TEXT NOT NULL, chat TEXT NOT NULL, summary TEXT NOT NULL,
+                                upto INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account,chat));""")
+        db.execute("INSERT INTO agent_summaries VALUES(?,?,?,?)", (ROBOT, ROOM, "旧摘要", 100))  # 指向旧表的 id
+        db.commit()
+        db.close()
+        store = self.create_store()
+        store.record(self.message("新消息", sequence=1))
+        self.assertEqual([line["text"] for line in store.memory(ROOM)[1]], ["新消息"])
+        self.assertEqual(store.memory(ROOM)[0], "")
+
     def test_private_chat_and_spoken_replies_are_recorded(self):
         friend = "wxid_friend"
         private = lambda text, sequence, chat=friend, **kwargs: Message(text, chat, chat, session_id="first",
                                                                          sequence=sequence, **kwargs)
         self.store.set_chat(friend, memory=True, reply=False)
         self.assertTrue(self.store.record(private("推荐本书", 2, data={"sender_wechat_name": "小王"})))
-        self.assertTrue(self.store.record_spoken(private("推荐本书", 2), "推荐《白夜行》"))  # 语音回复没有文字回传，补记
+        self.assertTrue(self.store.record_own(friend, "推荐《白夜行》", "first"))  # 语音回复没有文字回传，补记
         self.assertEqual([(line["name"], line["text"]) for line in self.store.memory(friend)[1]],
                          [("小王", "推荐本书"), ("你", "推荐《白夜行》")])
-        self.assertFalse(self.store.record_spoken(private("x", 3, chat="wxid_other"), "不在白名单不记"))
+        self.assertFalse(self.store.record_own("wxid_other", "没开长期记忆不记", "first"))
 
     def test_search_combines_day_speaker_and_keyword(self):
         clock = [datetime(2026, 10, 19, 4, 0, tzinfo=timezone.utc)]  # 北京 10-19 12:00

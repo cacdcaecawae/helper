@@ -363,7 +363,7 @@ class FrameworkTests(unittest.TestCase):
         self.config["chat_allowlist"] = ["filehelper"]
         self.write_config()
         app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
-        app.members = Mock()
+        app.members = Mock(**{"remembers.return_value": False, "replies.return_value": False})  # 聊天页开关都关
         room = "87654321@chatroom"
         sender = "wxid_example_member"
         body = "本条群正文不应出现在日志中"

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from plugins.agent_chat import Plugin
 from wxbot_framework.agent import MAX_OBSERVATION, Agent, ImageServer, ToolError, draw_tool, history_tool
 from wxbot_framework.llm import LLMError
+from wxbot_framework.members import SnapshotExpired
 from wxbot_framework.message_monitor import MessageBuffer
 from wxbot_framework.sdk import Message
 
@@ -145,11 +146,23 @@ class FakeTimeline:
         self.lines, self.compacted, self.summary, self.upto = [], [], "", 0
         self.account = "wxid_bot"
 
+    reply_chats = {"wxid_friend"}
+
     def remembers(self, chat):
         return chat in ("123@chatroom", "wxid_friend")
 
     def replies(self, chat):
-        return chat == "wxid_friend"
+        return chat in self.reply_chats
+
+    def reply_guard(self, chat, inner=None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def guard():
+            if chat not in self.reply_chats:
+                raise SnapshotExpired("自动回复已关闭")
+            yield
+        return guard()
 
     def add(self, name, text):
         self.lines.append({"id": len(self.lines) + 1, "at": "2026-10-23T06:00:00+00:00", "name": name, "text": text})
@@ -174,19 +187,22 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.timeline = FakeTimeline()
         self.plugin = Plugin()
         self.plugin.members = self.timeline
-        self.plugin.tools, self.plugin.image = frozenset(), None
+        self.plugin.tools, self.plugin.image, self.plugin.per_minute, self.plugin.recent = frozenset(), None, 5, {}
+        self.traces = []
         self.sent, self.llm = [], ScriptedLLM({"reply": "推荐《星际穿越》。\n\n周末看正合适。"}, {"reply": "讲的是穿越虫洞找新家园。"})
         self.summarizer = SimpleNamespace(calls=[], complete_json=lambda system, user: self.summarizer.calls.append(
             json.loads(user)) or {"summary": "较早的聊天"}, provider="openai_compatible")
 
         def reply(message, text, delivery_guard=None):
-            self.sent.append(text)
-            self.timeline.add("你", text)  # 原生层回传机器人发出的文字
+            with delivery_guard():  # 和真实发送一样，发送前过一遍保护
+                self.sent.append(text)
+                self.timeline.add("你", text)  # 发出的文字进聊天记录
             return True
         self.ctx = SimpleNamespace(
             llm=self.summarizer, logger=SimpleNamespace(warning=lambda *a: None),
             personality=lambda message: PersonalityState(message.chat_id), personality_guard=lambda state: None,
-            llm_for=lambda message, personality=None: self.llm, trace=lambda *a: None, reply=reply)
+            llm_for=lambda message, personality=None: self.llm, reply=reply,
+            trace=lambda message, run, step: self.traces.append(step["text"]))
 
     def say(self, text, chat="wxid_friend", sender="wxid_friend", **kwargs):
         self.timeline.add("小王", text)  # 运行时先记录收到的消息，再分发给插件
@@ -201,6 +217,23 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.assertEqual(second["chat"], ["10-23 14:00 小王：推荐个电影", "10-23 14:00 你：推荐《星际穿越》。",
                                           "10-23 14:00 你：周末看正合适。"])
         self.assertEqual(self.timeline.compacted, [])
+
+    def test_switching_auto_reply_off_during_generation_cancels_sending(self):
+        def answer(system, user, *, first_object=False):
+            self.timeline.reply_chats.discard("wxid_friend")  # 模型还在生成时，页面上关掉了自动回复
+            return {"reply": "好的"}
+        self.llm = SimpleNamespace(complete_json=answer)
+        self.say("在吗")
+        self.assertEqual(self.sent, [])
+        self.assertIn("自动回复已关闭", self.traces[-1])
+
+    def test_rate_limit_skips_replies_beyond_the_per_minute_cap(self):
+        self.plugin.per_minute = 2
+        self.llm = ScriptedLLM({"reply": "一"}, {"reply": "二"})
+        for text in ("1", "2", "3"):
+            self.say(text)
+        self.assertEqual(self.sent, ["一", "二"])  # 第三条没调用模型
+        self.assertIn("防刷屏", self.traces[-1])
 
     def test_search_is_offered_in_private_chats_too(self):
         self.plugin.tools = frozenset({"search_history"})

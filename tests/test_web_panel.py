@@ -176,6 +176,8 @@ class ControllerTests(PanelFixture):
         self.assertEqual({key: self.controller.chats()[0][key] for key in ('memory', 'reply')}, {'memory': True, 'reply': False})
         with self.assertRaises(ValueError):
             self.controller.set_chat_settings({'chat_id':'../x', 'memory':True, 'reply':False})
+        members.forget = lambda chat: 3
+        self.assertEqual(self.controller.forget_chat({'chat_id':'123@chatroom'}), {'cleared': 3})
         self.wait_stopped()
 
     def test_remembered_chats_are_listed_and_history_loads_after_restart(self):

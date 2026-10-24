@@ -100,7 +100,7 @@ class RuntimeMonitorTests(unittest.TestCase):
     def app(self):
         app = BotApplication.__new__(BotApplication)
         app.config = {'chat_allowlist': ['filehelper']}
-        app.members, app.plugins = Mock(), Mock()
+        app.members, app.plugins = Mock(**{"remembers.return_value": False, "replies.return_value": False}), Mock()  # 聊天页开关都关
         app.plugins.is_active.return_value = False
         return app
 

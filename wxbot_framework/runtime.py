@@ -29,6 +29,10 @@ class BotApplication:
         self.message_observer = None
         self.service.message_observer = self._observe_message
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
+        if self.members is not None:
+            # 私聊里自己发的话原生层不回传（群里会），发送时补记，智能体才记得自己说过什么。
+            self.service.sent_recorder = lambda chat, text, session: (
+                chat.endswith("@chatroom") or self.members.record_own(chat, text, session))
         generic = self.config.get("backend") == "native_text"
         capabilities = TEXT_CAPABILITIES if generic else CAPABILITIES
         self.plugins = PluginManager(root / "plugins", store, self.service, capabilities,
@@ -168,7 +172,10 @@ class BotApplication:
                         message.sender_id or message.chat_id,
                         json.dumps(message.text, ensure_ascii=False))
         allowed = self.config.get("chat_allowlist", [])
-        if not allowed or message.chat_id in allowed:
+        # 聊天页开了“长期记忆”或“自动回复”的会话不受旧的收发白名单限制。
+        switched = self.members is not None and (self.members.remembers(message.chat_id) or
+                                                 self.members.replies(message.chat_id))
+        if not allowed or message.chat_id in allowed or switched:
             if self.members is not None:
                 try:
                     self.members.record(message)
