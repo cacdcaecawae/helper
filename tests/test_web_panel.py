@@ -187,11 +187,14 @@ class ControllerTests(PanelFixture):
             seen.append((client.provider, client.endpoint, client._api_key))
             return ['model-a']
         with patch('wxbot_framework.llm.LLMClient.list_models', models):
-            result = self.controller.llm_models({'provider':'openai_compatible', 'base_url':'https://gateway.example.test/v1'})
+            result = self.controller.llm_models({'provider':'openai_compatible', 'base_url':data['base_url']})
+            # 地址改了又没填密钥：不能把已保存的密钥发到新地址
+            with self.assertRaisesRegex(PanelError, '接口地址已更改'):
+                self.controller.llm_models({'provider':'openai_compatible', 'base_url':'https://gateway.example.test/v1'})
             self.controller.llm_models({'base_url':'https://gateway.example.test/v1', 'api_key':' typed-key '})
         self.assertEqual(result, {'models':['model-a'], 'default':None})
-        self.assertEqual(seen, [('openai_compatible', 'https://gateway.example.test/v1/chat/completions', 'private-model-key'),
-                                ('openai_compatible', 'https://gateway.example.test/v1/chat/completions', 'typed-key')])
+        self.assertEqual([key for _, _, key in seen], ['private-model-key', 'typed-key'])
+        self.assertEqual(seen[1][1], 'https://gateway.example.test/v1/chat/completions')
         self.assertEqual(read_json(path)['api_key'], 'private-model-key')
 
     def test_compatible_llm_options_round_trip_without_changing_saved_key(self):

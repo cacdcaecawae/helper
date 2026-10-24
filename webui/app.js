@@ -242,7 +242,7 @@ $('#llm-model-select').onchange = e => {
   if (e.target.value) input.value = e.target.value; else input.focus();
 };
 $('#llm-form').elements.provider.onchange = () => loadModels(true);
-$('#llm-form').elements.base_url.onchange = () => loadModels();
+$('#llm-form').elements.base_url.onchange = $('#llm-form').elements.api_key.onchange = () => loadModels();
 $('#llm-load-models').onclick = () => loadModels();
 const lines = value => [...new Set(value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean))];
 async function save(data, message) { await api('config',data); await loadConfig(); toast(message||'配置已保存，下次启动生效'); }

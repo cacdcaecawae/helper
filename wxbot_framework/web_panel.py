@@ -308,20 +308,22 @@ class PanelController:
         return result
 
     def llm_models(self, data):
-        """按页面当前选择的接入方式取模型列表；未填的密钥沿用已保存的，不回传密钥。"""
+        """按页面当前选择的接入方式取模型列表；未填的密钥只在接口地址没变时沿用已保存的，不回传密钥。"""
         path = self._paths(self.store.load()).get('llm')
-        options = read_json(path) if path else {}
-        options.update({key: data[key] for key in ('provider', 'base_url') if key in data})
+        saved = read_json(path) if path else {}
+        options = dict(saved, **{key: data[key] for key in ('provider', 'base_url') if key in data})
         key = data.get('api_key', '')
         if isinstance(key, str) and key.strip():
             options['api_key'] = key.strip()
+        elif options.get('provider') != 'codex' and options.get('base_url') != saved.get('base_url'):
+            # 页面改地址会自动拉列表；已保存的密钥只发给保存时的地址，防止发到新填（可能填错）的地址。
+            raise PanelError('接口地址已更改，请先填写该地址的 API 密钥再获取模型列表')
         options['model'] = options.get('model') or 'list-only'
-        from .llm import LLMClient, LLMError
+        from .llm import CODEX_DEFAULT_MODEL, LLMClient, LLMError
         try:
             client = LLMClient(options)
-            from .llm import CODEX_DEFAULT_MODEL
             return {'models': client.list_models(), 'default': CODEX_DEFAULT_MODEL if client.provider == 'codex' else None}
-        except LLMError as error:
+        except (LLMError, ValueError) as error:  # 配置不完整时 LLMClient 抛 ValueError
             raise PanelError(str(error)) from None
 
     def message_tail(self, after=0):
