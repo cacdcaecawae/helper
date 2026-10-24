@@ -76,7 +76,7 @@ class NativeTextService(NativeFileHelperService):
                  file_directory=None, **options):
         super().__init__(**options)
         self.preferred_account = validate_account(account) if account is not None else None
-        self.router = TextRouter(include_self_groups=True)
+        self.router = TextRouter(include_self=True)
         self.chats = {}
         self._next_account_check = 0
         self._sent_texts = deque(maxlen=64)
@@ -102,7 +102,7 @@ class NativeTextService(NativeFileHelperService):
         return self.router.self_wxid
 
     def start(self):
-        self.router = TextRouter(include_self_groups=True)
+        self.router = TextRouter(include_self=True)
         self.chats = {}
         self._sent_texts.clear()
         if self.pid is None:

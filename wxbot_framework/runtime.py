@@ -30,7 +30,7 @@ class BotApplication:
         self.service.message_observer = self._observe_message
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
         if self.members is not None:
-            # 私聊里自己发的话原生层不回传（群里会），发送时补记，智能体才记得自己说过什么。
+            # 私聊里本程序发出的文字在发送时补记（回传标为 bot_generated，不重复记）；手动发的由回传记录。
             self.service.sent_recorder = lambda chat, text, session: (
                 chat.endswith("@chatroom") or self.members.record_own(chat, text, session))
         generic = self.config.get("backend") == "native_text"
@@ -101,7 +101,7 @@ class BotApplication:
             if not allowed or message.chat_id in allowed:
                 self._dispatch_recall_plugins(message)
             return
-        if message.is_self and message.data.get('native_message_id') and not message.data.get('dispatch_to_plugins', True) and (
+        if message.is_self and message.is_group and message.data.get('native_message_id') and not message.data.get('dispatch_to_plugins', True) and (
                 not allowed or message.chat_id in allowed):
             self._dispatch_recall_plugins(message)
         if message.type in (10000, 10002):

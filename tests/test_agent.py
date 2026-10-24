@@ -155,6 +155,9 @@ class FakeTimeline:
     def epoch(self, chat):
         return self.wipes
 
+    def has_newer(self, message):
+        return self.lines[-1]["text"] != message.text
+
     def reply_guard(self, chat, epoch, inner=None):
         from contextlib import contextmanager
 
@@ -183,6 +186,7 @@ class FakeTimeline:
     def compact_memory(self, chat, summary, upto, epoch):
         self.compacted.append((summary, upto))
         self.summary, self.upto = summary, upto
+        return True
 
 
 class AgentPluginConversationTests(unittest.TestCase):
@@ -244,6 +248,15 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.say("我喜欢什么")
         self.assertEqual((self.sent, self.timeline.lines), ([], []))  # 没发出去，也没写回记忆
 
+    def test_a_burst_of_private_messages_gets_one_reply_to_the_latest(self):
+        self.timeline.add("小王", "在吗")
+        self.timeline.add("小王", "周六有空吗")  # 处理“在吗”时，下一条已经到了
+        self.plugin.on_message(Message("在吗", "wxid_friend", "wxid_friend"), self.ctx)
+        self.assertEqual((self.sent, self.llm.calls), ([], []))
+        self.plugin.on_message(Message("周六有空吗", "wxid_friend", "wxid_friend"), self.ctx)
+        self.assertEqual(self.llm.calls[0][1]["chat"], ["10-23 14:00 小王：在吗"])  # 前一条在上下文里
+        self.assertEqual(self.llm.calls[0][1]["current"], "周六有空吗")
+
     def test_rate_limit_skips_replies_beyond_the_per_minute_cap(self):
         self.plugin.per_minute = 2
         self.llm = ScriptedLLM({"reply": "一"}, {"reply": "二"})
@@ -273,13 +286,33 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.plugin._compact("wxid_friend", self.ctx)
         self.assertEqual(self.timeline.compacted, [("较早的聊天", 1)])
 
+    def test_a_large_backlog_is_compacted_in_batches_that_fit_the_window(self):
+        from plugins.agent_chat import MEMORY_CHARS
+        for index in range(30):  # 插件关着期间攒下 7.5 倍上限
+            self.timeline.add("小王", "长" * (MEMORY_CHARS // 4))
+        self.plugin._compact("wxid_friend", self.ctx)
+        self.assertGreater(len(self.summarizer.calls), 1)
+        self.assertTrue(all(sum(len(line) for line in call["chat"]) <= MEMORY_CHARS + 100 for call in self.summarizer.calls))
+        self.assertLessEqual(self.timeline.memory_size("wxid_friend"), MEMORY_CHARS)
+
+    def test_reply_context_stays_within_the_limit_when_compaction_fails(self):
+        from plugins.agent_chat import MEMORY_CHARS
+
+        def broken(system, user):
+            raise LLMError("压缩失败")
+        self.ctx.llm = SimpleNamespace(complete_json=broken, provider="openai_compatible")
+        for index in range(6):
+            self.timeline.add("小王", "长" * (MEMORY_CHARS // 4))
+        self.say("还记得吗")
+        self.assertLessEqual(sum(len(line) for line in self.llm.calls[0][1]["chat"]), MEMORY_CHARS + 100)
+
     def test_plain_group_chatter_also_triggers_compaction(self):
         from plugins.agent_chat import MEMORY_CHARS
         for index in range(3):
             self.timeline.add("群友", "长" * MEMORY_CHARS)
         self.say("没艾特机器人的闲聊", chat="123@chatroom", sender="wxid_x", is_group=True)
         self.assertEqual(self.sent, [])  # 不回复，但记忆照样整理
-        self.assertEqual(len(self.timeline.compacted), 1)
+        self.assertTrue(self.timeline.compacted)
 
 if __name__ == "__main__":
     unittest.main()

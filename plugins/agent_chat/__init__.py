@@ -80,6 +80,9 @@ class Plugin:
         def trace(kind, text="", status=None):
             ctx.trace(message, run, {"kind": kind, "text": text, **({"status": status} if status else {})})
 
+        if not message.is_group and self.members.has_newer(message):
+            trace("done", "对方又发了消息，合并到最新一条一起回", status="done")
+            return
         if self._too_frequent(message.chat_id):  # 防刷屏：每个会话每分钟最多回 per_minute 次，额度不被刷光
             trace("error", f"一分钟内已回复 {self.per_minute} 次，这条先不回（防刷屏）", status="error")
             return
@@ -95,6 +98,10 @@ class Plugin:
                 name, current = message.data.get("sender_wechat_name") or "对方", message.text
             # 材料：较早聊天的摘要 ＋ 之后的全部聊天原文（所有人和你自己）＋ 这次的话。
             summary, lines = self.members.memory(message.chat_id, exclude=message)
+            start, total = 0, sum(len(line["text"]) for line in lines)
+            while total > MEMORY_CHARS:  # 压缩没成功时也不超量发送：去掉最早的几条
+                total, start = total - len(lines[start]["text"]), start + 1
+            lines = lines[start:]
             context = {"scene": "群聊" if message.is_group else "私聊", "name": name,
                        "summary": summary, "chat": transcript(lines), "current": current}
             trace("start", current[:300])
@@ -124,24 +131,30 @@ class Plugin:
 
     def _compact(self, chat, ctx):
         epoch = self.members.epoch(chat)  # 压缩途中清空了就不写回
-        if self.members.memory_size(chat) <= MEMORY_CHARS:
-            return
-        summary, lines = self.members.memory(chat)
-        if len(lines) <= 2:
-            return
-        cut, kept = len(lines), 0  # 从最新往回数，留下不超过 KEEP_CHARS 字的原文，至少留 2 条
-        while cut > 0 and kept + len(lines[cut - 1]["text"]) <= KEEP_CHARS:
-            cut, kept = cut - 1, kept + len(lines[cut - 1]["text"])
-        older = lines[:min(cut, len(lines) - 2)]
-        try:
-            result = ctx.llm.complete_json(COMPACT, json.dumps(
-                {"earlier_summary": summary, "chat": transcript(older)}, ensure_ascii=False))
-        except LLMError as error:
-            ctx.logger.warning("智能体记忆压缩失败，下次再试：%s", error)
-            return
-        text = result.get("summary")
-        if isinstance(text, str) and text.strip():
-            self.members.compact_memory(chat, text.strip()[:3000], older[-1]["id"], epoch)
+        # 每批最多整理 MEMORY_CHARS 字：积压很多时（比如插件关着期间一直在记）分几批，不会一次超出模型窗口。
+        while self.members.memory_size(chat) > MEMORY_CHARS:
+            summary, lines = self.members.memory(chat)
+            cut, kept = len(lines), 0  # 从最新往回数，留下不超过 KEEP_CHARS 字的原文，至少留 2 条
+            while cut > 0 and kept + len(lines[cut - 1]["text"]) <= KEEP_CHARS:
+                cut, kept = cut - 1, kept + len(lines[cut - 1]["text"])
+            older, size = [], 0
+            for line in lines[:min(cut, len(lines) - 2)]:
+                if older and size + len(line["text"]) > MEMORY_CHARS:
+                    break
+                older.append(line)
+                size += len(line["text"])
+            if not older:
+                return
+            try:
+                result = ctx.llm.complete_json(COMPACT, json.dumps(
+                    {"earlier_summary": summary, "chat": transcript(older)}, ensure_ascii=False))
+            except LLMError as error:
+                ctx.logger.warning("智能体记忆压缩失败，下次再试：%s", error)
+                return
+            text = result.get("summary")
+            if not (isinstance(text, str) and text.strip() and
+                    self.members.compact_memory(chat, text.strip()[:3000], older[-1]["id"], epoch)):
+                return
 
     def _toolbox(self, message, ctx, guard):
         tools = {}

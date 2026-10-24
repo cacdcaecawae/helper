@@ -130,7 +130,7 @@ class PersonalityTests(unittest.TestCase):
         self.assertEqual(self.store.personality(ROOM).name, "默认")
 
     def test_owner_phone_can_switch_and_default_style_does_not_modify_system(self):
-        router = TextRouter(include_self_groups=True)
+        router = TextRouter(include_self=True)
         router.set_account(ROBOT)
         data = router.convert(ROOM, ROBOT, ROBOT + ":\n/切换人格 夸夸")
         self.assertTrue(data["dispatch_to_plugins"])

@@ -39,8 +39,9 @@ def validate_mentions(room, members):
 class TextRouter:
     """先识别本账号，再区分会话与作者，避免回复自己同步过来的消息。"""
 
-    def __init__(self, *, include_self_groups=False):
-        self.include_self_groups = include_self_groups
+    def __init__(self, *, include_self=False):
+        # include_self：自己发的消息（手机、电脑上手动发的，和本程序发出的回传）也放行，只记录、显示，不分发给插件，不会回复自己。
+        self.include_self = include_self
         self.self_wxid = ""
         self.unidentified = 0
         self.unparsed_groups = 0
@@ -102,7 +103,7 @@ class TextRouter:
         else:
             return None
         own_group_input = bool(msg_type == 1 and room and own_group_command(body))
-        if not filehelper and is_self and not own_group_input and not (room and self.include_self_groups):
+        if not filehelper and is_self and not own_group_input and not self.include_self:
             self.ignored_self += 1
             return None
         if chat.startswith("gh_") or chat in SYSTEM_PEERS:
@@ -112,7 +113,7 @@ class TextRouter:
                 "chat_id": chat, "sender_id": author, "is_self": is_self,
                 "self_wxid": self.self_wxid, "native_sender": sender,
                 "native_receiver": receiver, "sequence": sequence,
-                "dispatch_to_plugins": not (room and is_self and not own_group_input),
+                "dispatch_to_plugins": filehelper or not is_self or own_group_input,
                 "native_thread_id": thread_id}
         if msg_type in (3, 49):
             result["raw_content"] = body

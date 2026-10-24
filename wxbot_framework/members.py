@@ -690,6 +690,8 @@ class MemberStore:
             return False
         if message.data.get("self_wxid", self.account) != self.account:
             return False
+        if message.is_self and not message.is_group and message.data.get("bot_generated"):
+            return False  # 私聊里本程序发出的文字发送时已补记（record_own），回传不重复记
         if message.is_group:
             validate_mentions(message.chat_id, [message.sender_id])
         else:
@@ -711,6 +713,16 @@ class MemberStore:
                  self._now().astimezone(timezone.utc).isoformat(), message.session_id, message.sequence,
                  int(message.is_self), int(bool(message.data.get("bot_generated")))))
             return result.rowcount > 0
+
+    def has_newer(self, message):
+        """对方在这条之后又发了话（已入库）：私聊连发几条时只回最新一条，像真人看完再一起回。
+        按收到时间比，补记进来的旧消息不算。"""
+        with self._lock:
+            db = self._connection()
+            row = db.execute("SELECT received_at FROM messages WHERE account=? AND room=? AND session_id=? AND sequence=? AND sequence>0",
+                             (self.account, message.chat_id, message.session_id, message.sequence)).fetchone()
+            return bool(row and db.execute("""SELECT 1 FROM messages WHERE account=? AND room=? AND is_self=0
+                AND received_at>? LIMIT 1""", (self.account, message.chat_id, row[0])).fetchone())
 
     def memory(self, chat, *, exclude=None):
         """智能体的记忆就是这个群或私聊的完整聊天记录：较早部分的摘要，加摘要之后的全部原文（按时间顺序）。

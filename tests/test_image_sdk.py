@@ -128,7 +128,7 @@ class ImageRoutingTests(unittest.TestCase):
                                        (ROOM, SELF, SELF + ":\n成语接龙")):
             self.assertIsNone(self.router.convert(sender, receiver, body, msg_type=3))
         self.assertEqual(self.router.ignored_self, 2)
-        router = TextRouter(include_self_groups=True)
+        router = TextRouter(include_self=True)
         router.set_account(SELF)
         data = router.convert(ROOM, SELF, SELF + ":\n/help", msg_type=3)
         self.assertTrue(data["is_self"])

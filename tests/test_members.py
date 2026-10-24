@@ -251,6 +251,32 @@ class MemberTests(unittest.TestCase):
         self.assertEqual([(line["name"], line["text"]) for line in self.store.memory(friend)[1]],
                          [("小王", "推荐本书"), ("你", "推荐《白夜行》")])
         self.assertFalse(self.store.record_own("wxid_other", "没开长期记忆不记", "first"))
+        # 手机上亲手回的话由回传记录；本程序发出的回传已在发送时补记，不重复
+        self.assertTrue(self.store.record(Message("我晚点看", friend, ROBOT, is_self=True, session_id="first", sequence=3)))
+        self.assertFalse(self.store.record(Message("推荐《白夜行》", friend, ROBOT, is_self=True, session_id="first",
+                                                   sequence=4, data={"bot_generated": True})))
+        self.assertEqual([(line["name"], line["text"]) for line in self.store.memory(friend)[1]],
+                         [("小王", "推荐本书"), ("你", "推荐《白夜行》"), ("你", "我晚点看")])
+
+    def test_has_newer_sees_later_lines_from_the_friend_only(self):
+        friend = "wxid_friend"
+        clock = [datetime(2026, 10, 24, 4, 0, tzinfo=timezone.utc)]
+        store = MemberStore(self.config_path, ROBOT, now=lambda: clock[0])
+        self.stores.append(store)
+        store.set_chat(friend, memory=True, reply=True)
+        first = Message("在吗", friend, friend, session_id="first", sequence=1)
+        store.record(first)
+        self.assertFalse(store.has_newer(first))
+        clock[0] += timedelta(seconds=1)
+        store.record_own(friend, "在的", "first")  # 自己说的不算
+        self.assertFalse(store.has_newer(first))
+        row = {"timestamp": (clock[0] - timedelta(minutes=5)).timestamp(), "content": "补记的旧话",
+               "direction": "incoming", "sender_id": friend, "sender_name": "小王"}
+        store.backfill(friend, [row])  # 补记进来的旧消息编号更大，但时间更早，也不算
+        self.assertFalse(store.has_newer(first))
+        clock[0] += timedelta(seconds=1)
+        store.record(Message("周六有空吗", friend, friend, session_id="first", sequence=2))
+        self.assertTrue(store.has_newer(first))
 
     def test_search_combines_day_speaker_and_keyword(self):
         clock = [datetime(2026, 10, 19, 4, 0, tzinfo=timezone.utc)]  # 北京 10-19 12:00

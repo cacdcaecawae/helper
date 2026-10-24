@@ -262,7 +262,7 @@ class DailySummaryTests(unittest.TestCase):
         self.assertTrue(all(0 < len(part.encode("utf-8")) <= 1023 for part in parts))
 
     def test_owner_group_messages_are_archived_without_reply_loops(self):
-        router = TextRouter(include_self_groups=True)
+        router = TextRouter(include_self=True)
         router.set_account(ROBOT)
         data = router.convert(ROOM, ROBOT, ROBOT + ":\n普通手机聊天")
         self.assertFalse(data["dispatch_to_plugins"])

@@ -54,6 +54,16 @@ class TextRoutingTests(unittest.TestCase):
         # 文件传输助手仍允许手机自己发送测试指令。
         self.assertTrue(self.identify()["is_self"])
 
+    def test_including_self_keeps_own_messages_for_recording_but_never_dispatches_them(self):
+        router = TextRouter(include_self=True)
+        router.convert(SELF, "filehelper", "init")
+        private = router.convert(SELF, FRIEND, "我手机上回的")
+        group = router.convert(GROUP, SELF, SELF + ":\n我在群里说的")
+        self.assertEqual((private["chat_id"], private["is_self"], private["dispatch_to_plugins"]), (FRIEND, True, False))
+        self.assertEqual((group["chat_id"], group["is_self"], group["dispatch_to_plugins"]), (GROUP, True, False))
+        self.assertTrue(router.convert(SELF, "filehelper", "/状态")["dispatch_to_plugins"])  # 文件传输助手的指令照常
+        self.assertTrue(router.convert(FRIEND, SELF, "好友的话")["dispatch_to_plugins"])
+
     def test_unrecognized_group_author_is_not_guessed(self):
         self.assertIsNone(self.router.convert(GROUP, SELF, "没有成员前缀"))
         self.assertIsNone(self.router.convert(GROUP, SELF, "普通内容:\n正文"))
