@@ -292,10 +292,10 @@ class PanelController:
             value = deepcopy(read_json(path))
             if name in ('llm', 'tts'):
                 result[name] = {key: value[key] for key in
-                    ('base_url', 'model', 'timeout_seconds', 'max_tokens', 'json_mode',
+                    ('provider', 'base_url', 'model', 'timeout_seconds', 'max_tokens', 'json_mode',
                      'token_limit_parameter', 'extra_body', 'default_voice', 'max_chars_per_clip') if key in value}
                 if name == 'llm':
-                    for key, default in (('json_mode', True), ('token_limit_parameter', 'max_tokens'), ('extra_body', {})):
+                    for key, default in (('provider', 'openai_compatible'), ('json_mode', True), ('token_limit_parameter', 'max_tokens'), ('extra_body', {})):
                         result[name].setdefault(key, default)
                 result[name]['api_key_configured'] = bool(value.get('api_key'))
             else:
@@ -303,6 +303,21 @@ class PanelController:
                 result['history_enabled'] = value.get('history_enabled', True)
                 result['daily_clear'] = value.get('daily_clear', True)
         return result
+
+    def llm_models(self, data):
+        """按页面当前选择的接入方式取模型列表；未填的密钥沿用已保存的，不回传密钥。"""
+        path = self._paths(self.store.load()).get('llm')
+        options = read_json(path) if path else {}
+        options.update({key: data[key] for key in ('provider', 'base_url') if key in data})
+        key = data.get('api_key', '')
+        if isinstance(key, str) and key.strip():
+            options['api_key'] = key.strip()
+        options['model'] = options.get('model') or 'list-only'
+        from .llm import LLMClient, LLMError
+        try:
+            return {'models': LLMClient(options).list_models()}
+        except LLMError as error:
+            raise PanelError(str(error)) from None
 
     def message_tail(self, after=0):
         return self.messages.tail(after)
@@ -344,7 +359,7 @@ class PanelController:
                 if name not in paths or not isinstance(data[name], dict):
                     raise PanelError('模型配置格式不正确')
                 value = read_json(paths[name])
-                fields = {'base_url', 'model', 'timeout_seconds'} | ({'max_tokens', 'json_mode', 'token_limit_parameter', 'extra_body'} if name == 'llm'
+                fields = {'base_url', 'model', 'timeout_seconds'} | ({'provider', 'max_tokens', 'json_mode', 'token_limit_parameter', 'extra_body'} if name == 'llm'
                             else {'default_voice', 'max_chars_per_clip'})
                 for key in fields:
                     if key in data[name]:
@@ -590,6 +605,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                     return self.send(200, hub.start_selected(data))
                 if path == '/api/send-text':
                     return self.send(200, controller.send_text(data))
+                if path == '/api/llm-models':
+                    return self.send(200, controller.llm_models(data))
                 actions = {'/api/start': lambda: controller.start(), '/api/stop': lambda: controller.stop(),
                     '/api/restart': lambda: controller.restart(),
                     '/api/account': lambda: controller.bind_account(data),

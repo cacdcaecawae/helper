@@ -1,9 +1,10 @@
-"""通过配置接入 OpenAI 兼容的大模型接口，不记录密钥或聊天正文。"""
+"""通过配置接入 OpenAI 兼容接口或本机 Codex 登录，不记录密钥或聊天正文。"""
 from __future__ import annotations
 
 import json
 import logging
 import math
+import os
 from ipaddress import ip_address
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -15,10 +16,20 @@ class LLMError(RuntimeError):
     pass
 
 
+CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+
+
+def _codex_home():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
 class LLMClient:
     def __init__(self, options):
         if not isinstance(options, dict):
             raise ValueError("大模型配置必须是 JSON 对象")
+        self.provider = options.get("provider", "openai_compatible")
+        if self.provider not in ("openai_compatible", "codex"):
+            raise ValueError("provider 应为 openai_compatible 或 codex")
         base_url = options.get("base_url", "https://api.deepseek.com")
         if not isinstance(base_url, str):
             raise ValueError("大模型 base_url 必须是接口地址字符串")
@@ -46,7 +57,7 @@ class LLMClient:
         self._api_key = options.get("api_key", "")
         if not isinstance(self.model, str) or not self.model.strip():
             raise ValueError("大模型 model 不能为空")
-        if not isinstance(self._api_key, str) or not self._api_key.strip():
+        if self.provider != "codex" and (not isinstance(self._api_key, str) or not self._api_key.strip()):
             raise ValueError("请在大模型配置文件中填写 api_key")
         self.timeout = options.get("timeout_seconds", 20)
         self.max_tokens = options.get("max_tokens", 512)
@@ -65,6 +76,8 @@ class LLMClient:
             raise ValueError("extra_body 应为 JSON 对象")
         reserved = {"model", "messages", "stream", "response_format", "max_tokens", "max_completion_tokens",
                     "api_key", "authorization", "Authorization"}
+        if self.provider == "codex":
+            reserved |= {"input", "instructions", "store", "text", "max_output_tokens"}
         if reserved.intersection(extra):
             raise ValueError("extra_body 不能覆盖模型、消息、输出格式、令牌上限或认证字段")
         try:
@@ -96,6 +109,8 @@ class LLMClient:
             payload["thinking"] = {"type": "disabled"}
         allow_fenced = not self.json_mode
         try:
+            if self.provider == "codex":
+                return self._parse_json(self._codex_text(system, user), allow_fenced)
             for attempt in range(2):
                 request = Request(self.endpoint,
                                   data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -129,19 +144,98 @@ class LLMClient:
                     raise LLMError("大模型返回了空结果" + suffix)
                 if not isinstance(content, str):
                     raise LLMError("大模型正文格式不正确")
-                content = content.strip()
-                if allow_fenced and content.startswith("```") and content.endswith("```"):
-                    opening, separator, body = content.partition("\n")
-                    if separator and opening.strip().lower() in ("```", "```json"):
-                        content = body[:-3].strip()
-                data = json.loads(content)
-                if not isinstance(data, dict):
-                    raise LLMError("大模型结果应为 JSON 对象")
-                return data
+                return self._parse_json(content, allow_fenced)
         except HTTPError as error:
             # 不输出响应正文或请求头，避免服务器错误回显密钥。
+            if self.provider == "codex":
+                hint = "；请在本机运行一次 codex 刷新登录" if error.code == 401 else "；请核对模型名称和 Codex 额度"
+                raise LLMError(f"Codex 接口 HTTP {error.code}{hint}") from None
             raise LLMError(f"大模型接口 HTTP {error.code}；请核对密钥、余额和模型配置") from None
         except (URLError, TimeoutError, OSError):
             raise LLMError("大模型连接失败或超时，请稍后再试") from None
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             raise LLMError("大模型响应格式不正确，请重试") from None
+
+    @staticmethod
+    def _parse_json(content, allow_fenced):
+        content = content.strip()
+        if allow_fenced and content.startswith("```") and content.endswith("```"):
+            opening, separator, body = content.partition("\n")
+            if separator and opening.strip().lower() in ("```", "```json"):
+                content = body[:-3].strip()
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            raise LLMError("大模型结果应为 JSON 对象")
+        return data
+
+    def list_models(self):
+        """可选模型 ID：Codex 读本机 models_cache.json（Codex 自己维护），兼容接口请求标准 /models。"""
+        if self.provider == "codex":
+            try:
+                models = json.loads((_codex_home() / "models_cache.json").read_text(encoding="utf-8-sig"))["models"]
+                result = [item["slug"] for item in models if item.get("visibility") == "list"
+                          and isinstance(item.get("slug"), str)]
+                if not result:
+                    raise ValueError
+                return result
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                raise LLMError("未找到 Codex 模型列表，请先在本机运行一次 codex") from None
+        request = Request(self.endpoint[:-len("/chat/completions")] + "/models",
+                          headers={"Authorization": "Bearer " + self._api_key})
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                raw = response.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                raise ValueError
+            result = sorted({item["id"] for item in json.loads(raw)["data"] if isinstance(item.get("id"), str)})
+            if not result:
+                raise ValueError
+            return result
+        except HTTPError as error:
+            raise LLMError(f"获取模型列表失败（HTTP {error.code}），请核对接口地址和密钥") from None
+        except (URLError, TimeoutError, OSError):
+            raise LLMError("获取模型列表失败：连接失败或超时") from None
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise LLMError("该接口没有提供标准模型列表，请手动填写模型名称") from None
+
+    def _codex_text(self, system, user):
+        # ponytail: 每次调用只读 Codex 的 token、不自行刷新（刷新会轮换 refresh_token，与 Codex 抢登录）；
+        # 长期不用 Codex 导致过期时，运行一次 codex 即可续期。
+        home = _codex_home()
+        try:
+            tokens = json.loads((home / "auth.json").read_text(encoding="utf-8-sig"))["tokens"]
+            token, account = tokens["access_token"], tokens["account_id"]
+            if not (isinstance(token, str) and token and isinstance(account, str) and account):
+                raise ValueError
+        except (OSError, ValueError, KeyError, TypeError):
+            raise LLMError("未找到 Codex 的 ChatGPT 登录信息，请先在本机运行 codex login") from None
+        payload = {"model": self.model, "store": False, "stream": True, "max_output_tokens": self.max_tokens,
+                   "input": [{"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]}
+                             for role, text in (("developer", system), ("user", user))], **self.extra_body}
+        if self.json_mode:
+            payload["text"] = {"format": {"type": "json_object"}}
+        request = Request(CODEX_ENDPOINT, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                          headers={"Authorization": "Bearer " + token, "chatgpt-account-id": account,
+                                   "Content-Type": "application/json", "Accept": "text/event-stream",
+                                   "originator": "codex_cli_rs"}, method="POST")
+        parts, size = [], 0
+        with urlopen(request, timeout=self.timeout) as response:
+            for line in response:
+                size += len(line)
+                if size > 4 * 1024 * 1024:
+                    raise LLMError("大模型响应过大")
+                if not line.startswith(b"data:"):
+                    continue
+                event = json.loads(line[5:])
+                kind = event.get("type")
+                if kind == "response.output_text.done":
+                    parts.append(event["text"])
+                elif kind == "response.completed":
+                    if not "".join(parts).strip():
+                        raise LLMError("大模型返回了空结果")
+                    return "".join(parts)
+                elif kind == "response.incomplete":
+                    raise LLMError("大模型响应被截断，请增加 max_tokens")
+                elif kind in ("response.failed", "error"):
+                    raise LLMError("Codex 接口返回错误，请核对模型名称和额度")
+        raise LLMError("Codex 响应提前结束，请稍后再试")

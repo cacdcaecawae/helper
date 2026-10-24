@@ -178,6 +178,22 @@ class ControllerTests(PanelFixture):
         self.assertEqual(read_json(path)['groups']['123@chatroom'], data['groups']['123@chatroom'])
         self.assertEqual(self.controller.store.load()['chat_allowlist'], ['filehelper','123@chatroom','456@chatroom'])
 
+    def test_model_list_uses_page_choice_and_saved_key_without_returning_it(self):
+        path = self.root/'llm_config.json'
+        data = read_json(path); data['api_key'] = 'private-model-key'
+        path.write_text(json.dumps(data), encoding='utf-8')
+        seen = []
+        def models(client):
+            seen.append((client.provider, client.endpoint, client._api_key))
+            return ['model-a']
+        with patch('wxbot_framework.llm.LLMClient.list_models', models):
+            result = self.controller.llm_models({'provider':'openai_compatible', 'base_url':'https://gateway.example.test/v1'})
+            self.controller.llm_models({'base_url':'https://gateway.example.test/v1', 'api_key':' typed-key '})
+        self.assertEqual(result, {'models':['model-a']})
+        self.assertEqual(seen, [('openai_compatible', 'https://gateway.example.test/v1/chat/completions', 'private-model-key'),
+                                ('openai_compatible', 'https://gateway.example.test/v1/chat/completions', 'typed-key')])
+        self.assertEqual(read_json(path)['api_key'], 'private-model-key')
+
     def test_compatible_llm_options_round_trip_without_changing_saved_key(self):
         path = self.root/'llm_config.json'
         original = read_json(path)

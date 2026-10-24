@@ -180,6 +180,21 @@ class LLMTests(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
         self.assertNotIn("private", str(caught.exception))
 
+    def test_compatible_model_list_uses_standard_models_endpoint(self):
+        client = LLMClient({**self.options, "base_url": "https://gateway.example.test/v1/chat/completions"})
+        body = io.BytesIO(json.dumps({"data": [{"id": "b-model"}, {"id": "a-model"}, {"id": 3}]}).encode())
+        with patch("wxbot_framework.llm.urlopen", return_value=body) as call:
+            self.assertEqual(client.list_models(), ["a-model", "b-model"])
+        request = call.call_args.args[0]
+        self.assertEqual(request.full_url, "https://gateway.example.test/v1/models")
+        self.assertEqual(request.get_header("Authorization"), "Bearer dummy-test-key")
+        for response in (io.BytesIO(b'{"object":"list"}'), HTTPError("u", 404, "dummy-test-key", {}, None)):
+            with self.subTest(response=response), patch("wxbot_framework.llm.urlopen",
+                    **({"side_effect": response} if isinstance(response, Exception) else {"return_value": response})):
+                with self.assertRaises(LLMError) as caught:
+                    client.list_models()
+                self.assertNotIn("dummy-test-key", str(caught.exception))
+
     def test_config_from_utf8_bom_file(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "llm.json"
@@ -213,6 +228,60 @@ class LLMTests(unittest.TestCase):
         with patch("wxbot_framework.llm.urlopen", return_value=io.BytesIO(b'{"choices":[null]}')):
             with self.assertRaises(LLMError):
                 self.client.complete_json("JSON", "测试")
+
+
+class CodexTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        Path(self.home.name, "auth.json").write_text(json.dumps(
+            {"tokens": {"access_token": "dummy-access", "account_id": "acct-test", "refresh_token": "private-refresh"}}))
+        env = patch.dict("os.environ", {"CODEX_HOME": self.home.name})
+        env.start()
+        self.addCleanup(env.stop)
+        self.client = LLMClient({"provider": "codex", "model": "gpt-test"})
+
+    @staticmethod
+    def stream(*events):
+        return io.BytesIO(b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n" for e in events))
+
+    def test_uses_codex_login_and_parses_sse(self):
+        events = [{"type": "response.output_text.done", "text": '{"reply":"你好"}'}, {"type": "response.completed"}]
+        with patch("wxbot_framework.llm.urlopen", return_value=self.stream(*events)) as call:
+            self.assertEqual(self.client.complete_json("只返回 JSON", "中文"), {"reply": "你好"})
+        request = call.call_args.args[0]
+        self.assertEqual(request.full_url, "https://chatgpt.com/backend-api/codex/responses")
+        self.assertEqual(request.get_header("Authorization"), "Bearer dummy-access")
+        self.assertEqual(request.get_header("Chatgpt-account-id"), "acct-test")
+        body = json.loads(request.data)
+        self.assertEqual(body["input"][0]["role"], "developer")
+        self.assertEqual(body["input"][1]["content"][0]["text"], "中文")
+        self.assertEqual(body["text"], {"format": {"type": "json_object"}})
+        self.assertNotIn("private-refresh", request.data.decode())
+
+    def test_model_list_comes_from_codex_cache_without_hidden_models(self):
+        Path(self.home.name, "models_cache.json").write_text(json.dumps({"models": [
+            {"slug": "gpt-big", "visibility": "list"}, {"slug": "internal", "visibility": "hide"},
+            {"slug": "gpt-small", "visibility": "list"}]}))
+        with patch("wxbot_framework.llm.urlopen") as call:
+            self.assertEqual(self.client.list_models(), ["gpt-big", "gpt-small"])
+        call.assert_not_called()
+        Path(self.home.name, "models_cache.json").unlink()
+        with self.assertRaisesRegex(LLMError, "运行一次 codex"):
+            self.client.list_models()
+
+    def test_missing_login_truncation_and_auth_errors(self):
+        with patch("wxbot_framework.llm.urlopen", return_value=self.stream({"type": "response.incomplete"})):
+            with self.assertRaisesRegex(LLMError, "截断"):
+                self.client.complete_json("JSON", "测试")
+        with patch("wxbot_framework.llm.urlopen", side_effect=HTTPError("u", 401, "dummy-access", {}, None)):
+            with self.assertRaisesRegex(LLMError, "codex") as caught:
+                self.client.complete_json("JSON", "测试")
+        self.assertNotIn("dummy-access", str(caught.exception))
+        Path(self.home.name, "auth.json").unlink()
+        with patch("wxbot_framework.llm.urlopen") as call, self.assertRaisesRegex(LLMError, "codex login"):
+            self.client.complete_json("JSON", "测试")
+        call.assert_not_called()
 
 
 class JudgeTests(unittest.TestCase):
