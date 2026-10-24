@@ -138,65 +138,92 @@ class AgentPluginGateTests(unittest.TestCase):
                 self.assertFalse(self.plugin._wanted(message))
 
 
+class FakeTimeline:
+    """假的聊天记录：像原生层一样，收到的消息和机器人发出的文字都会记进去。"""
+
+    def __init__(self):
+        self.lines, self.compacted, self.summary, self.upto = [], [], "", 0
+        self.groups, self.account = {"123@chatroom"}, "wxid_bot"
+
+    def add(self, name, text):
+        self.lines.append({"id": len(self.lines) + 1, "at": "2026-10-23T06:00:00+00:00", "name": name, "text": text})
+
+    def memory(self, chat, exclude=None):
+        return self.summary, [line for line in self.lines if line["id"] > self.upto
+                              and (exclude is None or line["text"] != exclude.text)]
+
+    def memory_size(self, chat):
+        return len(self.summary) + sum(len(line["text"]) for line in self.lines if line["id"] > self.upto)
+
+    def compact_memory(self, chat, summary, upto):
+        self.compacted.append((summary, upto))
+        self.summary, self.upto = summary, upto
+
+
 class AgentPluginConversationTests(unittest.TestCase):
-    """私聊多轮：第二轮能看到第一轮的问答和提问人；空行分隔的回复按条发送；记忆过长时压缩较早部分。"""
+    """记忆就是完整聊天记录：第二轮能看到第一轮双方说的话；回复按条发送；记忆过长时压缩较早部分。"""
 
     def setUp(self):
         from wxbot_framework.personality import PersonalityState
-        self.turns, self.compacted = [], []
-        turns = self.turns
+        self.timeline = FakeTimeline()
         self.plugin = Plugin()
-        self.plugin.members = SimpleNamespace(
-            agent_memory=lambda chat: ("", [turn for turn in turns if turn["chat"] == chat]),
-            remember_agent_turn=lambda chat, sender, speaker, asked, answered, snapshot=None: turns.append(
-                {"chat": chat, "id": len(turns) + 1, "at": "2026-10-23T06:00:00+00:00",
-                 "speaker": speaker, "asked": asked, "answered": answered}),
-            compact_agent_memory=lambda chat, summary, upto: self.compacted.append((chat, summary, upto)))
+        self.plugin.members = self.timeline
         self.plugin.friends, self.plugin.tools, self.plugin.image = frozenset({"wxid_friend"}), frozenset(), None
         self.sent, self.llm = [], ScriptedLLM({"reply": "推荐《星际穿越》。\n\n周末看正合适。"}, {"reply": "讲的是穿越虫洞找新家园。"})
-        self.ctx = SimpleNamespace(
-            llm=SimpleNamespace(provider="openai_compatible"), logger=SimpleNamespace(warning=lambda *a: None),
-            personality=lambda message: PersonalityState(message.chat_id), personality_guard=lambda state: None,
-            llm_for=lambda message, personality=None: self.llm, trace=lambda *a: None,
-            reply=lambda message, text, delivery_guard=None: self.sent.append(text) or True)
+        self.summarizer = SimpleNamespace(calls=[], complete_json=lambda system, user: self.summarizer.calls.append(
+            json.loads(user)) or {"summary": "较早的聊天"}, provider="openai_compatible")
 
-    def test_second_turn_sees_first_turn_and_replies_are_split(self):
-        data = {"sender_wechat_name": "小王"}
-        self.plugin.on_message(Message("推荐个电影", "wxid_friend", "wxid_friend", data=data), self.ctx)
-        self.plugin.on_message(Message("它讲什么的？", "wxid_friend", "wxid_friend", data=data), self.ctx)
+        def reply(message, text, delivery_guard=None):
+            self.sent.append(text)
+            self.timeline.add("你", text)  # 原生层回传机器人发出的文字
+            return True
+        self.ctx = SimpleNamespace(
+            llm=self.summarizer, logger=SimpleNamespace(warning=lambda *a: None),
+            personality=lambda message: PersonalityState(message.chat_id), personality_guard=lambda state: None,
+            llm_for=lambda message, personality=None: self.llm, trace=lambda *a: None, reply=reply)
+
+    def say(self, text, chat="wxid_friend", sender="wxid_friend", **kwargs):
+        self.timeline.add("小王", text)  # 运行时先记录收到的消息，再分发给插件
+        self.plugin.on_message(Message(text, chat, sender, data={"sender_wechat_name": "小王"}, **kwargs), self.ctx)
+
+    def test_second_turn_sees_both_sides_of_the_first_and_replies_are_split(self):
+        self.say("推荐个电影")
+        self.say("它讲什么的？")
         self.assertEqual(self.sent, ["推荐《星际穿越》。", "周末看正合适。", "讲的是穿越虫洞找新家园。"])
         second = self.llm.calls[1][1]
-        self.assertEqual((second["scene"], second["name"], second["summary"]), ("私聊", "小王", ""))
-        self.assertEqual(second["history"], [{"时间": "10-23 14:00", "提问人": "小王", "问": "推荐个电影",
-                                              "你答": "推荐《星际穿越》。\n周末看正合适。"}])
-        self.assertEqual(self.compacted, [])
+        self.assertEqual((second["scene"], second["name"], second["summary"], second["current"]), ("私聊", "小王", "", "它讲什么的？"))
+        self.assertEqual(second["chat"], ["10-23 14:00 小王：推荐个电影", "10-23 14:00 你：推荐《星际穿越》。",
+                                          "10-23 14:00 你：周末看正合适。"])
+        self.assertEqual(self.timeline.compacted, [])
 
-    def test_memory_search_is_offered_only_after_compaction(self):
-        self.plugin.tools = frozenset({"search_memory"})
-        message = Message("你好", "wxid_friend", "wxid_friend")
-        self.assertNotIn("search_memory", self.plugin._toolbox(message, self.ctx, None))
-        self.assertIn("search_memory", self.plugin._toolbox(message, self.ctx, None, compacted=True))
+    def test_search_is_offered_in_private_chats_too(self):
+        self.plugin.tools = frozenset({"search_history"})
+        self.assertIn("search_history", self.plugin._toolbox(Message("你好", "wxid_friend", "wxid_friend"), self.ctx, None))
 
-    def test_long_memory_compacts_older_turns_and_keeps_recent_ones(self):
+    def test_long_memory_compacts_older_lines_and_keeps_recent_ones(self):
         from plugins.agent_chat import KEEP_CHARS, MEMORY_CHARS
         self.assertEqual(MEMORY_CHARS, 2 * KEEP_CHARS)
-        # 每轮约 KEEP_CHARS/4 字，9 轮超过上限；最近 3 轮（不到 KEEP_CHARS）留原文，前 6 轮压缩。
+        # 每条 KEEP_CHARS/4 字，9 条超过上限；最近 4 条正好 KEEP_CHARS 留原文，前 5 条压缩。
         for index in range(9):
-            self.plugin.members.remember_agent_turn("wxid_friend", "wxid_friend", "小王", f"问{index}", "长" * (KEEP_CHARS // 4))
-        summarizer = SimpleNamespace(calls=[], complete_json=lambda system, user: summarizer.calls.append(json.loads(user))
-                                     or {"summary": "小王问过 6 个问题"})
-        self.plugin._compact("wxid_friend", SimpleNamespace(llm=summarizer))
-        self.assertEqual([turn["问"] for turn in summarizer.calls[0]["turns"]], [f"问{index}" for index in range(6)])
-        self.assertEqual(self.compacted, [("wxid_friend", "小王问过 6 个问题", 6)])
+            self.timeline.add("小王", str(index) + "长" * (KEEP_CHARS // 4 - 1))
+        self.plugin._compact("wxid_friend", self.ctx)
+        self.assertEqual([line.split("：")[1][0] for line in self.summarizer.calls[0]["chat"]], list("01234"))
+        self.assertEqual(self.timeline.compacted, [("较早的聊天", 5)])
 
-    def test_compaction_always_keeps_the_last_two_turns(self):
+    def test_compaction_always_keeps_the_last_two_lines(self):
         from plugins.agent_chat import MEMORY_CHARS
-        for index in range(3):  # 单轮就超过保留字数时，仍至少留最近 2 轮原文
-            self.plugin.members.remember_agent_turn("wxid_friend", "wxid_friend", "小王", f"问{index}", "长" * MEMORY_CHARS)
-        summarizer = SimpleNamespace(complete_json=lambda system, user: {"summary": "很长的第一轮"})
-        self.plugin._compact("wxid_friend", SimpleNamespace(llm=summarizer))
-        self.assertEqual(self.compacted, [("wxid_friend", "很长的第一轮", 1)])
+        for index in range(3):  # 单条就超过保留字数时，仍至少留最近 2 条原文
+            self.timeline.add("小王", "长" * MEMORY_CHARS)
+        self.plugin._compact("wxid_friend", self.ctx)
+        self.assertEqual(self.timeline.compacted, [("较早的聊天", 1)])
 
+    def test_plain_group_chatter_also_triggers_compaction(self):
+        from plugins.agent_chat import MEMORY_CHARS
+        for index in range(3):
+            self.timeline.add("群友", "长" * MEMORY_CHARS)
+        self.say("没艾特机器人的闲聊", chat="123@chatroom", sender="wxid_x", is_group=True)
+        self.assertEqual(self.sent, [])  # 不回复，但记忆照样整理
+        self.assertEqual(len(self.timeline.compacted), 1)
 
 if __name__ == "__main__":
     unittest.main()

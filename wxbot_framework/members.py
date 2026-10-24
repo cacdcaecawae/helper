@@ -24,6 +24,7 @@ class SnapshotExpired(RuntimeError):
 
 
 BEIJING = timezone(timedelta(hours=8))
+MEMORY_LINE_CHARS = 500  # 智能体记忆里单条消息最多带的字数，防止长段粘贴挤占记忆
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ class MemberStore:
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._active_day = None
         self.groups = set(options["groups"])
+        self.private_chats = frozenset()  # 智能体私聊白名单，由插件 track_private 登记后才记录
         self.profiles = []
         for room, profiles in options["groups"].items():
             validate_mentions(room, [self.account])
@@ -188,21 +190,15 @@ class MemberStore:
                     account TEXT NOT NULL, room TEXT NOT NULL, voice_id TEXT NOT NULL,
                     name TEXT NOT NULL, enabled INTEGER NOT NULL, generation INTEGER NOT NULL,
                     PRIMARY KEY(account,room));
-                CREATE TABLE IF NOT EXISTS agent_turns (
-                    id INTEGER PRIMARY KEY, account TEXT NOT NULL, chat TEXT NOT NULL, sender TEXT NOT NULL,
-                    at TEXT NOT NULL, asked TEXT NOT NULL, answered TEXT NOT NULL, speaker TEXT NOT NULL DEFAULT '');
                 CREATE TABLE IF NOT EXISTS agent_summaries (
                     account TEXT NOT NULL, chat TEXT NOT NULL, summary TEXT NOT NULL, upto INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(account,chat));
-                CREATE INDEX IF NOT EXISTS agent_turns_lookup ON agent_turns(account, chat, sender, id);
                 INSERT OR IGNORE INTO room_members SELECT DISTINCT account,room,sender_id FROM messages;
             """)
             if "self_named" not in {row["name"] for row in db.execute("PRAGMA table_info(people)")}:
                 db.execute("ALTER TABLE people ADD COLUMN self_named INTEGER NOT NULL DEFAULT 0")
             if "bot_generated" not in {row["name"] for row in db.execute("PRAGMA table_info(messages)")}:
                 db.execute("ALTER TABLE messages ADD COLUMN bot_generated INTEGER NOT NULL DEFAULT 0")
-            if "speaker" not in {row["name"] for row in db.execute("PRAGMA table_info(agent_turns)")}:
-                db.execute("ALTER TABLE agent_turns ADD COLUMN speaker TEXT NOT NULL DEFAULT ''")
             if "upto" not in {row["name"] for row in db.execute("PRAGMA table_info(agent_summaries)")}:
                 db.execute("ALTER TABLE agent_summaries ADD COLUMN upto INTEGER NOT NULL DEFAULT 0")
             with db:
@@ -254,7 +250,7 @@ class MemberStore:
                     if self.daily_clear:
                         db.execute("DELETE FROM messages WHERE account=? AND room=? AND received_at<?",
                                    (self.account, room, start))
-                # 智能体记忆是长期的，不随每日清理删除；只有本群 /清空 会清。
+                        db.execute("DELETE FROM agent_summaries WHERE account=? AND chat=?", (self.account, room))
             self._active_day = day
             return True
 
@@ -265,7 +261,6 @@ class MemberStore:
             self.rollover()
             with self._connection() as db:
                 count = db.execute("DELETE FROM messages WHERE account=? AND room=?", (self.account, room)).rowcount
-                db.execute("DELETE FROM agent_turns WHERE account=? AND chat=?", (self.account, room))
                 db.execute("DELETE FROM agent_summaries WHERE account=? AND chat=?", (self.account, room))
                 db.execute("UPDATE chat_buffers SET generation=generation+1 WHERE account=? AND room=?",
                            (self.account, room))
@@ -386,9 +381,8 @@ class MemberStore:
                 raise PersonalityExpired("人格已切换")
             yield
 
-    def conversation_snapshot(self, message, *, everyone=False):
-        """当前消息之前的本群有效文本，不混入后来消息。默认取当前发言者今天的 10 条（艾特对话用）；
-        everyone=True 取群里所有人最近 30 条，含本账号自己发的（name 为“你”），不限当天（智能体用）。"""
+    def conversation_snapshot(self, message):
+        """当前发言者在本群、当前消息之前的 10 条有效文本，不混入后来消息。"""
         from .summary import CONTROL
         if message.chat_id not in self.groups:
             raise MemberError("这个群尚未启用聊天记录")
@@ -402,22 +396,15 @@ class MemberStore:
                 message.session_id, message.sequence, message.text, start, end)).fetchone()
             if current is None:
                 raise SnapshotExpired("当前消息已被清空或已跨天")
-            if everyone:
-                cursor, limit = db.execute("SELECT * FROM messages WHERE account=? AND room=? AND id<? ORDER BY id DESC",
-                                           (self.account, message.chat_id, current[0])), 30
-            else:
-                cursor, limit = db.execute("""SELECT * FROM messages WHERE account=? AND room=? AND sender_id=?
-                    AND id<? AND received_at>=? AND received_at<? AND bot_generated=0 ORDER BY id DESC""",
-                    (self.account, message.chat_id, message.sender_id, current[0], start, end)), 10
+            cursor = db.execute("""SELECT * FROM messages WHERE account=? AND room=? AND sender_id=?
+                AND id<? AND received_at>=? AND received_at<? AND bot_generated=0 ORDER BY id DESC""",
+                (self.account, message.chat_id, message.sender_id, current[0], start, end))
             previous = []
             for row in cursor:
                 text = row["text"].strip()
                 if text and "WXBOT_AT_CHAT_PROBE" not in text and text.split(maxsplit=1)[0] not in CONTROL:
-                    item = dict(row)
-                    if everyone:
-                        item["name"] = "你" if row["is_self"] else self.display_name(row["sender_id"], message.chat_id) or "群友"
-                    previous.append(item)
-                    if len(previous) == limit:
+                    previous.append(dict(row))
+                    if len(previous) == 10:
                         break
             member = self.find_by_wxid(message.sender_id, message.chat_id)
             state = db.execute("SELECT generation FROM chat_buffers WHERE account=? AND room=?",
@@ -582,12 +569,23 @@ class MemberStore:
                 db.execute("INSERT OR IGNORE INTO aliases VALUES(?,?,?,?)", (self.account, room, alias, key))
             return self._member(self._row(name, room))
 
+    def track_private(self, chats):
+        self.private_chats = frozenset(chats)
+
+    def _tracked(self, chat):
+        return chat in self.groups if chat.endswith("@chatroom") else chat in self.private_chats
+
     def record(self, message):
-        if not self.history_enabled or message.type != 1 or not message.is_group or message.chat_id not in self.groups:
+        if not self.history_enabled or message.type != 1 or not self._tracked(message.chat_id) \
+                or message.is_group != message.chat_id.endswith("@chatroom"):
             return False
         if message.data.get("self_wxid", self.account) != self.account:
             return False
-        validate_mentions(message.chat_id, [message.sender_id])
+        if message.is_group:
+            validate_mentions(message.chat_id, [message.sender_id])
+        else:
+            validate_account(message.chat_id)
+            validate_account(message.sender_id or message.chat_id)
         if not isinstance(message.text, str) or not message.session_id:
             raise MemberError("群记录缺少正文或连接标识")
         native_name = message.data.get("sender_wechat_name")
@@ -595,39 +593,74 @@ class MemberStore:
             self.remember_wechat_name(message.sender_id, native_name)
         with self._lock, self._connection() as db:
             self.rollover()
-            db.execute("INSERT OR IGNORE INTO room_members VALUES(?,?,?)",
-                       (self.account, message.chat_id, message.sender_id))
+            if message.is_group:
+                db.execute("INSERT OR IGNORE INTO room_members VALUES(?,?,?)",
+                           (self.account, message.chat_id, message.sender_id))
             result = db.execute("""INSERT OR IGNORE INTO messages
                 (account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated) VALUES(?,?,?,?,?,?,?,?,?)""",
-                (self.account, message.chat_id, message.sender_id, message.text,
+                (self.account, message.chat_id, message.sender_id or message.chat_id, message.text,
                  self._now().astimezone(timezone.utc).isoformat(), message.session_id, message.sequence,
                  int(message.is_self), int(bool(message.data.get("bot_generated")))))
             return result.rowcount > 0
 
-    def agent_memory(self, chat):
-        """智能体在一个群或一个私聊里的记忆：更早对话的摘要，加摘要之后的全部问答（按时间顺序）；重启后仍在。"""
+    def memory(self, chat, *, exclude=None):
+        """智能体的记忆就是这个群或私聊的完整聊天记录：较早部分的摘要，加摘要之后的全部原文（按时间顺序）。
+        每条含 id、at、name（本账号说的为“你”）、text；exclude 传当前消息时不含它。重启后仍在。"""
+        from .summary import CONTROL
         with self._lock:
             self.rollover()
             db = self._connection()
             row = db.execute("SELECT summary,upto FROM agent_summaries WHERE account=? AND chat=?", (self.account, chat)).fetchone()
             summary, upto = tuple(row) if row else ("", 0)
-            turns = db.execute("""SELECT id,at,speaker,asked,answered FROM agent_turns
-                WHERE account=? AND chat=? AND id>? ORDER BY id""", (self.account, chat, upto)).fetchall()
-            return summary, [dict(turn) for turn in turns]
+            rows = db.execute("""SELECT id,sender_id,text,received_at,is_self,session_id,sequence FROM messages
+                WHERE account=? AND room=? AND id>? ORDER BY id""", (self.account, chat, upto)).fetchall()
+            names, lines = {}, []
+            for row in rows:
+                text = row["text"].strip()
+                if (exclude is not None and exclude.sequence and (row["session_id"], row["sequence"]) ==
+                        (exclude.session_id, exclude.sequence)):
+                    continue
+                if not text or "WXBOT_AT_CHAT_PROBE" in text or text.split(maxsplit=1)[0] in CONTROL:
+                    continue
+                if row["sender_id"] not in names:
+                    names[row["sender_id"]] = self.display_name(row["sender_id"], chat) or "群友"
+                lines.append({"id": row["id"], "at": row["received_at"], "text": text[:MEMORY_LINE_CHARS],
+                              "name": "你" if row["is_self"] else names[row["sender_id"]]})
+            return summary, lines
 
-    def search_agent_memory(self, chat, keyword, *, limit=6):
-        """在已压缩进摘要的问答原文里按关键词查找（提问人、问、答都查），按时间顺序返回。"""
-        if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > 100:
-            raise MemberError("搜索关键词应为 1–100 个字符")
-        keyword = keyword.strip()
+    def memory_size(self, chat):
+        """摘要加摘要之后原文的字数，按发给模型时的截断计；判断要不要压缩用，不逐条读出。"""
         with self._lock:
+            db = self._connection()
+            row = db.execute("SELECT summary,upto FROM agent_summaries WHERE account=? AND chat=?", (self.account, chat)).fetchone()
+            summary, upto = tuple(row) if row else ("", 0)
+            size = db.execute("SELECT COALESCE(SUM(MIN(length(text),?)),0) FROM messages WHERE account=? AND room=? AND id>?",
+                              (MEMORY_LINE_CHARS, self.account, chat, upto)).fetchone()[0]
+            return len(summary) + size
+
+    def compact_memory(self, chat, summary, upto):
+        """摘要从此代替 id<=upto 的聊天记录给模型看；原文保留，可用 search 查到。
+        期间被 /清空 或每日清理过（upto 已不在）就放弃，不把清掉的内容写回。"""
+        # ponytail: 原文只在 /清空 或开启每日清理时删除，会一直增长（活跃群一年约几十到上百 MB）；真占地方再加保留天数。
+        with self._lock, self._connection() as db:
+            if not db.execute("SELECT 1 FROM messages WHERE account=? AND room=? AND id=?",
+                              (self.account, chat, upto)).fetchone():
+                return False
+            db.execute("""INSERT INTO agent_summaries(account,chat,summary,upto) VALUES(?,?,?,?)
+                ON CONFLICT(account,chat) DO UPDATE SET summary=excluded.summary,upto=excluded.upto
+                WHERE excluded.upto>agent_summaries.upto""", (self.account, chat, summary, upto))
+            return True
+
+    def record_spoken(self, message, text):
+        """语音回复没有文字回传；补记机器人说的话，聊天记录（也就是智能体的记忆）里才有。sequence 为 0，不与原生消息冲突。"""
+        if not self.history_enabled or not self._tracked(message.chat_id):
+            return False
+        with self._lock, self._connection() as db:
             self.rollover()
-            rows = self._connection().execute("""SELECT t.at,t.speaker,t.asked,t.answered FROM agent_turns t
-                JOIN agent_summaries s ON s.account=t.account AND s.chat=t.chat
-                WHERE t.account=? AND t.chat=? AND t.id<=s.upto
-                AND (instr(t.asked,?)>0 OR instr(t.answered,?)>0 OR instr(t.speaker,?)>0) ORDER BY t.id DESC LIMIT ?""",
-                (self.account, chat, keyword, keyword, keyword, limit)).fetchall()
-            return [dict(row) for row in reversed(rows)]
+            db.execute("""INSERT INTO messages(account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated)
+                VALUES(?,?,?,?,?,?,0,1,1)""", (self.account, message.chat_id, self.account, text,
+                                               self._now().astimezone(timezone.utc).isoformat(), message.session_id or "spoken"))
+            return True
 
     def _speaker_wxid(self, name, room):
         """按群友称呼找微信 ID：先查绑定称呼和微信名，再查本群群昵称（仅唯一匹配时）。"""
@@ -646,38 +679,14 @@ class MemberStore:
             raise MemberError(f"群昵称“{name}”对应多人，请换个称呼")
         raise error
 
-    def remember_agent_turn(self, chat, sender, speaker, asked, answered, *, snapshot=None):
-        """记下一轮问答和提问人；不限条数，过长时由调用方用 compact_agent_memory 压缩。
-        群聊传入回复时的 snapshot：回复发出后群被 /清空 或跨天就不写，和清空在同一把锁里判断。"""
-        with self._lock:
-            if snapshot is not None and not self.snapshot_is_current(snapshot):
-                return False
-            with self._connection() as db:
-                db.execute("INSERT INTO agent_turns(account,chat,sender,speaker,at,asked,answered) VALUES(?,?,?,?,?,?,?)",
-                           (self.account, chat, sender, speaker, self._now().astimezone(timezone.utc).isoformat(), asked, answered))
-            return True
-
-    def compact_agent_memory(self, chat, summary, upto):
-        """摘要从此代替 id<=upto 的问答给模型看；原文保留，供 search_agent_memory 查找。
-        期间被 /清空 过（upto 已不在）就放弃，不把清掉的内容写回。"""
-        # ponytail: 原文只在本群 /清空 时删除，会一直增长（每轮几百字，活跃群一年几十 MB）；真占地方再加保留天数。
-        with self._lock, self._connection() as db:
-            if not db.execute("SELECT 1 FROM agent_turns WHERE account=? AND chat=? AND id=?",
-                              (self.account, chat, upto)).fetchone():
-                return False
-            db.execute("""INSERT INTO agent_summaries(account,chat,summary,upto) VALUES(?,?,?,?)
-                ON CONFLICT(account,chat) DO UPDATE SET summary=excluded.summary,upto=excluded.upto
-                WHERE excluded.upto>agent_summaries.upto""", (self.account, chat, summary, upto))
-            return True
-
     def search(self, room, keyword=None, *, date=None, name=None, limit=20):
-        """在本群已保存的群友文字里查找，关键词、日期（北京时间 YYYY-MM-DD）、发言人称呼可任意组合，至少给一项。
-        返回符合条件的最近 limit 条，按时间顺序；不含机器人自己的发言。"""
-        if room not in self.groups:
-            raise MemberError("这个群尚未启用聊天记录")
+        """在本群（或白名单私聊）保存的聊天原文里查找，关键词、日期（北京时间 YYYY-MM-DD）、发言人称呼可任意组合，
+        至少给一项；发言人填“你”查本账号说过的话。返回符合条件的最近 limit 条，按时间顺序。"""
+        if not self._tracked(room):
+            raise MemberError("这个会话尚未启用聊天记录")
         if keyword is None and date is None and name is None:
             raise MemberError("至少需要关键词、日期或发言人之一")
-        sql, values = " FROM messages WHERE account=? AND room=? AND bot_generated=0", [self.account, room]
+        sql, values = " FROM messages WHERE account=? AND room=?", [self.account, room]
         if keyword is not None:
             if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > 100:
                 raise MemberError("搜索关键词应为 1–100 个字符")
@@ -696,10 +705,11 @@ class MemberStore:
             self.rollover()
             if name is not None:
                 sql += " AND sender_id=?"
-                values.append(self._speaker_wxid(name.strip(), room))
-            rows = self._connection().execute("SELECT sender_id,text,received_at" + sql + " ORDER BY id DESC LIMIT ?",
+                values.append(self.account if name.strip() == "你" else self._speaker_wxid(name.strip(), room))
+            rows = self._connection().execute("SELECT sender_id,text,received_at,is_self" + sql + " ORDER BY id DESC LIMIT ?",
                                               values + [limit]).fetchall()
-            return [dict(row, name=self.display_name(row["sender_id"], room) or "群友") for row in reversed(rows)]
+            return [dict(row, name="你" if row["is_self"] else self.display_name(row["sender_id"], room) or "群友")
+                    for row in reversed(rows)]
 
     def history(self, name, room=None, *, limit=100, since=None):
         if type(limit) is not int or not 1 <= limit <= 1000:

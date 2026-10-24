@@ -53,40 +53,41 @@ class MemberTests(unittest.TestCase):
     def message(self, text="中文消息 🌸", sender=JING, sequence=1, **kwargs):
         return Message(text, ROOM, sender_id=sender, is_group=True, sequence=sequence, session_id="first", **kwargs)
 
-    def test_agent_memory_is_shared_per_chat_survives_restart_compacts_and_follows_clear(self):
-        for index in range(25):
-            sender, speaker = (JING, "成员乙") if index % 2 else (SMALL, "成员甲")
-            self.store.remember_agent_turn(ROOM, sender, speaker, f"问{index}", f"答{index}")
-        self.store.remember_agent_turn("wxid_friend", "wxid_friend", "好友", "私聊问", "私聊答")
+    def test_memory_is_the_whole_chat_and_survives_restart_compaction_and_clear(self):
+        self.store.record(self.message("周末去哪玩", sender=SMALL, sequence=1))
+        self.store.record(self.message("去爬山吧", sequence=2))
+        self.store.record(self.message("/总结群聊", sender=SMALL, sequence=3))  # 命令不算聊天
+        self.store.record(self.message("推荐《白日梦想家》", sender=ROBOT, sequence=4, is_self=True, data={"bot_generated": True}))
+        current = self.message("@小雪 你觉得呢", sender=SMALL, sequence=5)
+        self.store.record(current)
         reopened = self.create_store()  # 模拟重启：新的连接读同一个库
-        summary, turns = reopened.agent_memory(ROOM)
-        self.assertEqual((summary, len(turns)), ("", 25))  # 不限条数，群里所有人共用一份
-        self.assertEqual([(turn["speaker"], turn["asked"]) for turn in turns[:2]], [("成员甲", "问0"), ("成员乙", "问1")])
-        self.assertTrue(reopened.compact_agent_memory(ROOM, "前 20 轮的摘要", turns[19]["id"]))
-        summary, turns = reopened.agent_memory(ROOM)
-        self.assertEqual((summary, [turn["asked"] for turn in turns]), ("前 20 轮的摘要", [f"问{i}" for i in range(20, 25)]))
-        # 压缩掉的原文还能按关键词查到；没压缩的不在搜索范围（模型已经直接看得到）
-        self.assertEqual([(row["speaker"], row["asked"]) for row in reopened.search_agent_memory(ROOM, "问3")], [("成员乙", "问3")])
-        self.assertEqual([row["asked"] for row in reopened.search_agent_memory(ROOM, "成员甲")], [f"问{i}" for i in range(8, 20, 2)])
-        self.assertEqual(reopened.search_agent_memory(ROOM, "问21"), [])
+        summary, lines = reopened.memory(ROOM, exclude=current)
+        self.assertEqual((summary, [(line["name"], line["text"]) for line in lines]),
+                         ("", [("成员甲昵称", "周末去哪玩"), ("群友", "去爬山吧"), ("你", "推荐《白日梦想家》")]))
+        before = reopened.memory_size(ROOM)
+        self.assertTrue(reopened.compact_memory(ROOM, "商量周末", lines[1]["id"]))
+        summary, rest = reopened.memory(ROOM)
+        self.assertEqual((summary, [line["text"] for line in rest]), ("商量周末", ["推荐《白日梦想家》", "@小雪 你觉得呢"]))
+        self.assertLess(reopened.memory_size(ROOM), before)
+        # 压缩掉的原文还能查到；发言人填“你”查本账号说过的话
+        self.assertEqual([row["text"] for row in reopened.search(ROOM, "爬山")], ["去爬山吧"])
+        self.assertEqual([row["text"] for row in reopened.search(ROOM, name="你")], ["推荐《白日梦想家》"])
         reopened.clear(ROOM)
-        self.assertEqual(reopened.agent_memory(ROOM), ("", []))
-        self.assertEqual(reopened.search_agent_memory(ROOM, "问3"), [])
-        self.assertFalse(reopened.compact_agent_memory(ROOM, "清空后不能写回", turns[-1]["id"]))
-        self.assertEqual(reopened.agent_memory(ROOM), ("", []))
-        self.assertEqual([turn["asked"] for turn in reopened.agent_memory("wxid_friend")[1]], ["私聊问"])
+        self.assertEqual(reopened.memory(ROOM), ("", []))
+        self.assertFalse(reopened.compact_memory(ROOM, "清空后不能写回", rest[-1]["id"]))
+        self.assertEqual(reopened.memory(ROOM), ("", []))
 
-    def test_agent_turn_is_not_written_back_after_the_group_was_cleared(self):
-        message = self.message("推荐个电影")
-        self.store.record(message)
-        snapshot = self.store.conversation_snapshot(message)
-        self.store.clear(ROOM)  # 回复已发出、记忆还没写时被 /清空
-        self.assertFalse(self.store.remember_agent_turn(ROOM, JING, "成员乙", "推荐个电影", "白日梦想家", snapshot=snapshot))
-        self.assertEqual(self.store.agent_memory(ROOM), ("", []))
-        self.store.record(message)
-        self.assertTrue(self.store.remember_agent_turn(ROOM, JING, "成员乙", "推荐个电影", "白日梦想家",
-                                                       snapshot=self.store.conversation_snapshot(message)))
-        self.assertEqual(len(self.store.agent_memory(ROOM)[1]), 1)
+    def test_whitelisted_private_chat_and_spoken_replies_are_recorded(self):
+        friend = "wxid_friend"
+        private = lambda text, sequence, chat=friend, **kwargs: Message(text, chat, chat, session_id="first",
+                                                                         sequence=sequence, **kwargs)
+        self.assertFalse(self.store.record(private("没登记的私聊不记", 1)))
+        self.store.track_private({friend})
+        self.assertTrue(self.store.record(private("推荐本书", 2, data={"sender_wechat_name": "小王"})))
+        self.assertTrue(self.store.record_spoken(private("推荐本书", 2), "推荐《白夜行》"))  # 语音回复没有文字回传，补记
+        self.assertEqual([(line["name"], line["text"]) for line in self.store.memory(friend)[1]],
+                         [("小王", "推荐本书"), ("你", "推荐《白夜行》")])
+        self.assertFalse(self.store.record_spoken(private("x", 3, chat="wxid_other"), "不在白名单不记"))
 
     def test_search_combines_day_speaker_and_keyword(self):
         clock = [datetime(2026, 10, 19, 4, 0, tzinfo=timezone.utc)]  # 北京 10-19 12:00
@@ -105,17 +106,6 @@ class MemberTests(unittest.TestCase):
             with self.subTest(criteria=criteria), self.assertRaises(MemberError):
                 store.search(ROOM, **criteria)
 
-    def test_everyone_snapshot_is_the_recent_group_chat(self):
-        self.store.record(self.message("周末去哪玩", sender=SMALL, sequence=1))
-        self.store.record(self.message("/总结群聊", sender=SMALL, sequence=2))  # 命令不算聊天
-        self.store.record(self.message("推荐《白日梦想家》", sender=ROBOT, sequence=3, is_self=True, data={"bot_generated": True}))
-        current = self.message("@小雪 你觉得呢", sequence=4)
-        self.store.record(current)
-        self.store.record(self.message("后来的消息", sender=SMALL, sequence=5))
-        everyone = self.store.conversation_snapshot(current, everyone=True).messages
-        self.assertEqual([(row["name"], row["text"]) for row in everyone], [("成员甲昵称", "周末去哪玩"), ("你", "推荐《白日梦想家》")])
-        self.assertEqual(self.store.conversation_snapshot(current).messages, ())  # 默认仍只取本人的（艾特对话不变）
-
     def test_search_finds_speaker_by_group_nickname(self):
         self.store.remember_group_nickname("wxid_wang", ROOM, "群里小王")
         self.store.record(self.message("周末加班", sender="wxid_wang", sequence=1))
@@ -124,13 +114,13 @@ class MemberTests(unittest.TestCase):
         with self.assertRaisesRegex(MemberError, "对应多人"):
             self.store.search(ROOM, name="群里小王")
 
-    def test_keyword_search_returns_room_text_in_order_without_bot_replies(self):
+    def test_keyword_search_returns_chat_in_order_including_own_lines(self):
         self.store.record(self.message("周六晚上开黑", sequence=1))
         self.store.record(self.message("周六见", sender=SMALL, sequence=2))
-        self.store.record(self.message("周六我也来", sequence=3, data={"bot_generated": True}))
+        self.store.record(self.message("周六我也来", sender=ROBOT, sequence=3, is_self=True, data={"bot_generated": True}))
         rows = self.store.search(ROOM, "周六")
-        self.assertEqual([row["text"] for row in rows], ["周六晚上开黑", "周六见"])
-        self.assertEqual(rows[1]["name"], "成员甲昵称")
+        self.assertEqual([(row["name"], row["text"]) for row in rows],
+                         [("群友", "周六晚上开黑"), ("成员甲昵称", "周六见"), ("你", "周六我也来")])
         for room, keyword in (("999@chatroom", "周六"), (ROOM, " "), (ROOM, "x" * 101)):
             with self.subTest(room=room, keyword=keyword), self.assertRaises(MemberError):
                 self.store.search(room, keyword)

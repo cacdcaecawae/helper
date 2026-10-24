@@ -64,6 +64,8 @@ class SpeechTests(unittest.TestCase):
         self.assertEqual(self.backend.sent, [(ROOM, 'voice')])
         self.assertFalse(self.voice_paths[0].exists())
         self.client.synthesize.assert_called_once_with('这是模型生成的回答。', FIRST.id)
+        # 语音没有文字回传：说了什么补记进聊天记录，智能体的记忆里才有
+        self.assertEqual([(line['name'], line['text']) for line in self.store.memory(ROOM)[1]], [('你', '这是模型生成的回答。')])
 
     def test_synthesis_failure_falls_back_before_any_voice_is_sent(self):
         self.setup_speech()

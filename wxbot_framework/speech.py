@@ -200,6 +200,12 @@ class SpeechController:
                 if not ctx.reply_voice(message, path, delivery_guard=guard):
                     # 微信是否已送达不确定，不在此处重复发文字或重试。
                     raise RuntimeError("原生语音发送未确认成功")
+        # 语音没有文字回传：补记说了什么，聊天记录（也是智能体的记忆）里才有；期间被清空就不记。
+        try:
+            with guard():
+                self.members.record_spoken(message, text)
+        except SnapshotExpired:
+            pass
         return True
 
 

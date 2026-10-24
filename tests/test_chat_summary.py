@@ -89,14 +89,11 @@ class DailySummaryTests(unittest.TestCase):
 
     def test_midnight_clears_idle_buffer_preserves_identity_and_invalidates_snapshot(self):
         self.store.record(self.message("今晚聊聊天"))
-        self.store.remember_agent_turn(ROOM, CAT, "测试成员", "记住我喜欢猫", "记住啦")
         snapshot = self.snapshot()
         self.assertEqual(snapshot.day, "2026-10-10")
         self.now += timedelta(seconds=1)
         self.assertTrue(self.store.rollover())
         self.assertEqual(self.store.history("测试成员", ROOM), [])
-        # 每日清理只清群聊天记录，智能体的长期记忆保留
-        self.assertEqual([turn["asked"] for turn in self.store.agent_memory(ROOM)[1]], ["记住我喜欢猫"])
         self.assertFalse(self.store.snapshot_is_current(snapshot))
         self.assertEqual(self.store.resolve("测试成员", ROOM).wxid, CAT)
         self.store.record(self.message("新的一天"))
