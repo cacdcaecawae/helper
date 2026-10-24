@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 from .llm import LLMError
 from .members import BEIJING, MemberError
 
-MAX_TOOL_CALLS = 3
+MAX_TOOL_CALLS, MAX_OBSERVATION = 3, 2000
 
 SYSTEM = """你是微信里的智能助手，可以先调用工具再回复对方。
 每一步只输出一个 JSON 对象，二选一：
@@ -69,7 +69,7 @@ class Agent:
                     observation = f"失败：{error}"
                 except (ValueError, KeyError, TypeError, IndexError, AttributeError):
                     observation = "失败：工具返回的数据格式异常"
-            observation = str(observation)[:2000]
+            observation = str(observation)[:MAX_OBSERVATION]
             self.trace("result", observation[:600])
             steps.append({"tool": name, "args": args, "result": observation})
 
@@ -85,9 +85,7 @@ def history_tool(members, room):
         if not rows:
             return "本群记录里没有符合条件的发言（只保存 helper 运行期间收到的群聊）"
         lines = [f"{beijing_time(row['received_at'])} {row['name']}：{row['text'][:200]}" for row in rows]
-        if len(rows) == 20:
-            lines.append("（只显示符合条件的最近 20 条，可再加关键词、日期或发言人缩小范围）")
-        return "\n".join(lines)
+        return newest_fit(lines, "（只显示符合条件的最近 20 条，可再加关键词、日期或发言人缩小范围）" if len(rows) == 20 else "")
     return ("{\"keyword\":\"关键词\",\"date\":\"YYYY-MM-DD\",\"name\":\"群友称呼\"}（三项任选，至少一项）："
             "查本群 helper 保存的群聊原文，可按关键词、某一天（北京时间）、某人筛选，返回最近 20 条", search)
 
@@ -103,9 +101,21 @@ def memory_tool(members, chat):
             raise ToolError(str(error)) from None
         if not rows:
             return f"早期对话里没有包含“{keyword}”的内容"
-        return "\n".join(f"{beijing_time(row['at'])} {row['speaker'] or '对方'}问：{row['asked'][:150]}｜你答：{row['answered'][:150]}"
-                         for row in rows)
+        return newest_fit([f"{beijing_time(row['at'])} {row['speaker'] or '对方'}问：{row['asked'][:150]}｜你答：{row['answered'][:150]}"
+                           for row in rows])
     return ("{\"keyword\":\"关键词\"}：summary 里细节不够时，在已压缩的早期对话原文里查找（提问人、问题和你的回答都查），最多 6 条", search)
+
+
+def newest_fit(lines, tail=""):
+    """按时间顺序的结果放不进 MAX_OBSERVATION 时丢最早的几条并注明，保证最新记录和末尾提示都送到模型。"""
+    budget, kept, size = MAX_OBSERVATION - len(tail) - 40, [], 0  # 40 字留给省略说明
+    for line in reversed(lines):
+        if size + len(line) + 1 > budget:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    head = [f"（更早的 {len(lines) - len(kept)} 条放不下，已省略）"] if len(kept) < len(lines) else []
+    return "\n".join(head + kept[::-1] + ([tail] if tail else []))
 
 
 def beijing_time(at):

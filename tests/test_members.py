@@ -105,6 +105,14 @@ class MemberTests(unittest.TestCase):
             with self.subTest(criteria=criteria), self.assertRaises(MemberError):
                 store.search(ROOM, **criteria)
 
+    def test_search_finds_speaker_by_group_nickname(self):
+        self.store.remember_group_nickname("wxid_wang", ROOM, "群里小王")
+        self.store.record(self.message("周末加班", sender="wxid_wang", sequence=1))
+        self.assertEqual([row["text"] for row in self.store.search(ROOM, name="群里小王")], ["周末加班"])
+        self.store.remember_group_nickname("wxid_other", ROOM, "群里小王")
+        with self.assertRaisesRegex(MemberError, "对应多人"):
+            self.store.search(ROOM, name="群里小王")
+
     def test_keyword_search_returns_room_text_in_order_without_bot_replies(self):
         self.store.record(self.message("周六晚上开黑", sequence=1))
         self.store.record(self.message("周六见", sender=SMALL, sequence=2))

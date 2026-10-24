@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from plugins.agent_chat import Plugin
-from wxbot_framework.agent import Agent, ImageServer, ToolError, draw_tool, history_tool
+from wxbot_framework.agent import MAX_OBSERVATION, Agent, ImageServer, ToolError, draw_tool, history_tool
 from wxbot_framework.llm import LLMError
 from wxbot_framework.message_monitor import MessageBuffer
 from wxbot_framework.sdk import Message
@@ -52,6 +52,15 @@ class AgentTests(unittest.TestCase):
         members = SimpleNamespace(search=lambda room, keyword, date=None, name=None: seen.append((keyword, date, name)) or [])
         self.assertIn("没有符合条件", history_tool(members, "123@chatroom")[1]({"keyword": "", "date": "2026-10-20", "name": ""}))
         self.assertEqual(seen, [(None, "2026-10-20", None)])
+
+    def test_history_tool_keeps_newest_rows_and_hint_within_the_limit(self):
+        rows = [{"received_at": "2026-10-20T04:00:00+00:00", "name": "群友", "text": f"第{i}条" + "长" * 190} for i in range(19)]
+        rows.append({"received_at": "2026-10-20T05:00:00+00:00", "name": "小王", "text": "最后决定取消爬山"})
+        members = SimpleNamespace(search=lambda room, keyword, date=None, name=None: rows)
+        result = history_tool(members, "123@chatroom")[1]({"date": "2026-10-20"})
+        self.assertLessEqual(len(result), MAX_OBSERVATION)  # Agent 不会再截掉尾部
+        self.assertIn("最后决定取消爬山", result)
+        self.assertTrue(result.startswith("（更早的") and result.endswith("缩小范围）"))
 
     def test_tool_calls_are_bounded_and_must_end_with_a_valid_reply(self):
         loop = {"tool": "lookup", "args": {}}

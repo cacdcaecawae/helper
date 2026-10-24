@@ -621,6 +621,23 @@ class MemberStore:
                 (self.account, chat, keyword, keyword, keyword, limit)).fetchall()
             return [dict(row) for row in reversed(rows)]
 
+    def _speaker_wxid(self, name, room):
+        """按群友称呼找微信 ID：先查绑定称呼和微信名，再查本群群昵称（仅唯一匹配时）。"""
+        try:
+            member = self.resolve(name, room)
+            if member.wxid is not None:
+                return member.wxid
+            error = MemberError(f"{member.name} 尚未绑定微信 ID")
+        except MemberError as failed:
+            error = failed
+        rows = self._connection().execute("SELECT wxid FROM group_nicknames WHERE account=? AND room=? AND nickname=?",
+                                          (self.account, room, name)).fetchall()
+        if len(rows) == 1:
+            return rows[0][0]
+        if rows:
+            raise MemberError(f"群昵称“{name}”对应多人，请换个称呼")
+        raise error
+
     def remember_agent_turn(self, chat, sender, speaker, asked, answered, *, snapshot=None):
         """记下一轮问答和提问人；不限条数，过长时由调用方用 compact_agent_memory 压缩。
         群聊传入回复时的 snapshot：回复发出后群被 /清空 或跨天就不写，和清空在同一把锁里判断。"""
@@ -670,11 +687,8 @@ class MemberStore:
         with self._lock:
             self.rollover()
             if name is not None:
-                member = self.resolve(name.strip(), room)
-                if member.wxid is None:
-                    raise MemberError(f"{member.name} 尚未绑定微信 ID")
                 sql += " AND sender_id=?"
-                values.append(member.wxid)
+                values.append(self._speaker_wxid(name.strip(), room))
             rows = self._connection().execute("SELECT sender_id,text,received_at" + sql + " ORDER BY id DESC LIMIT ?",
                                               values + [limit]).fetchall()
             return [dict(row, name=self.display_name(row["sender_id"], room) or "群友") for row in reversed(rows)]
