@@ -35,10 +35,13 @@ let pluginSignature = '', accountSignature = '', robotOptionsSignature = '';
 let messages=[], messageCursor=0, messageStream='', messagePaused=false, messageError='', messageGeneration=0, messageSignature='';
 let loggedAccounts = [], selectedAccounts = new Set(), accountsError = '', accountsLoading = true, accountsFetching = false, lastAccountFetch = 0, batchStarting = false;
 let sendMembers = [], mentionSelection = new Set(), sendSession = '', sendGeneration = 0, sendLoading = false, pendingSend = null, sendPolling = false;
+let chatRows=[], chatLoadKey='', chatTimelineSignature='', chatConfirm=null, chatDraftId='';
+let chatListMarkup='', chatTimelineTarget='';
+const chatDrafts=new Map();
 const accountKey = row => row.pid + ':' + row.wxid;
 const activeStates = ['starting','running','stopping'];
 const profileLabel = row => loggedAccounts.find(account=>account.wxid===row?.account)?.name || row?.account || (row?.id==='default'?'默认配置':row?.name) || '当前账号';
-const pages = {overview:'运行概览', plugins:'插件管理', groups:'群聊与会话', models:'模型与语音', logs:'运行日志'};
+const pages = {chat:'聊天', overview:'账号与监控', plugins:'插件管理', groups:'群聊配置', models:'模型与语音', logs:'运行日志'};
 const pluginNames = {anti_recall:['文字防撤回'], anti_recall_image:['图片防撤回'], anti_recall_file:['文件防撤回'], picture_idiom:['看图猜成语'], idiom_chain:['成语接龙'], chat_summary:['聊天总结'], mention_chat:['艾特对话'], voice_reply:['语音回复'], group_notice:['进退群提醒'], member_identity:['群内昵称绑定'], personality:['切换人格'], friend_auto_accept:['自动通过好友'], chat_records:['聊天记录管理'], id_responder:['会话 ID 查询'], echo:['文字回声']};
 const escape = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -69,13 +72,15 @@ async function action(callback) {
   finally { busy = false; renderState(); }
 }
 function navigate() {
-  const name = location.hash.slice(1) in pages ? location.hash.slice(1) : 'overview';
+  const name = location.hash.slice(1) in pages ? location.hash.slice(1) : 'chat';
+  document.body.classList.toggle('chat-page',name==='chat');
   document.querySelectorAll('.page').forEach(node => node.classList.toggle('hidden', node.id !== 'page-' + name));
   document.querySelectorAll('[data-page]').forEach(node => node.classList.toggle('active', node.dataset.page === name));
   document.querySelectorAll('[data-page]').forEach(node => node.dataset.page === name ? node.setAttribute('aria-current','page') : node.removeAttribute('aria-current'));
   $('#page-label').textContent = pages[name]; document.title = pages[name] + ' · helper';
   if (document.body.classList.contains('nav-open')) { setNavigation(false); $('#workspace').focus({preventScroll:true}); }
   window.scrollTo(0, 0);
+  if(name==='chat')renderChatWorkspace();
 }
 function renderRobotOptions() {
   const names={stopped:'已停止',starting:'启动中',running:'等待连接',stopping:'停止中',error:'异常'};
@@ -105,6 +110,7 @@ function renderState() {
   document.querySelectorAll('.save-hint').forEach(node=>node.textContent=unavailable?'连接中断':!state?'正在读取':running?'停止后可保存':'启动后生效');
   if(state)$('#nav-plugin-count').textContent=state.plugins.length;
   renderPlugins();
+  renderChatWorkspace();
 }
 function renderPlugins() {
   if (!state) { pluginSignature=''; $('#plugin-list').innerHTML='<tr><td colspan="4" class="table-empty">正在读取插件列表…</td></tr>'; return; }
@@ -271,6 +277,8 @@ function renderSendMembers() {
   renderSendState();
 }
 function resetComposer() {
+  saveChatDraft();chatDraftId='';chatRows=[];chatLoadKey=robot;chatTimelineSignature='';chatConfirm=null;
+  if($('#chat-send-dialog')?.open)$('#chat-send-dialog').close();
   sendGeneration++;sendMembers=[];mentionSelection.clear();sendSession='';sendLoading=false;pendingSend=null;
   $('#send-chat').innerHTML='<option value="">选择会话</option>';$('#send-content').value='';$('#member-search').value='';
   $('#send-group').classList.add('hidden');sendFeedback('');renderSendMembers();
@@ -283,17 +291,19 @@ async function loadSendChats() {
     if(requested!==robot||generation!==sendGeneration)return;
     const previous=$('#send-chat').value, rows=[...chats];
     if(!rows.some(row=>row.chat_id==='filehelper'))rows.unshift({chat_id:'filehelper',name:'文件传输助手'});
+    chatRows=rows;
     $('#send-chat').innerHTML='<option value="">选择会话</option>'+rows.map(row=>`<option value="${escape(row.chat_id)}">${escape(row.name||row.chat_id)}${row.name?' · '+escape(row.chat_id):''}</option>`).join('');
     if(rows.some(row=>row.chat_id===previous))$('#send-chat').value=previous;
     sendSession=connection.session_id;sendFeedback('');
   } catch(error) {if(requested===robot&&generation===sendGeneration)sendFeedback(error.message,true);}
   finally {if(requested===robot&&generation===sendGeneration){sendLoading=false;renderSendState();}}
-  if(requested===robot&&generation===sendGeneration)await selectSendChat();
+  if(requested===robot&&generation===sendGeneration){await selectSendChat();renderChatWorkspace();}
 }
 async function selectSendChat() {
   const room=$('#send-chat').value,requested=robot,generation=++sendGeneration;
   sendMembers=[];mentionSelection.clear();$('#member-search').value='';
   $('#send-group').classList.toggle('hidden',!room.endsWith('@chatroom'));renderSendMembers();
+  renderChatWorkspace();
   if(!room){renderSendState();return;}
   sendSession='';sendLoading=true;sendFeedback('正在读取…');renderSendState();
   try {
@@ -301,11 +311,11 @@ async function selectSendChat() {
     if(requested!==robot||generation!==sendGeneration)return;
     sendSession=data.session_id;sendMembers=data.members||[];sendFeedback('');renderSendMembers();
   } catch(error) {if(requested===robot&&generation===sendGeneration)sendFeedback(error.message,true);}
-  finally {if(requested===robot&&generation===sendGeneration){sendLoading=false;renderSendState();}}
+  finally {if(requested===robot&&generation===sendGeneration){sendLoading=false;renderSendState();renderChatWorkspace();}}
 }
 $('#refresh-send-chats').onclick=loadSendChats;
-$('#send-chat').onchange=selectSendChat;$('#refresh-send-members').onclick=selectSendChat;
-$('#member-search').oninput=renderSendMembers;$('#send-content').oninput=renderSendState;
+$('#send-chat').onchange=()=>{restoreChatDraft($('#send-chat').value);selectSendChat();};$('#refresh-send-members').onclick=selectSendChat;
+$('#member-search').oninput=renderSendMembers;$('#send-content').oninput=()=>{saveChatDraft();renderSendState();};
 $('#send-members').onchange=event=>{
   const node=event.target;if(!node.matches('[data-mention]'))return;
   if(node.checked&&mentionSelection.size>=8){node.checked=false;sendFeedback('每条消息最多艾特 8 人',true);return;}
@@ -320,15 +330,15 @@ async function pollSendStatus() {
     if(pendingSend!==job||job.robot!==robot)return;
     if(result.status==='sending')return;
     pendingSend=null;
-    if(result.status==='sent'){$('#send-content').value='';sendFeedback('已发送');}
+    if(result.status==='sent'){$('#send-content').value='';chatDrafts.delete(job.robot+':'+job.chat);sendFeedback('已发送');}
     else sendFeedback(result.error||'发送未完成，请核对微信后再重发',true);
     renderSendState();
   } catch(error) {if(pendingSend===job)sendFeedback('暂时无法查询发送结果，请先核对微信。不会自动重发。',true);}
   finally {sendPolling=false;}
 }
-$('#send-form').onsubmit=async event=>{
+async function submitSendNow(event){
   event.preventDefault();if($('#send-text').disabled||pendingSend)return;
-  const requested=robot,job={id:crypto.randomUUID(),robot:requested};pendingSend=job;
+  const requested=robot,job={id:crypto.randomUUID(),robot:requested,chat:$('#send-chat').value};pendingSend=job;
   const body={request_id:job.id,session_id:sendSession,chat_id:$('#send-chat').value,content:$('#send-content').value,at_list:[...mentionSelection]};
   sendFeedback('正在发送…');renderSendState();
   try {
@@ -341,8 +351,95 @@ $('#send-form').onsubmit=async event=>{
     renderSendState();
   }
 };
+$('#send-form').onsubmit=event=>{
+  event.preventDefault();if($('#send-text').disabled||pendingSend)return;
+  chatConfirm={robot,session:sendSession,chat:$('#send-chat').value,text:$('#send-content').value,mentions:[...mentionSelection]};
+  $('#chat-confirm-name').textContent=chatRows.find(row=>row.chat_id===chatConfirm.chat)?.name||chatConfirm.chat;
+  $('#chat-confirm-text').textContent=chatConfirm.text;
+  $('#chat-send-dialog').showModal();
+};
+$('#chat-confirm-cancel').onclick=()=>{chatConfirm=null;$('#chat-send-dialog').close();};
+$('#chat-send-dialog').addEventListener('cancel',()=>{chatConfirm=null;});
+$('#chat-confirm-send').onclick=()=>{
+  const value=chatConfirm;chatConfirm=null;$('#chat-send-dialog').close();
+  if(!value||value.robot!==robot||value.session!==sendSession||value.chat!==$('#send-chat').value||value.text!==$('#send-content').value||JSON.stringify(value.mentions)!==JSON.stringify([...mentionSelection])){sendFeedback('账号、会话或内容已改变，未发送',true);return;}
+  submitSendNow({preventDefault(){}});
+};
 setInterval(pollSendStatus,1500);
+function saveChatDraft(){if(chatDraftId)chatDrafts.set(chatDraftId,$('#send-content').value);}
+function restoreChatDraft(identifier){
+  saveChatDraft();chatDraftId=identifier?robot+':'+identifier:'';
+  $('#send-content').value=chatDrafts.get(chatDraftId)||'';
+}
+function chatAvatar(name){
+  let color=0;for(const c of String(name))color=(color+c.codePointAt(0))%6;
+  return `<span class="hc-avatar hc-color-${color}" aria-hidden="true">${escape([...String(name||'聊')][0])}</span>`;
+}
+function renderChatWorkspace(){
+  if(!$('#chat-conversations'))return;
+  const connected=!!state?.connected&&serviceAvailable;
+  $('#chat-connection').textContent=connected?'已连接':'未连接';
+  $('#chat-connection').classList.toggle('connected',connected);
+  if(!connected)chatLoadKey='';
+  if(connected&&!busy&&!pendingSend&&!$('#page-chat').classList.contains('hidden')&&chatLoadKey!==robot){
+    chatLoadKey=robot;loadSendChats();
+  }
+  const all=new Map(chatRows.map(row=>[row.chat_id,{...row}]));
+  for(const message of messages){
+    if(!message.chat_id)continue;
+    if(!all.has(message.chat_id))all.set(message.chat_id,{chat_id:message.chat_id,name:message.chat_name||message.chat_id});
+    all.get(message.chat_id).last=message;
+  }
+  const selected=$('#send-chat').value,query=$('#chat-filter').value.trim().toLowerCase();
+  const rows=[...all.values()].filter(row=>!query||[row.name,row.chat_id,row.last?.content].some(v=>String(v||'').toLowerCase().includes(query)));
+  rows.sort((a,b)=>(b.last?.id||0)-(a.last?.id||0));
+  const listMarkup=rows.map(row=>{
+    const name=row.name||row.chat_id,last=row.last;
+    return `<button type="button" class="hc-session ${row.chat_id===selected?'selected':''}" data-chat="${escape(row.chat_id)}" aria-label="打开会话 ${escape(name)}" ${pendingSend?'disabled':''}>${chatAvatar(name)}<span class="hc-session-info"><span class="hc-session-row"><strong>${escape(name)}</strong><time>${escape(last?.time||'')}</time></span><span class="hc-preview">${escape(last?.content||'暂无本次连接的消息')}</span></span></button>`;
+  }).join('')||`<p class="hc-empty-list">${query?'没有匹配的会话':connected?'等待消息，或刷新会话':'先在账号管理中启动一个账号'}</p>`;
+  if(listMarkup!==chatListMarkup){chatListMarkup=listMarkup;$('#chat-conversations').innerHTML=listMarkup;}
+  const row=all.get(selected),name=row?.name||selected;
+  $('#chat-heading').textContent=name||'选择一个会话';
+  $('#chat-subtitle').textContent=selected?(selected==='filehelper'?'文件传输助手':selected.endsWith('@chatroom')?'群聊':'私聊'):'本次连接的消息将在这里显示';
+  $('#chat-mention-toggle').classList.toggle('hidden',!selected.endsWith('@chatroom'));
+  $('#chat-mention-toggle').textContent='@'+(mentionSelection.size?' '+mentionSelection.size:'');
+  const timeline=messages.filter(message=>message.chat_id===selected);
+  const signature=JSON.stringify([robot,selected,timeline,connected]);
+  if(signature===chatTimelineSignature)return;
+  chatTimelineSignature=signature;
+  const target=robot+':'+selected;
+  const box=$('#chat-timeline'),atBottom=target!==chatTimelineTarget||box.scrollHeight-box.scrollTop-box.clientHeight<80,top=box.scrollTop;
+  chatTimelineTarget=target;
+  let lastTime='';
+  box.innerHTML=timeline.map(message=>{
+    const time=[message.date,message.time].filter(Boolean).join(' '),showTime=time!==lastTime;lastTime=time;
+    const own=message.direction==='outgoing';
+    const label=own?'我':message.sender_name||name||'对方';
+    return `${showTime?`<div class="hc-time">${escape(time)}</div>`:''}<article class="hc-message ${own?'outgoing':''}">${chatAvatar(label)}<div class="hc-message-body">${message.is_group&&!own?`<div class="hc-sender">${escape(label)}</div>`:''}<div class="hc-bubble">${message.recalled?'<span class="hc-recalled">已撤回</span>':''}${escape(message.content)}</div></div></article>`;
+  }).join('')||`<div class="hc-welcome"><span class="hc-welcome-icon">↔</span><h2>${selected?'等待新消息':'选择一个会话'}</h2><p>${connected?'这里只显示本次连接收到的消息，不是完整历史记录':'前往账号管理启动机器人后，即可收发消息'}</p>${!connected?'<a href="#overview">前往账号管理 →</a>':''}</div>`;
+  box.scrollTop=atBottom?box.scrollHeight:top;
+}
+$('#chat-filter').oninput=renderChatWorkspace;
+$('#chat-refresh').onclick=()=>{if(!$('#refresh-send-chats').disabled)loadSendChats();};
+$('#chat-conversations').onclick=event=>{
+  const button=event.target.closest('[data-chat]');if(!button||pendingSend)return;
+  const id=button.dataset.chat;
+  if(![...$('#send-chat').options].some(option=>option.value===id)){
+    const option=document.createElement('option');option.value=id;option.textContent=id;$('#send-chat').append(option);
+  }
+  $('#send-chat').value=id;restoreChatDraft(id);
+  $('#page-chat').classList.add('chat-detail-open');$('#chat-conversation').classList.remove('chat-mentions-open');
+  selectSendChat();
+};
+$('#chat-back').onclick=()=>$('#page-chat').classList.remove('chat-detail-open');
+$('#chat-mention-toggle').onclick=()=>$('#chat-conversation').classList.toggle('chat-mentions-open');
+$('#send-members').addEventListener('change',renderChatWorkspace);
+$('#send-content').addEventListener('keydown',event=>{
+  if(event.key!=='Enter'||event.isComposing||event.keyCode===229||event.shiftKey||event.ctrlKey||event.metaKey)return;
+  event.preventDefault();if(!$('#send-text').disabled)$('#send-form').requestSubmit();
+});
 function renderMessages() {
+  renderChatWorkspace();
   const query=$('#message-search').value.trim().toLowerCase();
   const rows=messages.filter(row=>!query||[row.chat_id,row.sender_id,row.sender_name,row.content,row.forwarded_by,row.forwarded_by_id,row.source_time,row.message_id,roleLabels[row.sender_role],row.recalled?'已撤回':''].some(value=>String(value||'').toLowerCase().includes(query)));
   $('#message-count').textContent=(query?rows.length+' / '+messages.length:messages.length)+' 条';

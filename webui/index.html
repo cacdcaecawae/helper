@@ -13,13 +13,14 @@
 <body>
 <a class="skip-link" href="#workspace">跳转到主要内容</a>
 <aside class="sidebar" id="primary-sidebar" aria-label="工作空间导航">
-  <a class="brand" href="#overview" aria-label="helper 管理台首页">helper</a>
+  <a class="brand" href="#chat" aria-label="helper 管理台首页">helper</a>
   <nav aria-label="主导航">
-    <a href="#overview" data-page="overview"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="2"/><path d="M3.5 9h17M9 9v11.5"/></svg>运行概览</a>
-    <a href="#plugins" data-page="plugins"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="6.5" height="6.5" rx="1"/><rect x="14" y="3.5" width="6.5" height="6.5" rx="1"/><rect x="3.5" y="14" width="6.5" height="6.5" rx="1"/><rect x="14" y="14" width="6.5" height="6.5" rx="1"/></svg>插件管理<span id="nav-plugin-count" class="nav-count">—</span></a>
-    <a href="#groups" data-page="groups"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="7.5" r="3"/><path d="M3.5 20v-3.5a5.5 5.5 0 0 1 11 0V20M16 4.5a3 3 0 0 1 0 6M17 13a5 5 0 0 1 3.5 4.8V20"/></svg>群聊与会话</a>
-    <a href="#models" data-page="models"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h16M4 16h16"/><circle cx="9" cy="8" r="2.5"/><circle cx="15" cy="16" r="2.5"/></svg>模型与语音</a>
-    <a href="#logs" data-page="logs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.1M4 12h.1M4 18h.1"/></svg>运行日志</a>
+    <a href="#chat" data-page="chat" aria-label="聊天" title="聊天"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4C7 4 3 7 3 11c0 2.2 1.2 4 3.2 5.4L6 20l3.5-2c.8.2 1.7.3 2.5.3 5 0 9-3.3 9-7.3S17 4 12 4z"/></svg>聊天</a>
+    <a href="#overview" data-page="overview" aria-label="账号与监控" title="账号与监控"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="2"/><path d="M3.5 9h17M9 9v11.5"/></svg>账号与监控</a>
+    <a href="#plugins" data-page="plugins" aria-label="插件管理" title="插件管理"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="6.5" height="6.5" rx="1"/><rect x="14" y="3.5" width="6.5" height="6.5" rx="1"/><rect x="3.5" y="14" width="6.5" height="6.5" rx="1"/><rect x="14" y="14" width="6.5" height="6.5" rx="1"/></svg>插件管理<span id="nav-plugin-count" class="nav-count">—</span></a>
+    <a href="#groups" data-page="groups" aria-label="群聊配置" title="群聊配置"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="7.5" r="3"/><path d="M3.5 20v-3.5a5.5 5.5 0 0 1 11 0V20M16 4.5a3 3 0 0 1 0 6M17 13a5 5 0 0 1 3.5 4.8V20"/></svg>群聊配置</a>
+    <a href="#models" data-page="models" aria-label="模型与语音" title="模型与语音"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h16M4 16h16"/><circle cx="9" cy="8" r="2.5"/><circle cx="15" cy="16" r="2.5"/></svg>模型与语音</a>
+    <a href="#logs" data-page="logs" aria-label="运行日志" title="运行日志"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.1M4 12h.1M4 18h.1"/></svg>运行日志</a>
   </nav>
   <div class="sidebar-bottom"><a href="https://prometheus-first.github.io/helper/" target="_blank" rel="noreferrer">使用文档<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 14 14 6M6 6h8v8"/></svg></a></div>
 </aside>
@@ -30,7 +31,35 @@
     <div class="robot-toolbar"><label for="robot-select">当前账号</label><select id="robot-select" aria-label="当前账号"><option value="default">默认机器人</option></select><button id="theme-toggle" class="secondary theme-switch" type="button" aria-label="切换到暗色" title="切换到暗色"><svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 13a8.8 8.8 0 0 1-9.5-9.5A8.8 8.8 0 1 0 20.5 13Z"/></svg><svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.4 1.4M17.6 17.6 19 19M5 19l1.4-1.4M17.6 6.4 19 5"/></svg><span>暗色</span></button></div>
   </header>
   <div id="service-banner" class="banner hidden" role="status"></div>
-  <section class="page" id="page-overview" aria-labelledby="overview-heading">
+  <section class="page hidden" id="page-chat" aria-labelledby="chat-page-heading">
+    <h1 id="chat-page-heading" class="sr-only">聊天</h1>
+    <div class="hc-layout">
+      <aside class="hc-list">
+        <div class="hc-search-row"><label for="chat-filter" class="sr-only">搜索会话</label><input id="chat-filter" type="search" placeholder="搜索会话" autocomplete="off"><button id="chat-refresh" type="button" title="刷新会话" aria-label="刷新会话">↻</button></div>
+        <div id="chat-conversations" class="hc-conversations" aria-label="会话列表"></div>
+        <div class="hc-list-footer"><span id="chat-connection">未连接</span><a href="#overview">账号管理</a></div>
+      </aside>
+      <div class="hc-conversation" id="chat-conversation">
+        <header class="hc-chat-header"><button id="chat-back" type="button" aria-label="返回会话列表">‹</button><div><h2 id="chat-heading">选择一个会话</h2><p id="chat-subtitle">本次连接的消息将在这里显示</p></div><a href="#groups" title="群聊与白名单设置" aria-label="群聊与白名单设置">···</a></header>
+        <section id="chat-timeline" class="hc-timeline" aria-label="聊天消息" aria-live="polite"></section>
+            <section class="settings-section manual-send hc-composer" aria-labelledby="send-heading">
+      <div class="section-heading"><h2 id="send-heading">发送消息</h2><button id="refresh-send-chats" class="secondary small" type="button">刷新会话</button></div>
+      <form id="send-form">
+        <div class="hidden"><label for="send-chat">会话</label><select id="send-chat" required><option value="">选择会话</option></select></div>
+        <div id="send-group" class="hidden">
+          <div class="section-heading member-heading"><h3>艾特成员 <span id="mention-count" class="count">已选 0 / 8</span></h3><button id="refresh-send-members" class="text-button small" type="button">刷新成员</button></div>
+          <label class="sr-only" for="member-search">搜索群成员</label><input id="member-search" type="search" placeholder="搜索昵称、微信 ID 或身份" autocomplete="off">
+          <div class="table-container member-scroll"><table class="member-table"><thead><tr><th scope="col"><span class="sr-only">选择</span></th><th scope="col">群成员</th><th scope="col">身份</th></tr></thead><tbody id="send-members"><tr><td colspan="3" class="table-empty">请先选择群聊。</td></tr></tbody></table></div>
+        </div>
+        <button type="button" id="chat-mention-toggle" class="hidden" title="艾特群成员" aria-label="艾特群成员">@</button><label class="sr-only" for="send-content">正文</label><textarea id="send-content" rows="3" required placeholder="输入文字" spellcheck="false"></textarea>
+        <div class="form-footer"><p id="send-status" class="send-status" role="status" aria-live="polite"></p><button id="send-text" class="primary" type="submit" disabled>发送</button></div>
+      </form>
+    </section>
+      </div>
+    </div>
+  </section>
+
+  <section class="page hidden" id="page-overview" aria-labelledby="overview-heading">
     <div class="page-heading"><div><h1 id="overview-heading">运行概览</h1></div></div>
     <section class="account-picker" aria-labelledby="accounts-heading">
       <div class="section-heading"><h2 id="accounts-heading">已登录微信 <span id="account-total" class="count">—</span></h2><div class="account-controls"><span id="account-selection-count" class="count">已选 0</span><button id="refresh-accounts" class="secondary">刷新账号</button><button id="start-selected" class="primary" disabled>启动所选</button></div></div>
@@ -51,19 +80,7 @@
   </section>
   <section class="page hidden" id="page-groups" aria-labelledby="groups-heading">
     <div class="page-heading"><div><h1 id="groups-heading">群聊与会话</h1></div><button id="discover-chats" class="secondary">发现群聊</button></div>
-    <section class="settings-section manual-send" aria-labelledby="send-heading">
-      <div class="section-heading"><h2 id="send-heading">发送消息</h2><button id="refresh-send-chats" class="secondary small" type="button">刷新会话</button></div>
-      <form id="send-form">
-        <label for="send-chat">会话</label><select id="send-chat" required><option value="">选择会话</option></select>
-        <div id="send-group" class="hidden">
-          <div class="section-heading member-heading"><h3>艾特成员 <span id="mention-count" class="count">已选 0 / 8</span></h3><button id="refresh-send-members" class="text-button small" type="button">刷新成员</button></div>
-          <label class="sr-only" for="member-search">搜索群成员</label><input id="member-search" type="search" placeholder="搜索昵称、微信 ID 或身份" autocomplete="off">
-          <div class="table-container member-scroll"><table class="member-table"><thead><tr><th scope="col"><span class="sr-only">选择</span></th><th scope="col">群成员</th><th scope="col">身份</th></tr></thead><tbody id="send-members"><tr><td colspan="3" class="table-empty">请先选择群聊。</td></tr></tbody></table></div>
-        </div>
-        <label for="send-content">正文</label><textarea id="send-content" rows="3" required placeholder="输入文字" spellcheck="false"></textarea>
-        <div class="form-footer"><p id="send-status" class="send-status" role="status" aria-live="polite"></p><button id="send-text" class="primary" type="submit" disabled>发送</button></div>
-      </form>
-    </section>
+
     <div class="settings-columns"><form id="groups-form" class="settings-section"><div class="section-heading"><div><h2>支持的群聊</h2></div></div><label for="group-ids">群 ID（每行一个）</label><textarea id="group-ids" name="groups" rows="7" placeholder="12345678@chatroom" spellcheck="false"></textarea><div class="check-row"><label><input type="checkbox" name="history_enabled">记录当天文字</label><label><input type="checkbox" name="daily_clear">每天零点清理旧记录</label></div><div class="form-footer"><span class="save-hint">停止后保存，下次启动生效</span><button class="primary" type="submit">保存群聊配置</button></div></form><section class="settings-section discovered-section"><h2>已发现的群</h2><div id="discovered-chats" class="empty">暂无已接收消息的群。</div></section></div>
     <form id="scope-form" class="settings-section scope-section"><div class="section-heading"><div><h2>收发会话白名单</h2></div></div><label for="scope-ids">会话 ID（每行一个）</label><textarea id="scope-ids" name="chat_allowlist" rows="4" placeholder="留空允许全部会话" spellcheck="false"></textarea><details class="help-details"><summary>白名单与群配置的关系</summary><p>白名单非空时，支持群会自动加入。屏蔽群需从两处移除。</p></details><div class="form-footer"><span class="save-hint">停止后保存</span><button class="primary" type="submit">保存白名单</button></div></form>
   </section>
@@ -81,5 +98,6 @@
 </main>
 <div id="toast" class="toast hidden" role="status"></div>
 <dialog id="plugin-dialog" aria-labelledby="plugin-dialog-title"><form id="plugin-form"><div class="dialog-heading"><h2 id="plugin-dialog-title">插件配置</h2><button type="button" class="icon-button" id="close-plugin-dialog" aria-label="关闭"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button></div><label for="plugin-options">插件选项（JSON）</label><textarea id="plugin-options" name="options" rows="13" spellcheck="false"></textarea><p class="dialog-error hidden" role="alert"></p><div class="form-footer"><button type="submit" class="primary">保存插件配置</button></div></form></dialog>
+<dialog id="chat-send-dialog" aria-labelledby="chat-confirm-title"><h2 id="chat-confirm-title">确认发送</h2><p>发送给 <strong id="chat-confirm-name"></strong></p><pre id="chat-confirm-text"></pre><div class="form-footer"><button type="button" id="chat-confirm-cancel" class="secondary">取消</button><button type="button" id="chat-confirm-send" class="primary">确认发送</button></div></dialog>
 </body>
 </html>

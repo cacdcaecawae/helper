@@ -1,5 +1,7 @@
 # 微信机器人框架
 
+> 此 fork 改用 Claude 风格的微信聊天界面，保留上游的原生桥接和管理功能。修改范围与验收方式见 [FORK_NOTES.md](FORK_NOTES.md)。
+
 📚 [在线文档](https://prometheus-first.github.io/helper/) · [安装与启动](https://prometheus-first.github.io/helper/guide/quick-start.html) · [插件开发](https://prometheus-first.github.io/helper/development/plugins.html)
 
 **使用许可：允许个人自用，禁止商业使用。** 允许个人学习研究及非商业修改、免费分享，分享时须保留协议和版权声明。完整条款见 [LICENSE](LICENSE)，第三方组件继续适用各自的许可证。
