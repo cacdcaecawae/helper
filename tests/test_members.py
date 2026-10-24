@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRATCH = ROOT / ".runtime/tests"
 ROOM = "12345678@chatroom"
 ROBOT, SMALL, JING = "wxid_robot", "wxid_small", "wxid_jing"
+UNNAMED_JING = "群友·" + __import__("hashlib").sha1(JING.encode()).hexdigest()[:4]  # 没登记名字的群友
 
 
 class MemberTests(unittest.TestCase):
@@ -63,7 +64,7 @@ class MemberTests(unittest.TestCase):
         reopened = self.create_store()  # 模拟重启：新的连接读同一个库
         summary, lines = reopened.memory(ROOM, exclude=current)
         self.assertEqual((summary, [(line["name"], line["text"]) for line in lines]),
-                         ("", [("成员甲昵称", "周末去哪玩"), ("群友", "去爬山吧"), ("你", "推荐《白日梦想家》")]))
+                         ("", [("成员甲昵称", "周末去哪玩"), (UNNAMED_JING, "去爬山吧"), ("你", "推荐《白日梦想家》")]))
         before, epoch = reopened.memory_size(ROOM), reopened.epoch(ROOM)
         self.assertTrue(reopened.compact_memory(ROOM, "商量周末", lines[1]["id"], epoch))
         summary, rest = reopened.memory(ROOM)
@@ -258,6 +259,14 @@ class MemberTests(unittest.TestCase):
         self.assertEqual([(line["name"], line["text"]) for line in self.store.memory(friend)[1]],
                          [("小王", "推荐本书"), ("你", "推荐《白夜行》"), ("你", "我晚点看")])
 
+    def test_unnamed_group_members_get_distinct_stable_labels(self):
+        self.assertEqual(self.store.speaker_name(JING, ROOM), UNNAMED_JING)
+        self.assertNotEqual(self.store.speaker_name("wxid_other", ROOM), UNNAMED_JING)  # 分得清是两个人
+        self.assertNotIn(JING, UNNAMED_JING)  # 不把微信 ID 原样交给模型
+        self.assertEqual(self.store.speaker_name("wxid_friend", "wxid_friend"), "对方")
+        self.store.remember_group_nickname(JING, ROOM, "小静")
+        self.assertEqual(self.store.speaker_name(JING, ROOM), "小静")
+
     def test_has_newer_sees_later_lines_from_the_friend_only(self):
         friend = "wxid_friend"
         clock = [datetime(2026, 10, 24, 4, 0, tzinfo=timezone.utc)]
@@ -312,7 +321,7 @@ class MemberTests(unittest.TestCase):
         self.store.record(self.message("周六我也来", sender=ROBOT, sequence=3, is_self=True, data={"bot_generated": True}))
         rows = self.store.search(ROOM, "周六")
         self.assertEqual([(row["name"], row["text"]) for row in rows],
-                         [("群友", "周六晚上开黑"), ("成员甲昵称", "周六见"), ("你", "周六我也来")])
+                         [(UNNAMED_JING, "周六晚上开黑"), ("成员甲昵称", "周六见"), ("你", "周六我也来")])
         for room, keyword in (("999@chatroom", "周六"), (ROOM, " "), (ROOM, "x" * 101)):
             with self.subTest(room=room, keyword=keyword), self.assertRaises(MemberError):
                 self.store.search(room, keyword)

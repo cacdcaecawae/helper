@@ -1,11 +1,13 @@
-"""智能体对话：开了“自动回复”的会话里，群聊被真实艾特、私聊收到消息时，按需调用工具后回复。
+"""智能体对话：开了“自动回复”的会话里，群聊被真实艾特（或提到唤醒词）、私聊收到消息时，按需调用工具后回复。
 
 开启后代替“艾特对话”；每一步思考和工具调用都推送到管理台聊天页。
 哪些会话记录、哪些自动回复，由聊天页顶部每个会话的“长期记忆”“自动回复”两个开关决定。
 记忆就是这个群或私聊的完整聊天记录（所有人＋机器人自己说的），太长时把较早部分压成摘要，原文都保留可查。
-插件选项：tools 可用工具；image_server 本机画图服务地址；replies_per_minute 每个会话每分钟最多自动回复几次（默认 5，防刷屏）。
+插件选项：tools 可用工具；image_server 本机画图服务地址；replies_per_minute 每个会话每分钟最多自动回复几次（默认 5，防刷屏）；
+wake_words 唤醒词列表（如 ["小雪"]），群里消息含唤醒词时不用艾特也会回复。
 """
 from collections import deque
+from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -13,14 +15,14 @@ import tempfile
 import time
 import uuid
 
-from wxbot_framework.agent import Agent, ImageServer, ToolError, beijing_time, draw_tool, history_tool, search_tool
+from wxbot_framework.agent import Agent, ImageServer, ToolError, beijing_time, draw_tool, edit_tool, history_tool, search_tool
 from wxbot_framework.llm import LLMError
-from wxbot_framework.members import SnapshotExpired
+from wxbot_framework.members import BEIJING, SnapshotExpired
 from wxbot_framework.mentions import strip_at_labels
 from wxbot_framework.personality import personality_text
 from wxbot_framework.speech import deliver_model_reply
 
-TOOLS = ("draw_image", "search_history", "web_search")
+TOOLS = ("draw_image", "edit_image", "search_history", "web_search")
 MAX_PARTS = 3
 PRIVATE_WAIT = 5  # 私聊收到后等几秒再回，对方连发的几条合成一次回复
 # 记忆超过 MEMORY_CHARS 字时，像 Codex 的自动压缩一样，把较早部分（连同旧摘要）压成摘要，最近约 KEEP_CHARS 字保留原文。
@@ -50,16 +52,42 @@ class Plugin:
         if type(self.per_minute) is not int or not 1 <= self.per_minute <= 60:
             raise ValueError("replies_per_minute 应为 1–60 的整数")
         self.recent = {}  # 会话 → 最近一分钟开始回复的时刻
+        words = ctx.config.get("wake_words", [])
+        if not isinstance(words, list) or not all(isinstance(word, str) and word.strip() for word in words):
+            raise ValueError("wake_words 应为唤醒词列表，例如 [\"小雪\"]")
+        self.wake_words = tuple(word.strip() for word in words)
+        # 会话 → 最近一张图（读取函数, 说明），给 edit_image 用；只在内存里，重启就没了。
+        # ponytail: 只记最近一张，要改更早的某张得先让对方重发；需要时再按消息挑图。
+        self.images = {}
         self.image = ImageServer(ctx.config.get("image_server", "http://127.0.0.1:7860")) if "draw_image" in tools else None
         ctx.llm  # 启动时核对配置，不请求接口。
 
-    def _wanted(self, message):
-        # 只回开了“自动回复”的会话：私聊每条都回，群里真实艾特机器人才回。
+    def _trigger(self, message):
+        """这条要不要回、为什么轮到你：只回开了“自动回复”的会话。私聊每条都回；群里被真实艾特、
+        或消息里有唤醒词才回。不回返回 None。"""
         if (message.type != 1 or message.is_self or message.data.get("bot_generated") or
                 not self.members.replies(message.chat_id)):
-            return False
-        return not message.is_group or ("WXBOT_AT_CHAT_PROBE" not in message.text and bool(message.data.get("is_at_self"))
-                                         and self.members.account in message.data.get("at_members", ()))
+            return None
+        if not message.is_group:
+            return "私聊"
+        if "WXBOT_AT_CHAT_PROBE" in message.text:
+            return None
+        if message.data.get("is_at_self") and self.members.account in message.data.get("at_members", ()):
+            return "被艾特"
+        if any(word in message.text for word in self.wake_words):
+            return "有人提到你的名字"
+        return None
+
+    def _me(self):
+        name = self.members.wechat_name(self.members.account) or "（未知）"
+        return name + (f"（大家也叫你：{'、'.join(self.wake_words)}）" if self.wake_words else "")
+
+    def _keep_image(self, message):
+        # 开了自动回复的会话才记最近一张图；图片收到并下载好后才会分发过来，带本机路径。
+        if message.type == 3 and message.image_path and self.members.replies(message.chat_id):
+            who = "你" if message.is_self else self.members.speaker_name(message.sender_id or message.chat_id, message.chat_id)
+            self.images[message.chat_id] = (Path(message.image_path).read_bytes,
+                                            datetime.now(BEIJING).strftime("%H:%M ") + who + "发的图片")
 
     def _too_frequent(self, chat):
         now, recent = time.monotonic(), self.recent.setdefault(chat, deque())
@@ -71,10 +99,12 @@ class Plugin:
         return False
 
     def on_message(self, message, ctx):
+        self._keep_image(message)
         # 每来一条消息都看看记忆是否超长（不只在艾特时），艾特时拼出的材料就不会超过上限。
         if message.type == 1 and self.members.remembers(message.chat_id):
             self._compact(message.chat_id, ctx)
-        if not self._wanted(message):
+        trigger = self._trigger(message)
+        if trigger is None:
             return
         run, started = uuid.uuid4().hex[:12], time.monotonic()
 
@@ -102,7 +132,8 @@ class Plugin:
             if message.is_group:
                 snapshot = self.members.conversation_snapshot(message)
                 guard = lambda: self.members.reply_guard(message.chat_id, epoch, lambda: ctx.response_guard(snapshot, personality))
-                name, current = snapshot.speaker_name, strip_at_labels(snapshot.current)
+                name = self.members.speaker_name(message.sender_id, message.chat_id)
+                current = strip_at_labels(snapshot.current)
             else:
                 name, current = message.data.get("sender_wechat_name") or "对方", message.text
             # 材料：较早聊天的摘要 ＋ 之后的全部聊天原文（所有人和你自己）＋ 这次的话。
@@ -111,16 +142,17 @@ class Plugin:
             while total > MEMORY_CHARS:  # 压缩没成功时也不超量发送：去掉最早的几条
                 total, start = total - len(lines[start]["text"]), start + 1
             lines = lines[start:]
-            context = {"scene": "群聊" if message.is_group else "私聊", "name": name,
-                       "summary": summary, "chat": transcript(lines), "current": current}
+            latest = self.images.get(message.chat_id)
+            context = {"me": self._me(), "scene": "群聊" if message.is_group else "私聊", "trigger": trigger, "name": name,
+                       "summary": summary, "chat": transcript(lines), "current": current,
+                       "latest_image": latest[1] if latest else ""}
             trace("start", current[:300])
             reply = Agent(ctx.llm_for(message, personality=personality), self._toolbox(message, ctx, guard), trace).run(context)
             # 像真人一样可以分几条发：空行分隔，最多三条；群里只有第一条艾特对方。
             parts = [personality_text(part.strip(), personality.name)
                      for part in re.split(r"\n\s*\n", reply) if part.strip()][:MAX_PARTS]
-            display = None
-            if message.is_group:
-                display = self.members.display_name(message.sender_id, message.chat_id) or snapshot.speaker_name
+            # 群里第一条艾特对方；不知道对方在群里叫什么时不艾特，免得显示成“@群友”。
+            display = self.members.display_name(message.sender_id, message.chat_id) if message.is_group else None
             # 发出的话都会进聊天记录：群里文字由原生层回传，私聊文字在发送时补记，语音由语音模块补记。
             for index, part in enumerate(parts):
                 deliver_model_reply(ctx, message, part, display_name=display if index == 0 else None, delivery_guard=guard)
@@ -168,14 +200,18 @@ class Plugin:
     def _toolbox(self, message, ctx, guard):
         tools = {}
         codex = getattr(ctx.llm, "provider", "") == "codex"
+        def send(data):
+            with tempfile.TemporaryDirectory(prefix="agent-image-") as directory:
+                path = Path(directory) / "image.png"
+                path.write_bytes(data)
+                if not ctx.reply_image(message, path, delivery_guard=guard):
+                    raise ToolError("图片发送未成功")
+            self.images[message.chat_id] = (lambda: data, datetime.now(BEIJING).strftime("%H:%M ") + "你发的图片")
         if "draw_image" in self.tools and (codex or self.image is not None):
-            def send(data):
-                with tempfile.TemporaryDirectory(prefix="agent-image-") as directory:
-                    path = Path(directory) / "image.png"
-                    path.write_bytes(data)
-                    if not ctx.reply_image(message, path, delivery_guard=guard):
-                        raise ToolError("图片发送未成功")
             tools["draw_image"] = draw_tool(ctx.llm if codex else self.image, send)
+        latest = self.images.get(message.chat_id)
+        if "edit_image" in self.tools and codex and latest is not None:  # 本机 Z-Image 只能凭文字画，不能改图
+            tools["edit_image"] = edit_tool(ctx.llm, latest[0], send)
         if "search_history" in self.tools:
             tools["search_history"] = history_tool(self.members, message.chat_id)
         if "web_search" in self.tools and codex:

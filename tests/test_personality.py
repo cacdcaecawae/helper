@@ -256,8 +256,9 @@ class PersonalityTests(unittest.TestCase):
     def test_unbound_person_can_chat_and_bot_does_not_reply_to_id_text(self):
         plugin = self.setup_chat()
         plugin.on_message(self.chat(sender="wxid_unbound"), self.ctx)
-        self.assertTrue(self.backend.sent[-1][1].startswith("@群友\u2005"))
-        self.assertEqual(self.backend.sent[-1][2], ("wxid_unbound",))
+        # 不知道对方在群里叫什么：照常回复，但不艾特，免得显示成“@群友”
+        room, text, *mentions = self.backend.sent[-1]
+        self.assertEqual((room, text, mentions), (ROOM, "这是回答。", []))
 
     def test_cleared_current_message_or_day_change_does_not_reuse_history(self):
         plugin = self.setup_chat()

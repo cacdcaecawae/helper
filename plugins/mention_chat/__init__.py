@@ -27,7 +27,7 @@ class Plugin:
             guard = lambda: self.members.reply_guard(message.chat_id, epoch, lambda: ctx.response_guard(snapshot, personality))
             reply = personality_text(Dialogue(ctx.llm_for(message, personality=personality)).reply(snapshot),
                                      personality.name)
-            display = self.members.display_name(message.sender_id, message.chat_id) or snapshot.speaker_name
+            display = self.members.display_name(message.sender_id, message.chat_id)  # 不知道名字就不艾特，免得显示“@群友”
             deliver_model_reply(ctx, message, reply, display_name=display, delivery_guard=guard)
             ctx.logger.info("艾特对话完成：room=%s persona=%s context=%d", message.chat_id,
                             personality.name, len(snapshot.messages))

@@ -31,6 +31,18 @@ CODEX_DEFAULT_MODEL = "gpt-6.1-sol"
 CODEX_DEFAULT_REASONING = {"effort": "medium"}
 
 
+def image_data_url(data):
+    """原图字节转成 data URL；按文件头认格式，不信扩展名。"""
+    magics = ((b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpeg"), (b"GIF8", "gif"))
+    kind = next((name for magic, name in magics if data.startswith(magic)),
+                "webp" if data[:4] == b"RIFF" and data[8:12] == b"WEBP" else None)
+    if kind is None:
+        raise LLMError("图片格式不支持（只支持 PNG、JPEG、GIF、WebP）")
+    if len(data) > 10 * 1024 * 1024:
+        raise LLMError("图片超过 10 MB，无法修改")
+    return f"data:image/{kind};base64," + base64.b64encode(data).decode("ascii")
+
+
 def _codex_home():
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
@@ -217,13 +229,15 @@ class LLMClient:
                 "联网搜索后用不超过 300 字的中文回答，列出关键事实和来源网站名；搜不到就直说。"}]},
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": query}]}]})
 
-    def generate_image(self, prompt):
-        """用 Codex 后端自带的生图工具画一张图，返回 PNG 字节；仅 Codex 接入方式可用。"""
+    def generate_image(self, prompt, image=None):
+        """用 Codex 后端自带的生图工具画一张图；给了 image（原图字节）就按 prompt 修改它。返回 PNG 字节；仅 Codex 接入方式可用。"""
         if self.provider != "codex":
             raise LLMError("Codex 生图需要使用本机 Codex 登录")
+        content = [{"type": "input_text", "text": prompt}]
+        if image is not None:
+            content.append({"type": "input_image", "image_url": image_data_url(image)})
         return self._codex_stream({"tools": [{"type": "image_generation"}], "tool_choice": {"type": "image_generation"},
-                                   "input": [{"type": "message", "role": "user", "content": [
-                                       {"type": "input_text", "text": prompt}]}]}, image=True)
+                                   "input": [{"type": "message", "role": "user", "content": content}]}, image=True)
 
     def _codex_text(self, system, user):
         payload = {"max_output_tokens": self.max_tokens,

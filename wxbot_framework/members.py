@@ -1,6 +1,7 @@
 """框架共用的成员身份和新收到的群文本记录，按账号、群及成员 ID 隔离。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -473,8 +474,11 @@ class MemberStore:
             return row[0] if row else None
 
     def speaker_name(self, wxid, chat):
-        """给模型和聊天页看的发言人名字；读不到时群里叫“群友”，私聊叫“对方”。"""
-        return self.display_name(wxid, chat) or ("群友" if chat.endswith("@chatroom") else "对方")
+        """给模型和聊天页看的发言人名字。读不到时私聊叫“对方”；群里叫“群友·xxxx”，xxxx 由微信 ID 算出，
+        同一个人始终相同，模型分得清是几个人在说话，又不把微信 ID 原样交出去。"""
+        if not chat.endswith("@chatroom"):
+            return self.display_name(wxid, chat) or "对方"
+        return self.display_name(wxid, chat) or "群友·" + hashlib.sha1(wxid.encode()).hexdigest()[:4]
 
     def display_name(self, wxid, room):
         """群内绑定优先；其他群的绑定永远不作为默认名字。"""

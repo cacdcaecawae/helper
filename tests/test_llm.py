@@ -282,6 +282,19 @@ class CodexTests(unittest.TestCase):
         with self.assertRaisesRegex(LLMError, "Codex"):
             LLMClient({"api_key": "k", "model": "m"}).generate_image("橘猫")
 
+    def test_image_edit_sends_the_original_as_input_image(self):
+        events = [{"type": "response.output_item.done", "item": {"type": "image_generation_call", "result": "UE5HREFUQQ=="}},
+                  {"type": "response.completed"}]
+        jpeg = b"\xff\xd8\xff\xe0" + b"photo"
+        with patch("wxbot_framework.llm.urlopen", return_value=self.stream(*events)) as call:
+            self.assertEqual(self.client.generate_image("背景换成海边", jpeg), b"PNGDATA")
+        content = json.loads(call.call_args.args[0].data)["input"][0]["content"]
+        self.assertEqual(content[0], {"type": "input_text", "text": "背景换成海边"})
+        self.assertEqual(content[1]["type"], "input_image")
+        self.assertTrue(content[1]["image_url"].startswith("data:image/jpeg;base64,"))
+        with self.assertRaisesRegex(LLMError, "格式不支持"):  # 按文件头认格式，不是图片就不上传
+            self.client.generate_image("改", b"not an image")
+
     def test_model_list_comes_from_codex_cache_without_hidden_models(self):
         Path(self.home.name, "models_cache.json").write_text(json.dumps({"models": [
             {"slug": "gpt-big", "visibility": "list"}, {"slug": "internal", "visibility": "hide"},

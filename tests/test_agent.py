@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from plugins.agent_chat import Plugin
-from wxbot_framework.agent import MAX_OBSERVATION, Agent, ImageServer, ToolError, draw_tool, history_tool
+from wxbot_framework.agent import MAX_OBSERVATION, Agent, ImageServer, ToolError, draw_tool, edit_tool, history_tool
 from wxbot_framework.llm import LLMError
 from wxbot_framework.members import SnapshotExpired
 from wxbot_framework.message_monitor import MessageBuffer
@@ -101,6 +101,19 @@ class ImageServerTests(unittest.TestCase):
         self.assertEqual(sent, ["IMG:猫".encode()])
 
 
+    def test_edit_tool_sends_the_edited_latest_image(self):
+        sent, seen = [], []
+        generator = SimpleNamespace(generate_image=lambda prompt, image: seen.append((prompt, image)) or b"EDITED")
+        description, run = edit_tool(generator, lambda: b"ORIGINAL", sent.append)
+        self.assertEqual(run({"prompt": " 背景换成海边 "}), "修改后的图片已生成并发送到当前会话")
+        self.assertEqual((seen, sent), ([("背景换成海边", b"ORIGINAL")], [b"EDITED"]))
+
+        def gone():
+            raise FileNotFoundError
+        with self.assertRaisesRegex(ToolError, "重新发"):
+            edit_tool(generator, gone, sent.append)[1]({"prompt": "改"})
+
+
 class TraceBufferTests(unittest.TestCase):
     def test_each_run_is_one_row_updated_in_place(self):
         buffer = MessageBuffer(clock=lambda: 1792540800)
@@ -119,6 +132,7 @@ class AgentPluginGateTests(unittest.TestCase):
         self.plugin = Plugin()
         # 聊天页开了“自动回复”的会话：一个群、一个私聊
         self.plugin.members = SimpleNamespace(account="wxid_bot", replies=lambda chat: chat in {"123@chatroom", "wxid_friend"})
+        self.plugin.wake_words = ("小雪",)
 
     def message(self, chat, text="你好", **data):
         return Message(text, chat, "wxid_x" if chat.endswith("@chatroom") else chat,
@@ -129,14 +143,16 @@ class AgentPluginGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "history_enabled"):
             Plugin().on_load(ctx)
 
-    def test_only_real_mentions_and_private_messages_in_chats_with_auto_reply(self):
+    def test_mentions_wake_words_and_private_messages_in_chats_with_auto_reply(self):
         mention = {"is_at_self": True, "at_members": ["wxid_bot"]}
-        self.assertTrue(self.plugin._wanted(self.message("123@chatroom", **mention)))
-        self.assertTrue(self.plugin._wanted(self.message("wxid_friend")))
+        self.assertEqual(self.plugin._trigger(self.message("123@chatroom", **mention)), "被艾特")
+        self.assertEqual(self.plugin._trigger(self.message("123@chatroom", "小雪你觉得呢")), "有人提到你的名字")
+        self.assertEqual(self.plugin._trigger(self.message("wxid_friend")), "私聊")
         for message in (self.message("123@chatroom"), self.message("999@chatroom", **mention),
-                        self.message("wxid_stranger"), self.message("wxid_friend", bot_generated=True)):
-            with self.subTest(chat=message.chat_id, data=message.data):
-                self.assertFalse(self.plugin._wanted(message))
+                        self.message("999@chatroom", "小雪在吗"), self.message("wxid_stranger"),
+                        self.message("wxid_friend", bot_generated=True)):
+            with self.subTest(chat=message.chat_id, text=message.text, data=message.data):
+                self.assertIsNone(self.plugin._trigger(message))
 
 
 class FakeTimeline:
@@ -148,6 +164,12 @@ class FakeTimeline:
 
     def remembers(self, chat):
         return chat in ("123@chatroom", "wxid_friend")
+
+    def wechat_name(self, wxid):
+        return "小雪三号" if wxid == self.account else None
+
+    def speaker_name(self, wxid, chat):
+        return "小王" if wxid == "wxid_friend" else "群友·0000"
 
     def replies(self, chat):
         return chat in self.reply_chats
@@ -204,6 +226,7 @@ class AgentPluginConversationTests(unittest.TestCase):
         wait.start()
         self.addCleanup(wait.stop)
         self.plugin.tools, self.plugin.image, self.plugin.per_minute, self.plugin.recent = frozenset(), None, 5, {}
+        self.plugin.wake_words, self.plugin.images = ("小雪",), {}
         self.traces = []
         self.sent, self.llm = [], ScriptedLLM({"reply": "推荐《星际穿越》。\n\n周末看正合适。"}, {"reply": "讲的是穿越虫洞找新家园。"})
         self.summarizer = SimpleNamespace(calls=[], complete_json=lambda system, user: self.summarizer.calls.append(
@@ -281,6 +304,29 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.assertEqual(len(waits), 2)
         self.assertAlmostEqual(waits[0], 3, delta=0.5)
         self.assertEqual(waits[1], 0)
+
+    def test_context_tells_who_you_are_why_you_speak_and_the_latest_image(self):
+        self.say("在吗")
+        context = self.llm.calls[0][1]
+        self.assertEqual((context["me"], context["trigger"], context["latest_image"]), ("小雪三号（大家也叫你：小雪）", "私聊", ""))
+        self.assertRegex(context["now"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} 周[一二三四五六日]$")
+
+    def test_latest_image_is_kept_and_edit_image_is_offered_only_with_codex(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            photo = Path(directory) / "photo.jpg"
+            photo.write_bytes(b"JPEGDATA")
+            self.plugin.on_message(Message("", "wxid_friend", "wxid_friend", type=3, data={"image_path": str(photo)}), self.ctx)
+            load, label = self.plugin.images["wxid_friend"]
+            self.assertEqual((load(), label[6:]), (b"JPEGDATA", "小王发的图片"))
+        self.plugin.tools = frozenset({"edit_image"})
+        message = Message("背景换成海边", "wxid_friend", "wxid_friend")
+        self.assertNotIn("edit_image", self.plugin._toolbox(message, self.ctx, None))  # 本机画图不能改图
+        self.ctx.llm = SimpleNamespace(provider="codex")
+        self.assertIn("edit_image", self.plugin._toolbox(message, self.ctx, None))
+        self.plugin.on_message(Message("", "wxid_other", "wxid_other", type=3, data={"image_path": str(photo)}), self.ctx)
+        self.assertNotIn("wxid_other", self.plugin.images)  # 没开自动回复的会话不记
 
     def test_rate_limit_skips_replies_beyond_the_per_minute_cap(self):
         self.plugin.per_minute = 2
