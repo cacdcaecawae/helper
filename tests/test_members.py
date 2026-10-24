@@ -64,8 +64,8 @@ class MemberTests(unittest.TestCase):
         summary, lines = reopened.memory(ROOM, exclude=current)
         self.assertEqual((summary, [(line["name"], line["text"]) for line in lines]),
                          ("", [("成员甲昵称", "周末去哪玩"), ("群友", "去爬山吧"), ("你", "推荐《白日梦想家》")]))
-        before = reopened.memory_size(ROOM)
-        self.assertTrue(reopened.compact_memory(ROOM, "商量周末", lines[1]["id"]))
+        before, epoch = reopened.memory_size(ROOM), reopened.epoch(ROOM)
+        self.assertTrue(reopened.compact_memory(ROOM, "商量周末", lines[1]["id"], epoch))
         summary, rest = reopened.memory(ROOM)
         self.assertEqual((summary, [line["text"] for line in rest]), ("商量周末", ["推荐《白日梦想家》", "@小雪 你觉得呢"]))
         self.assertLess(reopened.memory_size(ROOM), before)
@@ -74,8 +74,20 @@ class MemberTests(unittest.TestCase):
         self.assertEqual([row["text"] for row in reopened.search(ROOM, name="你")], ["推荐《白日梦想家》"])
         reopened.clear(ROOM)
         self.assertEqual(reopened.memory(ROOM), ("", []))
-        self.assertFalse(reopened.compact_memory(ROOM, "清空后不能写回", rest[-1]["id"]))
+        self.assertFalse(reopened.compact_memory(ROOM, "清空后不能写回", rest[-1]["id"], epoch))
         self.assertEqual(reopened.memory(ROOM), ("", []))
+
+    def test_compaction_started_before_a_clear_is_not_written_back_even_if_ids_are_reused(self):
+        for sequence, text in enumerate(("周末去哪玩", "去爬山吧", "好"), 1):
+            self.store.record(self.message(text, sequence=sequence))
+        epoch, (_, lines) = self.store.epoch(ROOM), self.store.memory(ROOM)  # 后台开始整理旧聊天
+        self.store.clear(ROOM)
+        for sequence, text in enumerate(("新话题一", "新话题二", "新话题三"), 4):
+            self.store.record(self.message(text, sequence=sequence))
+        self.assertIn(lines[1]["id"], [line["id"] for line in self.store.memory(ROOM)[1]])  # 旧编号被新消息复用了
+        self.assertFalse(self.store.compact_memory(ROOM, "清空前的旧摘要", lines[1]["id"], epoch))
+        summary, lines = self.store.memory(ROOM)  # 没有写回旧摘要，新消息也没被当成“已经总结过”
+        self.assertEqual((summary, [line["text"] for line in lines]), ("", ["新话题一", "新话题二", "新话题三"]))
 
     def test_chat_switches_persist_and_control_recording(self):
         friend = "wxid_friend"
@@ -102,12 +114,12 @@ class MemberTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(MemberError):
                 self.store.set_chat(friend, memory=value, reply=False)
 
-    def test_backfill_adds_only_lines_after_the_last_record(self):
+    def test_backfill_adds_only_lines_not_recorded_yet(self):
         friend = "wxid_friend"
         self.store.set_chat(friend, memory=True, reply=False)
         self.store.record(Message("已经记过的", friend, friend, session_id="first", sequence=1))
         last = datetime.fromisoformat(self.store.memory(friend)[1][-1]["at"]).timestamp()
-        rows = [{"timestamp": last - 60, "content": "已经记过的", "direction": "incoming", "sender_id": friend, "sender_name": "小王"},
+        rows = [{"timestamp": last, "content": "已经记过的", "direction": "incoming", "sender_id": friend, "sender_name": "小王"},
                 {"timestamp": last + 60, "content": "周六有空吗", "direction": "incoming", "sender_id": friend, "sender_name": "小王"},
                 {"timestamp": last + 120, "content": "有空", "direction": "outgoing", "sender_id": ROBOT, "sender_name": "我"}]
         self.assertEqual(self.store.backfill(friend, rows), 2)
@@ -180,6 +192,17 @@ class MemberTests(unittest.TestCase):
                     self.fail("清空前读到的内容不应再发出去")
             with self.store.reply_guard(chat, self.store.epoch(chat)):
                 pass  # 清空后新开始的回复照常
+
+    def test_backfill_keeps_unrecorded_lines_older_than_one_that_arrived_first(self):
+        friend = "wxid_friend"
+        now = datetime.now(timezone.utc).timestamp()
+        row = lambda at, text: {"timestamp": at, "content": text, "direction": "incoming", "sender_id": friend, "sender_name": "小王"}
+        window = [row(now - 60, "A"), row(now - 30, "B")]  # 关着记忆时收到，没入库
+        self.store.set_chat(friend, memory=True, reply=False)
+        self.store.record(Message("C", friend, friend, session_id="first", sequence=1))  # 开启后 C 先入库
+        window.append(row(datetime.fromisoformat(self.store.memory(friend)[1][-1]["at"]).timestamp(), "C"))
+        self.assertEqual(self.store.backfill(friend, window), 2)
+        self.assertEqual(sorted(line["text"] for line in self.store.memory(friend)[1]), ["A", "B", "C"])
 
     def test_group_clear_command_also_blocks_backfilling_older_lines(self):
         self.store.set_chat(ROOM, memory=True, reply=False)

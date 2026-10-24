@@ -265,6 +265,7 @@ class MemberStore:
                         db.execute("DELETE FROM messages WHERE account=? AND room=? AND received_at<?",
                                    (self.account, room, start))
                         db.execute("DELETE FROM agent_summaries WHERE account=? AND chat=?", (self.account, room))
+                        self._epochs[room] = self._epochs.get(room, 0) + 1
             self._active_day = day
             return True
 
@@ -746,13 +747,12 @@ class MemberStore:
                               (MEMORY_LINE_CHARS, self.account, chat, upto)).fetchone()[0]
             return len(summary) + size
 
-    def compact_memory(self, chat, summary, upto):
-        """摘要从此代替 id<=upto 的聊天记录给模型看；原文保留，可用 search 查到。
-        期间被 /清空 或每日清理过（upto 已不在）就放弃，不把清掉的内容写回。"""
+    def compact_memory(self, chat, summary, upto, epoch):
+        """摘要从此代替 id<=upto 的聊天记录给模型看；原文保留，可用 search 查到。epoch 为开始压缩前取的 epoch(chat)：
+        期间清空或每日清理过就放弃，不把清掉的内容写回（清空后新消息可能复用旧编号，不能只看 upto 在不在）。"""
         # ponytail: 原文只在 /清空 或开启每日清理时删除，会一直增长（活跃群一年约几十到上百 MB）；真占地方再加保留天数。
         with self._lock, self._connection() as db:
-            if not db.execute("SELECT 1 FROM messages WHERE account=? AND room=? AND id=?",
-                              (self.account, chat, upto)).fetchone():
+            if self._epochs.get(chat, 0) != epoch:
                 return False
             db.execute("""INSERT INTO agent_summaries(account,chat,summary,upto) VALUES(?,?,?,?)
                 ON CONFLICT(account,chat) DO UPDATE SET summary=excluded.summary,upto=excluded.upto
@@ -760,21 +760,28 @@ class MemberStore:
             return True
 
     def backfill(self, chat, rows):
-        """打开长期记忆时补记管理台已显示的文字（MessageBuffer.texts 的行），按原来的时间；
-        只补库里这个会话最后一条之后的，之前记过的不会重复。返回补了几条。"""
-        if not self.history_enabled or not self.remembers(chat):
+        """打开长期记忆时补记管理台已显示的文字（MessageBuffer.texts 的行），按原来的时间。
+        库里已有的不重复记，按消息本身认，不按“库里最新一条的时间”截断；清空之前的不补。返回补了几条。"""
+        rows = [row for row in rows if row["content"].strip()]
+        if not rows or not self.history_enabled or not self.remembers(chat):
             return 0
         with self._lock, self._connection() as db:
-            last = db.execute("""SELECT MAX(COALESCE((SELECT MAX(received_at) FROM messages WHERE account=? AND room=?),''),
-                COALESCE((SELECT cleared_at FROM chat_settings WHERE account=? AND chat=?),''))""",
-                (self.account, chat, self.account, chat)).fetchone()[0]
+            cleared = db.execute("SELECT cleared_at FROM chat_settings WHERE account=? AND chat=?", (self.account, chat)).fetchone()
+            cleared = datetime.fromisoformat(cleared[0]).timestamp() if cleared and cleared[0] else 0
+            start = datetime.fromtimestamp(min(row["timestamp"] for row in rows) - 5, timezone.utc).isoformat()
+            stored = [(item["sender_id"], item["text"][:2000].strip(), datetime.fromisoformat(item["received_at"]).timestamp())
+                      for item in db.execute("SELECT sender_id,text,received_at FROM messages WHERE account=? AND room=? AND received_at>=?",
+                                             (self.account, chat, start))]
             count = 0
             for row in rows:
-                at, text = datetime.fromtimestamp(row["timestamp"], timezone.utc).isoformat(), row["content"].strip()
-                if at <= last or not text:
-                    continue
                 own = row["direction"] == "outgoing"
-                sender = self.account if own else row["sender_id"] or chat
+                sender, text = self.account if own else row["sender_id"] or chat, row["content"].strip()
+                # ponytail: 窗口行没有原生序号，按“同一发送者、同样文字（窗口最多显示 2000 字）、时间差 5 秒内”认作同一条；
+                # 5 秒内同一人连发同样的话会少补一条，要精确就给 messages 加原生消息 ID 列。
+                if row["timestamp"] <= cleared or any(who == sender and said == text and abs(when - row["timestamp"]) <= 5
+                                                      for who, said, when in stored):
+                    continue
+                at = datetime.fromtimestamp(row["timestamp"], timezone.utc).isoformat()
                 if not own and row.get("sender_name") and self.display_name(sender, chat) is None:
                     try:  # 补记的人没有原生名字缓存，用窗口里显示的名字，模型才知道是谁说的
                         self.remember_wechat_name(sender, row["sender_name"])

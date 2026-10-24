@@ -123,6 +123,7 @@ class Plugin:
             raise
 
     def _compact(self, chat, ctx):
+        epoch = self.members.epoch(chat)  # 压缩途中清空了就不写回
         if self.members.memory_size(chat) <= MEMORY_CHARS:
             return
         summary, lines = self.members.memory(chat)
@@ -140,7 +141,7 @@ class Plugin:
             return
         text = result.get("summary")
         if isinstance(text, str) and text.strip():
-            self.members.compact_memory(chat, text.strip()[:3000], older[-1]["id"])
+            self.members.compact_memory(chat, text.strip()[:3000], older[-1]["id"], epoch)
 
     def _toolbox(self, message, ctx, guard):
         tools = {}

@@ -180,7 +180,7 @@ class FakeTimeline:
     def memory_size(self, chat):
         return len(self.summary) + sum(len(line["text"]) for line in self.lines if line["id"] > self.upto)
 
-    def compact_memory(self, chat, summary, upto):
+    def compact_memory(self, chat, summary, upto, epoch):
         self.compacted.append((summary, upto))
         self.summary, self.upto = summary, upto
 
