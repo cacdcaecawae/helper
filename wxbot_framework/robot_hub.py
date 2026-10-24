@@ -131,6 +131,7 @@ class RobotProxy:
     def bind_account(self, data): return self.request('account', data)
     def save_configuration(self, data): return self.request('config', data)
     def plugin_action(self, data): return self.request('plugin', data)
+    def llm_models(self, data): return self.request('llm-models', data)
 
 
 class RobotHub:
