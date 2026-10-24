@@ -52,6 +52,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.headers.get('X-Helper-Token')!=TOKEN:return self.reply(403,{'error':'token'})
         data=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if urlsplit(self.path).path=='/api/llm-models':return self.reply(200,{'models':['synthetic-model-a','synthetic-model-b']})
         if urlsplit(self.path).path!='/api/send-text':return self.reply(400,{'error':'Unexpected mutation in UI test'})
         if data.get('session_id')!='synthetic-session':return self.reply(409,{'error':'session changed'})
         self.server.fixture.sent.append(data)
@@ -108,6 +109,10 @@ def main():
             for name in ['overview','plugins','groups','models','logs','chat']:
                 page.locator('[data-page="'+name+'"]').click()
                 expect(page.locator('#page-'+name)).to_be_visible()
+            page.locator('[data-page="models"]').click()
+            expect(page.locator('#llm-model-select option')).to_have_count(3)
+            expect(page.locator('#llm-model-select')).to_have_value('synthetic-model-a')
+            page.locator('[data-page="chat"]').click()
             page.locator('#theme-toggle').click()
             expect(page.locator('html')).to_have_attribute('data-theme','dark')
             if args.screenshots:page.screenshot(path=str(artifacts/'dark.png'))

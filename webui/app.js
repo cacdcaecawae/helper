@@ -198,12 +198,41 @@ async function loadConfig() {
   fill($('#scope-form'), {chat_allowlist:config.chat_allowlist.join('\n')});
   for (const name of ['llm','tts']) {
     const form = $('#'+name+'-form');
-    fill(form, {...(name === 'llm' ? {json_mode:true, token_limit_parameter:'max_tokens', extra_body:{}} : {}), ...config[name]});
+    fill(form, {...(name === 'llm' ? {provider:'openai_compatible', json_mode:true, token_limit_parameter:'max_tokens', extra_body:{}} : {}), ...config[name]});
     form.elements.api_key.value = ''; form.elements.clear_api_key.checked = false;
     $('.key-state',form).textContent = config[name]?.api_key_configured ? '已配置' : '尚未配置';
+    $('.key-state',form).classList.toggle('missing', !config[name]?.api_key_configured);
   }
   fill($('#delay-form'), config.text_send_delay);
+  loadModels();
 }
+let modelRequest = 0;
+async function loadModels(switched = false) {
+  const f = $('#llm-form').elements, select = $('#llm-model-select'), hint = $('#llm-model-hint');
+  const codex = f.provider.value === 'codex', request = ++modelRequest;
+  $('#llm-form').dataset.provider = f.provider.value;
+  f.base_url.disabled = f.api_key.disabled = codex;
+  select.innerHTML = '<option value="">正在获取模型列表…</option>'; hint.textContent = '';
+  let models = [];
+  try { models = (await api('llm-models', {provider:f.provider.value, base_url:f.base_url.value, api_key:f.api_key.value})).models; }
+  catch (error) { if (request === modelRequest) hint.textContent = error.message; }
+  if (request !== modelRequest) return;
+  // Codex 只接受列表内的模型；兼容接口保留列表外的自定义模型名，切换接入方式时选第一个。
+  const current = f.model.value.trim();
+  const value = models.includes(current) ? current : models.length && (codex || switched || !current) ? models[0] : '';
+  select.innerHTML = models.map(m => `<option>${escape(m)}</option>`).join('') + '<option value="">手动填写…</option>';
+  select.value = value;
+  if (value) f.model.value = value;
+  f.model.classList.toggle('hidden', Boolean(value));
+}
+$('#llm-model-select').onchange = e => {
+  const input = $('#llm-form').elements.model;
+  input.classList.toggle('hidden', Boolean(e.target.value));
+  if (e.target.value) input.value = e.target.value; else input.focus();
+};
+$('#llm-form').elements.provider.onchange = () => loadModels(true);
+$('#llm-form').elements.base_url.onchange = () => loadModels();
+$('#llm-load-models').onclick = () => loadModels();
 const lines = value => [...new Set(value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean))];
 async function save(data, message) { await api('config',data); await loadConfig(); toast(message||'配置已保存，下次启动生效'); }
 $('#start-selected').onclick = () => action(()=>launchAccounts(loggedAccounts.filter(row=>selectedAccounts.has(accountKey(row))&&row.selectable&&!activeStates.includes(row.state))));
