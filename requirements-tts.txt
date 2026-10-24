@@ -1,0 +1,5 @@
+# 本机 Qwen3-TTS 语音服务（tools/local_tts_server.py），复用已安装的 CUDA 版 torch：
+#   python -m venv --system-site-packages .venv-tts
+#   .venv-tts\Scripts\python.exe -m pip install -r requirements-tts.txt
+qwen-tts==0.1.1
+numpy<2

@@ -1,4 +1,4 @@
-"""Fish Audio 的音色查询和 WAV 合成；密钥与服务响应不写入日志。"""
+"""Fish Audio（或本机兼容服务 tools/local_tts_server.py）的音色查询和 WAV 合成；密钥与服务响应不写入日志。"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -111,7 +111,7 @@ class FishTTS:
         if not isinstance(data, dict):
             raise TTSError("语音配置必须是 JSON 对象")
         base = data.get('base_url', 'https://api.fish.audio')
-        key = data.get('api_key')
+        key = data.get('api_key', '')
         model = data.get('model', 's2.1-pro-free')
         default = data.get('default_voice', '')
         timeout = data.get('timeout_seconds', 45)
@@ -119,11 +119,13 @@ class FishTTS:
         if not isinstance(base, str):
             raise TTSError("语音接口地址无效")
         parsed = urllib.parse.urlsplit(base)
-        if parsed.scheme != 'https' or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise TTSError("语音接口地址必须是无凭据的 HTTPS 地址")
-        if not isinstance(key, str) or not key.strip() or any(not 33 <= ord(ch) <= 126 for ch in key):
+        local = parsed.scheme == 'http' and parsed.hostname in ('127.0.0.1', 'localhost')
+        if (parsed.scheme != 'https' and not local) or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise TTSError("语音接口地址必须是无凭据的 HTTPS 地址；本机语音服务可用 http://127.0.0.1")
+        # 本机服务不需要密钥。
+        if not isinstance(key, str) or any(not 33 <= ord(ch) <= 126 for ch in key) or not (local or key.strip()):
             raise TTSError("请在 tts_config.json 填写有效 api_key")
-        if model not in ('s2.1-pro-free', 's2.1-pro', 's2-pro', 's1', 'drama-3'):
+        if model not in ('s2.1-pro-free', 's2.1-pro', 's2-pro', 's1', 'drama-3', 'qwen3-tts-local'):
             raise TTSError("语音 model 不在已支持的 Fish 模型列表中")
         if not isinstance(default, str) or len(default) > 128 or any(ord(ch) < 32 for ch in default):
             raise TTSError("默认音色名称或 ID 无效")
@@ -146,7 +148,7 @@ class FishTTS:
         except urllib.error.HTTPError as error:
             raise TTSError(f"Fish Audio 请求失败（HTTP {error.code}）") from None
         except (OSError, TimeoutError, urllib.error.URLError, http.client.HTTPException):
-            raise TTSError("Fish Audio 连接失败或超时") from None
+            raise TTSError("语音接口连接失败或超时（本机语音服务需先启动 start_web）") from None
         if len(data) > limit:
             raise TTSError("Fish Audio 响应超过大小限制")
         return data

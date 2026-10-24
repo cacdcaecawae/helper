@@ -72,7 +72,7 @@ def inspect(root, private_markers=()):
         path=root/filename
         if path.exists() and json.loads(path.read_text(encoding='utf-8')).get('api_key'):
             findings.append({'file':filename,'kind':'nonempty_api_key'})
-        if filename.startswith('tts_config') and path.exists() and json.loads(path.read_text(encoding='utf-8')).get('default_voice'):
+        if filename.startswith('tts_config') and path.exists() and json.loads(path.read_text(encoding='utf-8')).get('default_voice') and not json.loads(path.read_text(encoding='utf-8')).get('base_url','').startswith('http://127.0.0.1'):
             findings.append({'file':filename,'kind':'nonempty_personal_voice'})
     return {'passed':not findings,'files_scanned':count,'bytes_scanned':total,'findings':findings}
 

@@ -126,6 +126,13 @@ class TTSTests(unittest.TestCase):
             path.write_text(json.dumps(valid), encoding='utf-8')
             self.assertEqual(FishTTS.from_file(path).model, 's2.1-pro-free')
 
+    def test_local_service_needs_no_key_but_only_on_loopback(self):
+        local = {'base_url': 'http://127.0.0.1:8766', 'api_key': '', 'model': 'qwen3-tts-local', 'default_voice': 'Vivian'}
+        self.assertEqual(FishTTS.from_options(local).default_voice, 'Vivian')
+        for change in ({'base_url': 'http://192.168.1.2:8766'}, {'base_url': 'https://api.fish.audio'}):
+            with self.subTest(change=change), self.assertRaises(TTSError):
+                FishTTS.from_options({**local, **change})
+
 
 if __name__ == '__main__':
     unittest.main()
