@@ -3,7 +3,7 @@
 开启后代替“艾特对话”；每一步思考和工具调用都推送到管理台聊天页。
 插件选项：private_friends 私聊白名单（微信 ID 列表）；tools 可用工具；image_server 本机画图服务地址。
 """
-from collections import deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import tempfile
@@ -18,7 +18,8 @@ from wxbot_framework.personality import personality_text
 from wxbot_framework.speech import deliver_model_reply
 
 TOOLS = ("draw_image", "search_history", "web_search")
-MEMORY_TURNS, MEMORY_SECONDS, MAX_PARTS = 6, 1800, 3
+# 带给模型最近 6 轮；12 小时没再聊就当新话题。对话存在本账号的成员库里，重启不丢。
+MEMORY_TURNS, MEMORY_HOURS, MAX_PARTS = 6, 12, 3
 
 
 class Plugin:
@@ -30,8 +31,6 @@ class Plugin:
         if not isinstance(tools, list) or not set(tools) <= set(TOOLS):
             raise ValueError("tools 只能包含 " + "、".join(TOOLS))
         self.friends, self.tools = frozenset(friends), frozenset(tools)
-        # ponytail: 对话记忆只在内存里，按“会话+发言人”保留最近几轮，重启即清空；要跨重启再落到成员库。
-        self.memory = {}
         self.image = ImageServer(ctx.config.get("image_server", "http://127.0.0.1:7860")) if "draw_image" in tools else None
         ctx.llm  # 启动时核对配置，不请求接口。
 
@@ -62,11 +61,10 @@ class Plugin:
             else:
                 # ponytail: 私聊只带本条消息，没有历史；需要上下文时再给私聊加记录表。
                 context = {"current": message.text}
-            key, now = (message.chat_id, message.sender_id or message.chat_id), time.monotonic()
-            turns = self.memory.setdefault(key, deque(maxlen=MEMORY_TURNS))
-            while turns and now - turns[0][0] > MEMORY_SECONDS:
-                turns.popleft()
-            context["history"] = [{"对方": asked, "你": answered} for _, asked, answered in turns]
+            sender = message.sender_id or message.chat_id
+            since = datetime.now(timezone.utc) - timedelta(hours=MEMORY_HOURS)
+            context["history"] = [{"对方": asked, "你": answered} for asked, answered in
+                                  self.members.agent_history(message.chat_id, sender, limit=MEMORY_TURNS, since=since)]
             trace("start", context["current"][:300])
             reply = Agent(ctx.llm_for(message, personality=personality),
                           self._toolbox(message, ctx, guard), trace).run(context)
@@ -78,7 +76,7 @@ class Plugin:
                 display = self.members.display_name(message.sender_id, message.chat_id) or snapshot.speaker_name
             for index, part in enumerate(parts):
                 deliver_model_reply(ctx, message, part, display_name=display if index == 0 else None, delivery_guard=guard)
-            turns.append((time.monotonic(), context["current"], "\n".join(parts)))
+            self.members.remember_agent_turn(message.chat_id, sender, context["current"], "\n".join(parts))
             trace("done", f"{len(parts)} 条回复，用时 {time.monotonic() - started:.1f} 秒", status="done")
         except SnapshotExpired:
             trace("error", "已取消：聊天记录或人格已变更", status="error")

@@ -121,9 +121,12 @@ class AgentPluginConversationTests(unittest.TestCase):
 
     def setUp(self):
         from wxbot_framework.personality import PersonalityState
+        turns = []
         self.plugin = Plugin()
-        self.plugin.members, self.plugin.friends, self.plugin.tools = None, frozenset({"wxid_friend"}), frozenset()
-        self.plugin.image, self.plugin.memory = None, {}
+        self.plugin.members = SimpleNamespace(
+            agent_history=lambda chat, sender, limit, since: [(a, b) for c, s, a, b in turns if (c, s) == (chat, sender)][-limit:],
+            remember_agent_turn=lambda chat, sender, asked, answered: turns.append((chat, sender, asked, answered)))
+        self.plugin.friends, self.plugin.tools, self.plugin.image = frozenset({"wxid_friend"}), frozenset(), None
         self.sent, self.llm = [], ScriptedLLM({"reply": "推荐《星际穿越》。\n\n周末看正合适。"}, {"reply": "讲的是穿越虫洞找新家园。"})
         self.ctx = SimpleNamespace(
             llm=SimpleNamespace(provider="openai_compatible"), logger=SimpleNamespace(warning=lambda *a: None),

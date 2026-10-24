@@ -53,6 +53,21 @@ class MemberTests(unittest.TestCase):
     def message(self, text="中文消息 🌸", sender=JING, sequence=1, **kwargs):
         return Message(text, ROOM, sender_id=sender, is_group=True, sequence=sequence, session_id="first", **kwargs)
 
+    def test_agent_turns_survive_a_new_store_and_follow_clear_and_limits(self):
+        from datetime import datetime, timedelta, timezone
+        since = datetime.now(timezone.utc) - timedelta(hours=1)
+        for index in range(25):
+            self.store.remember_agent_turn(ROOM, JING, f"问{index}", f"答{index}")
+        self.store.remember_agent_turn("wxid_friend", "wxid_friend", "私聊问", "私聊答")
+        reopened = self.create_store()  # 模拟重启：新的连接读同一个库
+        self.assertEqual(reopened.agent_history(ROOM, JING, limit=3, since=since), [("问22", "答22"), ("问23", "答23"), ("问24", "答24")])
+        self.assertEqual(len(reopened.agent_history(ROOM, JING, limit=100, since=since)), 20)
+        self.assertEqual(reopened.agent_history(ROOM, SMALL, limit=6, since=since), [])
+        self.assertEqual(reopened.agent_history(ROOM, JING, limit=6, since=datetime.now(timezone.utc) + timedelta(minutes=1)), [])
+        reopened.clear(ROOM)
+        self.assertEqual(reopened.agent_history(ROOM, JING, limit=6, since=since), [])
+        self.assertEqual(reopened.agent_history("wxid_friend", "wxid_friend", limit=6, since=since), [("私聊问", "私聊答")])
+
     def test_keyword_search_returns_room_text_in_order_without_bot_replies(self):
         self.store.record(self.message("周六晚上开黑", sequence=1))
         self.store.record(self.message("周六见", sender=SMALL, sequence=2))
