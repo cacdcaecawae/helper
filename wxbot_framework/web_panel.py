@@ -366,6 +366,7 @@ class PanelController:
                 if name not in paths or not isinstance(data[name], dict):
                     raise PanelError('模型配置格式不正确')
                 value = read_json(paths[name])
+                saved_url = value.get('base_url')
                 fields = {'base_url', 'model', 'timeout_seconds'} | ({'provider', 'max_tokens', 'json_mode', 'token_limit_parameter', 'extra_body'} if name == 'llm'
                             else {'default_voice', 'max_chars_per_clip'})
                 for key in fields:
@@ -378,6 +379,9 @@ class PanelController:
                     value['api_key'] = ''
                 elif key.strip():
                     value['api_key'] = key.strip()
+                elif value.get('api_key') and value.get('base_url') != saved_url:
+                    # 已保存的密钥只属于原地址；保存后刷新列表和机器人调用都会把它发到新地址。
+                    raise PanelError('接口地址已更改，请填写该地址的 API 密钥，或勾选“清除已保存的密钥”后再保存')
                 # 允许先保存未填密钥的模板，其余字段沿用真实客户端验证。
                 validation = dict(value, api_key=value.get('api_key') or 'validation-only')
                 if name == 'llm':

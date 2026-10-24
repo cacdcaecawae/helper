@@ -205,13 +205,22 @@ class ControllerTests(PanelFixture):
         settings = {'base_url':'https://gateway.example.test/v1', 'model':'custom-model',
                     'json_mode':False, 'token_limit_parameter':'max_completion_tokens',
                     'extra_body':{'reasoning_effort':'low'}}
-        self.controller.save_configuration({'llm':settings})
+        # 换地址不带新密钥：拒绝保存，旧密钥不能跟到新地址；文件不变
+        with self.assertRaisesRegex(PanelError, '接口地址已更改'):
+            self.controller.save_configuration({'llm':settings})
+        self.assertEqual(read_json(path), original)
+        self.controller.save_configuration({'llm':dict(settings, api_key='gateway-key')})
         saved = read_json(path)
         for key, value in settings.items():
             self.assertEqual(saved[key], value)
             self.assertEqual(self.controller.configuration()['llm'][key], value)
-        self.assertEqual(saved['api_key'], 'private-model-key')
-        self.assertNotIn('private-model-key', json.dumps(self.controller.configuration()))
+        self.assertEqual(saved['api_key'], 'gateway-key')
+        self.assertNotIn('gateway-key', json.dumps(self.controller.configuration()))
+        # 不换地址时留空仍沿用已保存的密钥；换地址并勾选清除则保存为空密钥
+        self.controller.save_configuration({'llm':{'base_url':settings['base_url'], 'model':'other-model'}})
+        self.assertEqual(read_json(path)['api_key'], 'gateway-key')
+        self.controller.save_configuration({'llm':{'base_url':'https://local.example.test/v1', 'clear_api_key':True}})
+        self.assertEqual(read_json(path)['api_key'], '')
         self.controller.save_configuration({'llm':{'extra_body':{}}})
         self.assertEqual(read_json(path)['extra_body'], {})
 
