@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .config import ConfigStore, EXAMPLE_ACCOUNT, account_is_unbound, initialize_configs, validate_name
 from .locking import InstanceLock
-from .message_monitor import MessageBuffer
+from .message_monitor import MessageBuffer, beijing
 from .runtime import BotApplication
 from .startup import scan_logged_accounts
 from .text import validate_target, validate_mentions
@@ -68,7 +68,7 @@ class LogBuffer(logging.Handler):
         self.acquire()
         try:
             self.sequence += 1
-            self.rows.append({'id': self.sequence, 'time': time.strftime('%H:%M:%S', time.localtime(record.created)),
+            self.rows.append({'id': self.sequence, 'time': beijing(record.created, '%H:%M:%S'),
                               'level': record.levelname, 'logger': record.name,
                               'message': redact(self.format(record))})
         finally:

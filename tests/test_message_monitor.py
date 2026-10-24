@@ -30,7 +30,8 @@ class BufferTests(unittest.TestCase):
         self.assertEqual((row['account'], row['chat_id'], row['sender_id'], row['sender_name']), (ACCOUNT, ROOM, FRIEND, '群友甲'))
         self.assertEqual(row['content'], '第一行\n第二行')
         self.assertTrue(row['is_group'])
-        self.assertRegex(row['time'], r'^\d\d:\d\d:\d\d$')
+        # 按北京时间显示，与系统时区无关（1792540800 = 北京 2026-10-21 08:00:00）
+        self.assertEqual((row['date'], row['time']), ('2026-10-21', '08:00:00'))
 
     def test_media_never_exposes_raw_xml_paths_or_download_credentials(self):
         buffer = MessageBuffer(sanitize=redact)

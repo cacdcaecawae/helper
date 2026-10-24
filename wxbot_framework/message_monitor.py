@@ -1,9 +1,16 @@
 """管理台的有界消息缓存；仅保存显示字段，不保存媒体、原始 XML 或下载凭证。"""
 from collections import deque, OrderedDict
+from datetime import datetime
 import threading
 import time
 import uuid
+from .members import BEIJING
 from .recall import message_id
+
+
+def beijing(timestamp, fmt):
+    """管理台统一显示北京时间，不随系统时区（本机可能设成别的地区）。"""
+    return datetime.fromtimestamp(timestamp, BEIJING).strftime(fmt)
 
 
 class MessageBuffer:
@@ -60,8 +67,8 @@ class MessageBuffer:
                        47: '[表情]', 62: '[视频]', 10000: '[系统消息]', 10002: '[系统消息]'}.get(
                            message.type, f'[消息类型 {message.type}]')
         now = self.clock()
-        row = {'timestamp': now, 'time': time.strftime('%H:%M:%S', time.localtime(now)),
-               'date': time.strftime('%Y-%m-%d', time.localtime(now)), 'account': self._text(account, 128),
+        row = {'timestamp': now, 'time': beijing(now, '%H:%M:%S'),
+               'date': beijing(now, '%Y-%m-%d'), 'account': self._text(account, 128),
                'chat_id': self._text(message.chat_id, 128), 'is_group': group,
                'sender_id': self._text(sender, 128),
                'sender_name': '机器人' if data.get('monitor_outgoing') else self._text(sender_name, 128),
@@ -170,8 +177,8 @@ class MessageBuffer:
             if not matched:
                 self.sequence += 1
                 self.rows.append({'id':self.sequence, 'revision':self.sequence, 'timestamp':now,
-                    'time':time.strftime('%H:%M:%S',time.localtime(now)),
-                    'date':time.strftime('%Y-%m-%d',time.localtime(now)), 'account':account,
+                    'time':beijing(now, '%H:%M:%S'),
+                    'date':beijing(now, '%Y-%m-%d'), 'account':account,
                     'chat_id':chat, 'is_group':message.is_group, 'sender_id':'', 'sender_name':'',
                     'direction':'incoming', 'type':message.type,
                     'content':'[撤回消息] 原消息未捕获', 'message_id':identifier,
@@ -190,8 +197,8 @@ class MessageBuffer:
                     return
             now = self.clock()
             self.rows.append({'id': self.sequence, 'revision': self.sequence, 'kind': 'agent', 'run': run,
-                'timestamp': now, 'time': time.strftime('%H:%M:%S', time.localtime(now)),
-                'date': time.strftime('%Y-%m-%d', time.localtime(now)), 'account': self._text(account, 128),
+                'timestamp': now, 'time': beijing(now, '%H:%M:%S'),
+                'date': beijing(now, '%Y-%m-%d'), 'account': self._text(account, 128),
                 'chat_id': self._text(message.chat_id, 128), 'is_group': message.is_group,
                 'status': step.get('status') or 'running', 'steps': [step]})
 
