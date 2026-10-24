@@ -509,6 +509,8 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC"
 .sidebar a:focus-visible,.sidebar button:focus-visible{outline:2px solid rgb(255 255 255 / .35);outline-offset:-2px;}
 .hc-composer #refresh-send-chats{display:none;}
 @media(min-width:801px){.topbar{display:none;}}
+/* 工具栏里的下拉按内容收缩，不留大段空白。 */
+.log-toolbar select{width:auto;field-sizing:content;padding-inline:10px 8px;}
 .settings-columns{gap:var(--space-6);align-items:start;}
 .scope-section{max-width:none;}
 /* 有无滚动条时页面不左右跳动；聊天页不滚动，不预留。 */
