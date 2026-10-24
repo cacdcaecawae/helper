@@ -42,7 +42,7 @@ const accountKey = row => row.pid + ':' + row.wxid;
 const activeStates = ['starting','running','stopping'];
 const profileLabel = row => loggedAccounts.find(account=>account.wxid===row?.account)?.name || row?.account || (row?.id==='default'?'默认配置':row?.name) || '当前账号';
 const pages = {chat:'聊天', overview:'账号与监控', plugins:'插件管理', groups:'群聊配置', models:'模型与语音', logs:'运行日志'};
-const pluginNames = {anti_recall:['文字防撤回'], anti_recall_image:['图片防撤回'], anti_recall_file:['文件防撤回'], picture_idiom:['看图猜成语'], idiom_chain:['成语接龙'], chat_summary:['聊天总结'], mention_chat:['艾特对话'], voice_reply:['语音回复'], group_notice:['进退群提醒'], member_identity:['群内昵称绑定'], personality:['切换人格'], friend_auto_accept:['自动通过好友'], chat_records:['聊天记录管理'], id_responder:['会话 ID 查询'], echo:['文字回声']};
+const pluginNames = {agent_chat:['智能体'], anti_recall:['文字防撤回'], anti_recall_image:['图片防撤回'], anti_recall_file:['文件防撤回'], picture_idiom:['看图猜成语'], idiom_chain:['成语接龙'], chat_summary:['聊天总结'], mention_chat:['艾特对话'], voice_reply:['语音回复'], group_notice:['进退群提醒'], member_identity:['群内昵称绑定'], personality:['切换人格'], friend_auto_accept:['自动通过好友'], chat_records:['聊天记录管理'], id_responder:['会话 ID 查询'], echo:['文字回声']};
 const escape = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 async function api(path, body, identifier = robot) {
@@ -98,6 +98,10 @@ function renderRobotOptions() {
     $('#robot-select').innerHTML=options.map(row=>`<option value="${escape(row.value)}" ${row.disabled?'disabled':''}>${escape(row.label)}</option>`).join('');
   }
   $('#robot-select').value=robot;
+  // 左上角和微信一样显示当前账号的头像。
+  const current=robotRows.find(row=>row.id===robot),name=current?profileLabel(current):'';
+  $('.brand').innerHTML=name?chatAvatar(name):'';
+  $('#robot-select').title=name?'当前账号：'+name:'切换账号';
 }
 function renderState() {
   const unavailable=!serviceAvailable;
@@ -200,8 +204,9 @@ async function loadConfig() {
     const form = $('#'+name+'-form');
     fill(form, {...(name === 'llm' ? {provider:'openai_compatible', json_mode:true, token_limit_parameter:'max_tokens', extra_body:{}} : {}), ...config[name]});
     form.elements.api_key.value = ''; form.elements.clear_api_key.checked = false;
-    $('.key-state',form).textContent = config[name]?.api_key_configured ? '已配置' : '尚未配置';
-    $('.key-state',form).classList.toggle('missing', !config[name]?.api_key_configured);
+    const local = /^http:\/\/(127\.0\.0\.1|localhost)[:/]/.test(config[name]?.base_url || '');
+    $('.key-state',form).textContent = config[name]?.api_key_configured ? '已配置' : local ? '本机服务无需密钥' : '尚未配置';
+    $('.key-state',form).classList.toggle('missing', !config[name]?.api_key_configured && !local);
   }
   fill($('#delay-form'), config.text_send_delay);
   loadModels();
@@ -213,13 +218,14 @@ async function loadModels(switched = false) {
   $('#llm-form').dataset.provider = f.provider.value;
   f.base_url.disabled = f.api_key.disabled = codex;
   select.innerHTML = '<option value="">正在获取模型列表…</option>'; hint.textContent = '';
-  let models = [];
-  try { models = (await api('llm-models', {provider:f.provider.value, base_url:f.base_url.value, api_key:f.api_key.value})).models; }
+  let models = [], preferred = '';
+  try { ({models, default:preferred} = await api('llm-models', {provider:f.provider.value, base_url:f.base_url.value, api_key:f.api_key.value})); }
   catch (error) { if (request === modelRequest) hint.textContent = error.message; }
   if (request !== modelRequest) return;
   // Codex 只接受列表内的模型；兼容接口保留列表外的自定义模型名，切换接入方式时选第一个。
   const current = f.model.value.trim();
-  const value = models.includes(current) ? current : models.length && (codex || switched || !current) ? models[0] : '';
+  const fallback = models.includes(preferred) ? preferred : models[0];
+  const value = models.includes(current) ? current : models.length && (codex || switched || !current) ? fallback : '';
   select.innerHTML = models.map(m => `<option>${escape(m)}</option>`).join('') + '<option value="">手动填写…</option>';
   select.value = value;
   if (value) f.model.value = value;
@@ -407,15 +413,14 @@ function chatAvatar(name){
 function renderChatWorkspace(){
   if(!$('#chat-conversations'))return;
   const connected=!!state?.connected&&serviceAvailable;
-  $('#chat-connection').textContent=connected?'已连接':'未连接';
-  $('#chat-connection').classList.toggle('connected',connected);
+  $('.account-switch').classList.toggle('online',connected);
   if(!connected)chatLoadKey='';
   if(connected&&!busy&&!pendingSend&&!$('#page-chat').classList.contains('hidden')&&chatLoadKey!==robot){
     chatLoadKey=robot;loadSendChats();
   }
   const all=new Map(chatRows.map(row=>[row.chat_id,{...row}]));
   for(const message of messages){
-    if(!message.chat_id)continue;
+    if(!message.chat_id||message.kind==='agent')continue;
     if(!all.has(message.chat_id))all.set(message.chat_id,{chat_id:message.chat_id,name:message.chat_name||message.chat_id});
     all.get(message.chat_id).last=message;
   }
@@ -428,8 +433,7 @@ function renderChatWorkspace(){
   }).join('')||`<p class="hc-empty-list">${query?'没有匹配的会话':connected?'等待消息，或刷新会话':'先在账号管理中启动一个账号'}</p>`;
   if(listMarkup!==chatListMarkup){chatListMarkup=listMarkup;$('#chat-conversations').innerHTML=listMarkup;}
   const row=all.get(selected),name=row?.name||selected;
-  $('#chat-heading').textContent=name||'选择一个会话';
-  $('#chat-subtitle').textContent=selected?(selected==='filehelper'?'文件传输助手':selected.endsWith('@chatroom')?'群聊':'私聊'):'本次连接的消息将在这里显示';
+  $('#chat-heading').textContent=name||'';
   $('#chat-mention-toggle').classList.toggle('hidden',!selected.endsWith('@chatroom'));
   $('#chat-mention-toggle').textContent='@'+(mentionSelection.size?' '+mentionSelection.size:'');
   const timeline=messages.filter(message=>message.chat_id===selected);
@@ -441,6 +445,7 @@ function renderChatWorkspace(){
   chatTimelineTarget=target;
   let lastTime='';
   box.innerHTML=timeline.map(message=>{
+    if(message.kind==='agent')return agentTrace(message);
     const time=[message.date,message.time].filter(Boolean).join(' '),showTime=time!==lastTime;lastTime=time;
     const own=message.direction==='outgoing';
     const label=own?'我':message.sender_name||name||'对方';
@@ -448,6 +453,18 @@ function renderChatWorkspace(){
   }).join('')||`<div class="hc-welcome"><span class="hc-welcome-icon">↔</span><h2>${selected?'等待新消息':'选择一个会话'}</h2><p>${connected?'这里只显示本次连接收到的消息，不是完整历史记录':'前往账号管理启动机器人后，即可收发消息'}</p>${!connected?'<a href="#overview">前往账号管理 →</a>':''}</div>`;
   box.scrollTop=atBottom?box.scrollHeight:top;
 }
+const agentLabels={start:'收到',thought:'思考',tool:'调用工具',result:'工具结果',done:'完成',error:'出错'};
+const agentStatus={running:'进行中…',done:'已完成',error:'出错'};
+const openAgentRuns=new Set();
+function agentTrace(row){
+  const steps=row.steps||[],tools=steps.filter(step=>step.kind==='tool').length;
+  const open=row.status==='running'||openAgentRuns.has(row.run);
+  return `<details class="hc-agent ${escape(row.status)}" data-run="${escape(row.run)}" ${open?'open':''}><summary>智能体 · ${escape(agentStatus[row.status]||row.status)}${tools?` · 调用工具 ${tools} 次`:''}</summary><ol>${steps.map(step=>`<li class="${escape(step.kind)}"><span>${escape(agentLabels[step.kind]||step.kind)}</span>${escape(step.text||'')}</li>`).join('')}</ol></details>`;
+}
+$('#chat-timeline').addEventListener('toggle',event=>{
+  const run=event.target.dataset?.run;if(!run)return;
+  if(event.target.open)openAgentRuns.add(run);else openAgentRuns.delete(run);
+},true);
 $('#chat-filter').oninput=renderChatWorkspace;
 $('#chat-refresh').onclick=()=>{if(!$('#refresh-send-chats').disabled)loadSendChats();};
 $('#chat-conversations').onclick=event=>{
@@ -470,8 +487,9 @@ $('#send-content').addEventListener('keydown',event=>{
 function renderMessages() {
   renderChatWorkspace();
   const query=$('#message-search').value.trim().toLowerCase();
-  const rows=messages.filter(row=>!query||[row.chat_id,row.sender_id,row.sender_name,row.content,row.forwarded_by,row.forwarded_by_id,row.source_time,row.message_id,roleLabels[row.sender_role],row.recalled?'已撤回':''].some(value=>String(value||'').toLowerCase().includes(query)));
-  $('#message-count').textContent=(query?rows.length+' / '+messages.length:messages.length)+' 条';
+  const rows=messages.filter(row=>row.kind!=='agent').filter(row=>!query||[row.chat_id,row.sender_id,row.sender_name,row.content,row.forwarded_by,row.forwarded_by_id,row.source_time,row.message_id,roleLabels[row.sender_role],row.recalled?'已撤回':''].some(value=>String(value||'').toLowerCase().includes(query)));
+  const total=messages.filter(row=>row.kind!=='agent').length;
+  $('#message-count').textContent=(query?rows.length+' / '+total:total)+' 条';
   $('#message-error').textContent=messageError;$('#message-error').classList.toggle('hidden',!messageError);
   const signature=JSON.stringify([robot,query,rows,rows.length?null:state?.state]);
   if(signature===messageSignature)return;

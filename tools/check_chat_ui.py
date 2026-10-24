@@ -123,8 +123,8 @@ def main():
             assert page.evaluate('() => document.documentElement.scrollWidth <= innerWidth')
             detail=page.locator('.hc-conversation').bounding_box()
             assert abs(detail['x'])<1 and detail['width']==390 and detail['height']>=780
-            toolbar=page.locator('.robot-toolbar').bounding_box()
-            assert toolbar['y']<60 and toolbar['x']+toolbar['width']<=390
+            bar=page.locator('.topbar').bounding_box()
+            assert bar['y']<60 and bar['x']+bar['width']<=390
             expect(page.locator('#send-text')).to_be_enabled()
             if args.screenshots:page.screenshot(path=str(artifacts/'mobile.png'))
             page.locator('#chat-back').click();page.locator('#nav-toggle').click()
