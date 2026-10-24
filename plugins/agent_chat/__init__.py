@@ -83,13 +83,13 @@ class Plugin:
         if self._too_frequent(message.chat_id):  # 防刷屏：每个会话每分钟最多回 per_minute 次，额度不被刷光
             trace("error", f"一分钟内已回复 {self.per_minute} 次，这条先不回（防刷屏）", status="error")
             return
-        personality = ctx.personality(message)
-        # 每次发送前都再确认“自动回复”还开着：生成途中关掉就不发。
-        guard = lambda: self.members.reply_guard(message.chat_id, lambda: ctx.personality_guard(personality))
+        personality, epoch = ctx.personality(message), self.members.epoch(message.chat_id)
+        # 每次发送前都再确认“自动回复”还开着、记忆没被清空：生成途中关掉或清空就不发。
+        guard = lambda: self.members.reply_guard(message.chat_id, epoch, lambda: ctx.personality_guard(personality))
         try:
             if message.is_group:
                 snapshot = self.members.conversation_snapshot(message)
-                guard = lambda: self.members.reply_guard(message.chat_id, lambda: ctx.response_guard(snapshot, personality))
+                guard = lambda: self.members.reply_guard(message.chat_id, epoch, lambda: ctx.response_guard(snapshot, personality))
                 name, current = snapshot.speaker_name, strip_at_labels(snapshot.current)
             else:
                 name, current = message.data.get("sender_wechat_name") or "对方", message.text
@@ -110,7 +110,7 @@ class Plugin:
                 deliver_model_reply(ctx, message, part, display_name=display if index == 0 else None, delivery_guard=guard)
             trace("done", f"{len(parts)} 条回复，用时 {time.monotonic() - started:.1f} 秒", status="done")
         except SnapshotExpired:
-            trace("error", "已取消：自动回复已关闭，或聊天记录、人格已变更", status="error")
+            trace("error", "已取消：自动回复已关闭、记忆已清空，或人格已变更", status="error")
         except LLMError as error:
             trace("error", str(error), status="error")
             ctx.logger.warning("智能体回复失败：%s", error)

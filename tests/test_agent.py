@@ -144,9 +144,7 @@ class FakeTimeline:
 
     def __init__(self):
         self.lines, self.compacted, self.summary, self.upto = [], [], "", 0
-        self.account = "wxid_bot"
-
-    reply_chats = {"wxid_friend"}
+        self.account, self.reply_chats, self.wipes = "wxid_bot", {"wxid_friend"}, 0
 
     def remembers(self, chat):
         return chat in ("123@chatroom", "wxid_friend")
@@ -154,15 +152,23 @@ class FakeTimeline:
     def replies(self, chat):
         return chat in self.reply_chats
 
-    def reply_guard(self, chat, inner=None):
+    def epoch(self, chat):
+        return self.wipes
+
+    def reply_guard(self, chat, epoch, inner=None):
         from contextlib import contextmanager
 
         @contextmanager
         def guard():
             if chat not in self.reply_chats:
                 raise SnapshotExpired("自动回复已关闭")
+            if epoch != self.wipes:
+                raise SnapshotExpired("记忆已清空")
             yield
         return guard()
+
+    def forget(self, chat):
+        self.lines, self.summary, self.upto, self.wipes = [], "", 0, self.wipes + 1
 
     def add(self, name, text):
         self.lines.append({"id": len(self.lines) + 1, "at": "2026-10-23T06:00:00+00:00", "name": name, "text": text})
@@ -226,6 +232,17 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.say("在吗")
         self.assertEqual(self.sent, [])
         self.assertIn("自动回复已关闭", self.traces[-1])
+
+    def test_clearing_memory_during_generation_cancels_sending_and_nothing_is_written_back(self):
+        self.say("我喜欢科幻电影")
+        self.sent.clear()
+
+        def answer(system, user, *, first_object=False):
+            self.timeline.forget("wxid_friend")  # 模型已读到“喜欢科幻电影”，这时页面上清空了记忆
+            return {"reply": "你喜欢科幻电影"}
+        self.llm = SimpleNamespace(complete_json=answer)
+        self.say("我喜欢什么")
+        self.assertEqual((self.sent, self.timeline.lines), ([], []))  # 没发出去，也没写回记忆
 
     def test_rate_limit_skips_replies_beyond_the_per_minute_cap(self):
         self.plugin.per_minute = 2

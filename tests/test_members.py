@@ -160,12 +160,35 @@ class MemberTests(unittest.TestCase):
         from wxbot_framework.members import SnapshotExpired
         friend = "wxid_friend"
         self.store.set_chat(friend, memory=True, reply=True)
-        with self.store.reply_guard(friend):
+        epoch = self.store.epoch(friend)
+        with self.store.reply_guard(friend, epoch):
             pass
         self.store.set_chat(friend, memory=True, reply=False)  # 生成途中关掉自动回复
         with self.assertRaises(SnapshotExpired):
-            with self.store.reply_guard(friend):
+            with self.store.reply_guard(friend, epoch):
                 self.fail("不应发送")
+
+    def test_clearing_during_generation_cancels_the_reply_in_private_and_group_chats(self):
+        from wxbot_framework.members import SnapshotExpired
+        friend = "wxid_friend"
+        for chat, clear in ((friend, self.store.forget), (ROOM, self.store.clear)):  # 页面清空记忆、群里 /清空
+            self.store.set_chat(chat, memory=True, reply=True)
+            epoch = self.store.epoch(chat)
+            clear(chat)
+            with self.assertRaises(SnapshotExpired):
+                with self.store.reply_guard(chat, epoch):
+                    self.fail("清空前读到的内容不应再发出去")
+            with self.store.reply_guard(chat, self.store.epoch(chat)):
+                pass  # 清空后新开始的回复照常
+
+    def test_group_clear_command_also_blocks_backfilling_older_lines(self):
+        self.store.set_chat(ROOM, memory=True, reply=False)
+        shown = datetime.now(timezone.utc).timestamp()
+        self.store.clear(ROOM)  # 群里 /清空
+        self.store.set_chat(ROOM, memory=False, reply=False)
+        self.store.set_chat(ROOM, memory=True, reply=False)  # 关掉再打开长期记忆，会补记窗口里的消息
+        row = {"timestamp": shown, "content": "清空前窗口里的话", "direction": "incoming", "sender_id": "wxid_a", "sender_name": "小王"}
+        self.assertEqual(self.store.backfill(ROOM, [row]), 0)
 
     def test_forget_clears_memory_keeps_switches_and_blocks_backfilling_older_lines(self):
         friend = "wxid_friend"

@@ -104,6 +104,7 @@ class MemberStore:
         # 记录哪些会话：配置里的群默认记录；聊天页的开关（chat_settings 表）优先，打开数据库时读入。
         self.groups = set(options["groups"])
         self.private_chats, self.reply_chats = set(), set()
+        self._epochs = {}  # 每个会话清空过几次：生成中途清空了，旧回复就不发（重启后进行中的回复本来就不在）
         self.profiles = []
         for room, profiles in options["groups"].items():
             validate_mentions(room, [self.account])
@@ -272,12 +273,22 @@ class MemberStore:
             raise MemberError("这个群尚未启用聊天记录")
         with self._lock:
             self.rollover()
-            with self._connection() as db:
-                count = db.execute("DELETE FROM messages WHERE account=? AND room=?", (self.account, room)).rowcount
-                db.execute("DELETE FROM agent_summaries WHERE account=? AND chat=?", (self.account, room))
-                db.execute("UPDATE chat_buffers SET generation=generation+1 WHERE account=? AND room=?",
-                           (self.account, room))
-            return count
+            return self._wipe(room)
+
+    def _wipe(self, chat):
+        """群里 /清空 和页面“清空记忆”共用，调用方持锁。清掉记录和摘要，开关不变；
+        记下清空时间，之后再打开长期记忆补记时不会把清空前窗口里的消息补回来；进行中的回复也作废。"""
+        setting = self.chat_setting(chat)
+        with self._connection() as db:
+            count = db.execute("DELETE FROM messages WHERE account=? AND room=?", (self.account, chat)).rowcount
+            db.execute("DELETE FROM agent_summaries WHERE account=? AND chat=?", (self.account, chat))
+            db.execute("UPDATE chat_buffers SET generation=generation+1 WHERE account=? AND room=?", (self.account, chat))
+            db.execute("""INSERT INTO chat_settings(account,chat,memory,reply,cleared_at) VALUES(?,?,?,?,?)
+                ON CONFLICT(account,chat) DO UPDATE SET cleared_at=excluded.cleared_at""",
+                (self.account, chat, int(setting["memory"]), int(setting["reply"]),
+                 self._now().astimezone(timezone.utc).isoformat()))
+        self._epochs[chat] = self._epochs.get(chat, 0) + 1
+        return count
 
     def today_snapshot(self, name, room):
         """完整读取当天的成员文本，数量不受控制台 history 的条数限制。"""
@@ -623,33 +634,28 @@ class MemberStore:
             return [{"id": row["id"], "at": row["received_at"], "text": row["text"], "own": bool(row["is_self"]),
                      "name": "我" if row["is_self"] else names[row["sender_id"]]} for row in reversed(rows)]
 
+    def epoch(self, chat):
+        """开始生成回复前取一次，发送时交给 reply_guard 比对。"""
+        with self._lock:
+            return self._epochs.get(chat, 0)
+
     @contextmanager
-    def reply_guard(self, chat, inner=None):
-        """自动回复发送前再确认一次：生成途中关掉了“自动回复”就不发。inner 为插件原有的发送保护。"""
+    def reply_guard(self, chat, epoch, inner=None):
+        """自动回复发送前再确认一次：生成途中关掉了“自动回复”、或清空了记忆就不发。inner 为插件原有的发送保护。"""
         with self._lock:
             if chat not in self.reply_chats:
                 raise SnapshotExpired("自动回复已关闭")
+            if self._epochs.get(chat, 0) != epoch:
+                raise SnapshotExpired("记忆已清空")
             with inner() if inner is not None else nullcontext():
                 yield
 
     def forget(self, chat):
-        """清空这个会话的长期记忆（聊天记录和摘要），开关不变，之后的新消息照常记录。
-        记下清空时间：之后再打开长期记忆补记时，不会把清空前窗口里的消息补回来。"""
+        """页面“清空记忆”：清空这个会话的长期记忆，群聊、私聊都行，和群里 /清空 效果相同。"""
         validate_target(chat)
         with self._lock:
-            if chat in self.groups:
-                count = self.clear(chat)  # 群里同 /清空：进行中的回复也会取消
-            else:
-                with self._connection() as db:
-                    count = db.execute("DELETE FROM messages WHERE account=? AND room=?", (self.account, chat)).rowcount
-                    db.execute("DELETE FROM agent_summaries WHERE account=? AND chat=?", (self.account, chat))
-            setting = self.chat_setting(chat)
-            with self._connection() as db:
-                db.execute("""INSERT INTO chat_settings(account,chat,memory,reply,cleared_at) VALUES(?,?,?,?,?)
-                    ON CONFLICT(account,chat) DO UPDATE SET cleared_at=excluded.cleared_at""",
-                    (self.account, chat, int(setting["memory"]), int(setting["reply"]),
-                     self._now().astimezone(timezone.utc).isoformat()))
-            return count
+            self.rollover()
+            return self._wipe(chat)
 
     def chat_setting(self, chat):
         return {"memory": self.remembers(chat), "reply": self.replies(chat)}

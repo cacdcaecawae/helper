@@ -21,10 +21,10 @@ class Plugin:
                 message.data.get("bot_generated") or not message.data.get("is_at_self") or
                 self.members.account not in message.data.get("at_members", ())):
             return
-        personality = ctx.personality(message)
+        personality, epoch = ctx.personality(message), self.members.epoch(message.chat_id)
         try:
             snapshot = self.members.conversation_snapshot(message)
-            guard = lambda: self.members.reply_guard(message.chat_id, lambda: ctx.response_guard(snapshot, personality))
+            guard = lambda: self.members.reply_guard(message.chat_id, epoch, lambda: ctx.response_guard(snapshot, personality))
             reply = personality_text(Dialogue(ctx.llm_for(message, personality=personality)).reply(snapshot),
                                      personality.name)
             display = self.members.display_name(message.sender_id, message.chat_id) or snapshot.speaker_name
