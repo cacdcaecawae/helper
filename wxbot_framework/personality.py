@@ -61,10 +61,10 @@ class PersonalityLLM:
     def __init__(self, client, state, *, current):
         self.client, self.state, self.current = client, state, current
 
-    def complete_json(self, system, user):
+    def complete_json(self, system, user, **options):
         if not self.current():
             raise PersonalityExpired("人格已切换")
-        result = self.client.complete_json(system_with_personality(system, self.state), user)
+        result = self.client.complete_json(system_with_personality(system, self.state), user, **options)
         if not self.current():
             raise PersonalityExpired("人格已切换")
         return result

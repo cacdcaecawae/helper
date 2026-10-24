@@ -183,6 +183,9 @@ class PanelController:
                             pass
                     self.messages.append(message, account=app.config.get('wechat_account') or '', sender_name=name)
                 app.message_observer = observe
+                if getattr(app, 'service', None) is not None:
+                    app.service.trace_observer = lambda message, run, step: self.messages.trace(
+                        message, run, step, account=app.config.get('wechat_account') or '')
                 self.app, self.state, self.error, self.started = app, 'starting', '', time.time()
 
                 def run():
@@ -315,7 +318,9 @@ class PanelController:
         options['model'] = options.get('model') or 'list-only'
         from .llm import LLMClient, LLMError
         try:
-            return {'models': LLMClient(options).list_models()}
+            client = LLMClient(options)
+            from .llm import CODEX_DEFAULT_MODEL
+            return {'models': client.list_models(), 'default': CODEX_DEFAULT_MODEL if client.provider == 'codex' else None}
         except LLMError as error:
             raise PanelError(str(error)) from None
 

@@ -582,6 +582,19 @@ class MemberStore:
                  int(message.is_self), int(bool(message.data.get("bot_generated")))))
             return result.rowcount > 0
 
+    def search(self, room, keyword, *, limit=20):
+        """在本群已保存的群友文字里按关键词查找，按时间顺序返回；不含机器人自己的发言。"""
+        if room not in self.groups:
+            raise MemberError("这个群尚未启用聊天记录")
+        if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > 100:
+            raise MemberError("搜索关键词应为 1–100 个字符")
+        with self._lock:
+            self.rollover()
+            rows = self._connection().execute("""SELECT sender_id,text,received_at FROM messages
+                WHERE account=? AND room=? AND bot_generated=0 AND instr(text,?)>0 ORDER BY id DESC LIMIT ?""",
+                (self.account, room, keyword.strip(), limit)).fetchall()
+            return [dict(row, name=self.display_name(row["sender_id"], room) or "群友") for row in reversed(rows)]
+
     def history(self, name, room=None, *, limit=100, since=None):
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise MemberError("历史查询 limit 应为 1–1000 的整数")

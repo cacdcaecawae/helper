@@ -14,6 +14,8 @@ class Plugin:
         ctx.llm  # 启动时核对配置，不请求接口。
 
     def on_message(self, message, ctx):
+        if ctx.plugin_is_active("agent_chat"):
+            return  # 智能体开启时由它接管艾特，避免同一句话回两次
         if (message.type != 1 or not message.is_group or message.chat_id not in self.members.groups or
                 "WXBOT_AT_CHAT_PROBE" in message.text or
                 message.data.get("bot_generated") or not message.data.get("is_at_self") or

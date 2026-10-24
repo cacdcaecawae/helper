@@ -189,7 +189,7 @@ class ControllerTests(PanelFixture):
         with patch('wxbot_framework.llm.LLMClient.list_models', models):
             result = self.controller.llm_models({'provider':'openai_compatible', 'base_url':'https://gateway.example.test/v1'})
             self.controller.llm_models({'base_url':'https://gateway.example.test/v1', 'api_key':' typed-key '})
-        self.assertEqual(result, {'models':['model-a']})
+        self.assertEqual(result, {'models':['model-a'], 'default':None})
         self.assertEqual(seen, [('openai_compatible', 'https://gateway.example.test/v1/chat/completions', 'private-model-key'),
                                 ('openai_compatible', 'https://gateway.example.test/v1/chat/completions', 'typed-key')])
         self.assertEqual(read_json(path)['api_key'], 'private-model-key')

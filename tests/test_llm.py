@@ -74,6 +74,13 @@ class LLMTests(unittest.TestCase):
                 self.assertIn("原功能规则", body["messages"][0]["content"])
                 self.assertIn("JSON 对象", body["messages"][0]["content"])
 
+    def test_first_object_mode_ignores_invented_continuations(self):
+        content = '{"tool":"web_search","args":{}}{"reply":"invented"}'
+        with patch("wxbot_framework.llm.urlopen", return_value=self.response(content)):
+            self.assertEqual(self.client.complete_json("JSON", "x", first_object=True), {"tool": "web_search", "args": {}})
+        with patch("wxbot_framework.llm.urlopen", return_value=self.response(content)), self.assertRaises(LLMError):
+            self.client.complete_json("JSON", "x")
+
     def test_prompt_mode_still_requires_a_single_json_object(self):
         client = LLMClient({**self.options, "json_mode": False})
         for content in ('这是普通回答', '[]', '前言\n```json\n{}\n```', '```json\n{}\n```\n后记', '{} {}'):
@@ -257,7 +264,23 @@ class CodexTests(unittest.TestCase):
         self.assertEqual(body["input"][0]["role"], "developer")
         self.assertEqual(body["input"][1]["content"][0]["text"], "中文")
         self.assertEqual(body["text"], {"format": {"type": "json_object"}})
+        self.assertEqual((body["model"], body["reasoning"]), ("gpt-test", {"effort": "medium"}))
+        self.assertEqual(LLMClient({"provider": "codex"}).model, "gpt-6.1-sol")
         self.assertNotIn("private-refresh", request.data.decode())
+
+    def test_image_generation_returns_png_bytes(self):
+        events = [{"type": "response.output_item.done", "item": {"type": "image_generation_call", "result": "UE5HREFUQQ=="}},
+                  {"type": "response.completed"}]
+        with patch("wxbot_framework.llm.urlopen", return_value=self.stream(*events)) as call:
+            self.assertEqual(self.client.generate_image("橘猫"), b"PNGDATA")
+        body = json.loads(call.call_args.args[0].data)
+        self.assertEqual(body["tools"], [{"type": "image_generation"}])
+        self.assertEqual(call.call_args.kwargs["timeout"], 120)
+        with patch("wxbot_framework.llm.urlopen", return_value=self.stream({"type": "response.completed"})):
+            with self.assertRaisesRegex(LLMError, "没有返回图片"):
+                self.client.generate_image("橘猫")
+        with self.assertRaisesRegex(LLMError, "Codex"):
+            LLMClient({"api_key": "k", "model": "m"}).generate_image("橘猫")
 
     def test_model_list_comes_from_codex_cache_without_hidden_models(self):
         Path(self.home.name, "models_cache.json").write_text(json.dumps({"models": [

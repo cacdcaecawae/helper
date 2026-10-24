@@ -1,6 +1,7 @@
 """通过配置接入 OpenAI 兼容接口或本机 Codex 登录，不记录密钥或聊天正文。"""
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
@@ -17,6 +18,8 @@ class LLMError(RuntimeError):
 
 
 CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+CODEX_DEFAULT_MODEL = "gpt-6.1-sol"
+CODEX_DEFAULT_REASONING = {"effort": "medium"}
 
 
 def _codex_home():
@@ -53,7 +56,7 @@ class LLMClient:
                          else self.base_url + "/chat/completions")
         self._deepseek_official = (parsed.scheme == "https" and parsed.hostname == "api.deepseek.com"
                                   and parsed.port in (None, 443))
-        self.model = options.get("model", "deepseek-flash")
+        self.model = options.get("model", CODEX_DEFAULT_MODEL if self.provider == "codex" else "deepseek-flash")
         self._api_key = options.get("api_key", "")
         if not isinstance(self.model, str) or not self.model.strip():
             raise ValueError("大模型 model 不能为空")
@@ -93,7 +96,7 @@ class LLMClient:
     def from_file(cls, path):
         return cls(json.loads(Path(path).read_text(encoding="utf-8-sig")))
 
-    def complete_json(self, system, user):
+    def complete_json(self, system, user, *, first_object=False):
         json_instruction = "\n\n请只返回一个有效的 JSON 对象，不要使用 Markdown 代码围栏或附加说明。"
         if not self.json_mode:
             system += json_instruction
@@ -110,7 +113,7 @@ class LLMClient:
         allow_fenced = not self.json_mode
         try:
             if self.provider == "codex":
-                return self._parse_json(self._codex_text(system, user), allow_fenced)
+                return self._parse_json(self._codex_text(system, user), allow_fenced, first_object)
             for attempt in range(2):
                 request = Request(self.endpoint,
                                   data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -144,12 +147,9 @@ class LLMClient:
                     raise LLMError("大模型返回了空结果" + suffix)
                 if not isinstance(content, str):
                     raise LLMError("大模型正文格式不正确")
-                return self._parse_json(content, allow_fenced)
+                return self._parse_json(content, allow_fenced, first_object)
         except HTTPError as error:
             # 不输出响应正文或请求头，避免服务器错误回显密钥。
-            if self.provider == "codex":
-                hint = "；请在本机运行一次 codex 刷新登录" if error.code == 401 else "；请核对模型名称和 Codex 额度"
-                raise LLMError(f"Codex 接口 HTTP {error.code}{hint}") from None
             raise LLMError(f"大模型接口 HTTP {error.code}；请核对密钥、余额和模型配置") from None
         except (URLError, TimeoutError, OSError):
             raise LLMError("大模型连接失败或超时，请稍后再试") from None
@@ -157,13 +157,14 @@ class LLMClient:
             raise LLMError("大模型响应格式不正确，请重试") from None
 
     @staticmethod
-    def _parse_json(content, allow_fenced):
+    def _parse_json(content, allow_fenced, first_object=False):
         content = content.strip()
         if allow_fenced and content.startswith("```") and content.endswith("```"):
             opening, separator, body = content.partition("\n")
             if separator and opening.strip().lower() in ("```", "```json"):
                 content = body[:-3].strip()
-        data = json.loads(content)
+        # first_object：模型有时在工具调用后自行续写编造的结果，只取第一个对象。
+        data = json.JSONDecoder().raw_decode(content)[0] if first_object else json.loads(content)
         if not isinstance(data, dict):
             raise LLMError("大模型结果应为 JSON 对象")
         return data
@@ -198,44 +199,79 @@ class LLMClient:
         except (ValueError, KeyError, TypeError, AttributeError):
             raise LLMError("该接口没有提供标准模型列表，请手动填写模型名称") from None
 
+    def web_search(self, query):
+        """用 Codex 后端自带的联网搜索回答问题，返回带来源的简短摘要；仅 Codex 接入方式可用。"""
+        if self.provider != "codex":
+            raise LLMError("联网搜索需要使用本机 Codex 登录")
+        return self._codex_stream({"tools": [{"type": "web_search"}], "max_output_tokens": 2048, "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text":
+                "联网搜索后用不超过 300 字的中文回答，列出关键事实和来源网站名；搜不到就直说。"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": query}]}]})
+
+    def generate_image(self, prompt):
+        """用 Codex 后端自带的生图工具画一张图，返回 PNG 字节；仅 Codex 接入方式可用。"""
+        if self.provider != "codex":
+            raise LLMError("Codex 生图需要使用本机 Codex 登录")
+        return self._codex_stream({"tools": [{"type": "image_generation"}], "tool_choice": {"type": "image_generation"},
+                                   "input": [{"type": "message", "role": "user", "content": [
+                                       {"type": "input_text", "text": prompt}]}]}, image=True)
+
     def _codex_text(self, system, user):
+        payload = {"max_output_tokens": self.max_tokens,
+                   "input": [{"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]}
+                             for role, text in (("developer", system), ("user", user))], **self.extra_body}
+        if self.json_mode:
+            payload["text"] = {"format": {"type": "json_object"}}
+        return self._codex_stream(payload)
+
+    def _codex_stream(self, payload, *, image=False):
         # ponytail: 每次调用只读 Codex 的 token、不自行刷新（刷新会轮换 refresh_token，与 Codex 抢登录）；
         # 长期不用 Codex 导致过期时，运行一次 codex 即可续期。
-        home = _codex_home()
         try:
-            tokens = json.loads((home / "auth.json").read_text(encoding="utf-8-sig"))["tokens"]
+            tokens = json.loads((_codex_home() / "auth.json").read_text(encoding="utf-8-sig"))["tokens"]
             token, account = tokens["access_token"], tokens["account_id"]
             if not (isinstance(token, str) and token and isinstance(account, str) and account):
                 raise ValueError
         except (OSError, ValueError, KeyError, TypeError):
             raise LLMError("未找到 Codex 的 ChatGPT 登录信息，请先在本机运行 codex login") from None
-        payload = {"model": self.model, "store": False, "stream": True, "max_output_tokens": self.max_tokens,
-                   "input": [{"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]}
-                             for role, text in (("developer", system), ("user", user))], **self.extra_body}
-        if self.json_mode:
-            payload["text"] = {"format": {"type": "json_object"}}
+        payload = {"model": self.model, "store": False, "stream": True, "reasoning": CODEX_DEFAULT_REASONING, **payload}
         request = Request(CODEX_ENDPOINT, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                           headers={"Authorization": "Bearer " + token, "chatgpt-account-id": account,
                                    "Content-Type": "application/json", "Accept": "text/event-stream",
                                    "originator": "codex_cli_rs"}, method="POST")
-        parts, size = [], 0
-        with urlopen(request, timeout=self.timeout) as response:
-            for line in response:
-                size += len(line)
-                if size > 4 * 1024 * 1024:
-                    raise LLMError("大模型响应过大")
-                if not line.startswith(b"data:"):
-                    continue
-                event = json.loads(line[5:])
-                kind = event.get("type")
-                if kind == "response.output_text.done":
-                    parts.append(event["text"])
-                elif kind == "response.completed":
-                    if not "".join(parts).strip():
-                        raise LLMError("大模型返回了空结果")
-                    return "".join(parts)
-                elif kind == "response.incomplete":
-                    raise LLMError("大模型响应被截断，请增加 max_tokens")
-                elif kind in ("response.failed", "error"):
-                    raise LLMError("Codex 接口返回错误，请核对模型名称和额度")
+        parts, size, picture = [], 0, None
+        try:
+            with urlopen(request, timeout=max(self.timeout, 120) if image else self.timeout) as response:
+                for line in response:
+                    size += len(line)
+                    if size > (64 if image else 4) * 1024 * 1024:
+                        raise LLMError("大模型响应过大")
+                    if not line.startswith(b"data:"):
+                        continue
+                    event = json.loads(line[5:])
+                    kind = event.get("type")
+                    if kind == "response.output_text.done":
+                        parts.append(event["text"])
+                    elif image and kind == "response.output_item.done" and event["item"].get("type") == "image_generation_call":
+                        picture = base64.b64decode(event["item"]["result"], validate=True)
+                    elif kind == "response.completed" and image:
+                        if not picture:
+                            raise LLMError("Codex 没有返回图片，可能触发了内容限制")
+                        return picture
+                    elif kind == "response.completed":
+                        if not "".join(parts).strip():
+                            raise LLMError("大模型返回了空结果")
+                        return "".join(parts)
+                    elif kind == "response.incomplete":
+                        raise LLMError("大模型响应被截断，请增加 max_tokens")
+                    elif kind in ("response.failed", "error"):
+                        raise LLMError("Codex 接口返回错误，请核对模型名称和额度")
+        except HTTPError as error:
+            # 不输出响应正文或请求头，避免服务器错误回显 token。
+            hint = "；请在本机运行一次 codex 刷新登录" if error.code == 401 else "；请核对模型名称和 Codex 额度"
+            raise LLMError(f"Codex 接口 HTTP {error.code}{hint}") from None
+        except (URLError, TimeoutError, OSError):
+            raise LLMError("大模型连接失败或超时，请稍后再试") from None
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise LLMError("大模型响应格式不正确，请重试") from None
         raise LLMError("Codex 响应提前结束，请稍后再试")

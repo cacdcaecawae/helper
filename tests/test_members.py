@@ -53,6 +53,17 @@ class MemberTests(unittest.TestCase):
     def message(self, text="中文消息 🌸", sender=JING, sequence=1, **kwargs):
         return Message(text, ROOM, sender_id=sender, is_group=True, sequence=sequence, session_id="first", **kwargs)
 
+    def test_keyword_search_returns_room_text_in_order_without_bot_replies(self):
+        self.store.record(self.message("周六晚上开黑", sequence=1))
+        self.store.record(self.message("周六见", sender=SMALL, sequence=2))
+        self.store.record(self.message("周六我也来", sequence=3, data={"bot_generated": True}))
+        rows = self.store.search(ROOM, "周六")
+        self.assertEqual([row["text"] for row in rows], ["周六晚上开黑", "周六见"])
+        self.assertEqual(rows[1]["name"], "成员甲昵称")
+        for room, keyword in (("999@chatroom", "周六"), (ROOM, " "), (ROOM, "x" * 101)):
+            with self.subTest(room=room, keyword=keyword), self.assertRaises(MemberError):
+                self.store.search(room, keyword)
+
     def test_configuration_check_does_not_create_database(self):
         self.assertFalse(self.store.path.exists())
         self.store.initialize()

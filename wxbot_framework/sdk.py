@@ -77,6 +77,7 @@ class ServiceFacade:
         self._cancel = threading.Event()
         self.text_delay = TextSendDelay.from_config(text_delay)
         self.message_observer = None
+        self.trace_observer = None  # 管理台设置：接收智能体每一步，显示在聊天时间线
 
     def _sent(self, result, backend, chat_id, msg_type, *, text='', path=''):
         observer = self.message_observer
@@ -392,6 +393,15 @@ class PluginContext:
 
     def plugin_is_active(self, name):
         return bool(self._plugin_active and self._plugin_active(name))
+
+    def trace(self, message, run, step):
+        """把智能体的一步（思考、工具调用、结果、回复）推送到管理台；没有管理台时忽略。"""
+        observer = getattr(self._service, "trace_observer", None)
+        if observer is not None:
+            try:
+                observer(message, run, step)
+            except Exception:
+                self.logger.warning("智能体过程暂时无法显示，回复继续")
 
     @property
     def speech(self):

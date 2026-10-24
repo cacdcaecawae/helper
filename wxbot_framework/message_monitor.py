@@ -177,6 +177,24 @@ class MessageBuffer:
                     'content':'[撤回消息] 原消息未捕获', 'message_id':identifier,
                     'recalled':True, 'recalled_at':now, 'recall_notice':notice, 'recall_missing':True})
 
+    def trace(self, message, run, step, *, account=''):
+        """智能体每次运行占一行（kind=agent），每走一步追加 step 并提升 revision，前端增量刷新。"""
+        step = {key: self._text(step.get(key), 2000) if isinstance(step.get(key), str) else step.get(key)
+                for key in ('kind', 'text', 'status') if key in step}
+        with self.lock:
+            self.sequence += 1
+            for index, old in enumerate(self.rows):
+                if old.get('kind') == 'agent' and old.get('run') == run:
+                    self.rows[index] = dict(old, steps=[*old['steps'], step][-40:], revision=self.sequence,
+                                            status=step.get('status') or old['status'])
+                    return
+            now = self.clock()
+            self.rows.append({'id': self.sequence, 'revision': self.sequence, 'kind': 'agent', 'run': run,
+                'timestamp': now, 'time': time.strftime('%H:%M:%S', time.localtime(now)),
+                'date': time.strftime('%Y-%m-%d', time.localtime(now)), 'account': self._text(account, 128),
+                'chat_id': self._text(message.chat_id, 128), 'is_group': message.is_group,
+                'status': step.get('status') or 'running', 'steps': [step]})
+
     def tail(self, after=0):
         if type(after) is not int or after < 0:
             raise ValueError('消息游标必须是非负整数')
