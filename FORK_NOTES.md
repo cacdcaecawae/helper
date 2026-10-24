@@ -14,6 +14,11 @@
 
 前端验收仅使用合成账号、消息及发送任务；不会启动微信或机器人。启动仍使用原有 `start_web.bat`，请先退出其他注入工具。
 
+## 本机模型
+
+- 大模型「接入方式」可选「本机 Codex 登录」（`llm_config.json` 中 `"provider": "codex"`）：每次调用读取 `~/.codex/auth.json`（或 `CODEX_HOME`）的 ChatGPT 登录，请求 Codex 后端，无需 API 密钥，接口地址和密钥栏会自动隐藏。模型从下拉框选择：Codex 读取本机 `models_cache.json`（Codex 自动维护），兼容接口请求标准 `/models`；取不到列表时可选「手动填写…」。不自行刷新 token，长期未用 Codex 导致 401 时运行一次 `codex` 即可。
+- 语音默认使用本机 Qwen3-TTS（`F:\本地模型\Qwen3-TTS-12Hz-1.7B-CustomVoice`），默认音色 Vivian，固定随机种子保证同句同音。`tools/local_tts_server.py` 只监听 `127.0.0.1:8766`，实现 helper 用到的 Fish Audio 接口子集；按 `requirements-tts.txt` 建好 `.venv-tts` 后，`start_web` 会自动后台启动。RTX 4070 SUPER 上约 2.5 倍实时，故每段 80 字、超时 120 秒。
+
 ## 界面文件与验收
 
 - `webui/index.html`：页面结构；`webui/style.css`：配色、布局与响应式；`webui/app.js`：现有 API 对接及聊天交互。
