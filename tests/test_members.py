@@ -277,6 +277,9 @@ class MemberTests(unittest.TestCase):
         clock[0] += timedelta(seconds=1)
         store.record(Message("周六有空吗", friend, friend, session_id="first", sequence=2))
         self.assertTrue(store.has_newer(first))
+        self.assertTrue(store.recorded(first))
+        store.forget(friend)  # 排队期间清空了：这条已不在记录里
+        self.assertFalse(store.recorded(first))
 
     def test_search_combines_day_speaker_and_keyword(self):
         clock = [datetime(2026, 10, 19, 4, 0, tzinfo=timezone.utc)]  # 北京 10-19 12:00

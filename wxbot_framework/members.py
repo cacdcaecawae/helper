@@ -714,6 +714,15 @@ class MemberStore:
                  int(message.is_self), int(bool(message.data.get("bot_generated")))))
             return result.rowcount > 0
 
+    def recorded(self, message):
+        """这条消息还在记录里：排队期间被清空就不在了，不再回复它。没有原生序号的无法核对，按在。"""
+        if not message.sequence:
+            return True
+        with self._lock:
+            return bool(self._connection().execute(
+                "SELECT 1 FROM messages WHERE account=? AND room=? AND session_id=? AND sequence=?",
+                (self.account, message.chat_id, message.session_id, message.sequence)).fetchone())
+
     def has_newer(self, message):
         """对方在这条之后又发了话（已入库）：私聊连发几条时只回最新一条，像真人看完再一起回。
         按收到时间比，补记进来的旧消息不算。"""

@@ -39,17 +39,18 @@ let chatRows=[], chatLoadKey='', chatTimelineSignature='', chatConfirm=null, cha
 let chatListMarkup='', chatTimelineTarget='';
 const chatDrafts=new Map();
 // 开了长期记忆的会话，点开时从库里取以前的聊天，接在本次收到的消息前面。
-const chatHistory=new Map(),historyLoading=new Set();
+// historyLoading：会话 → 本次请求的标记；清空记忆时删掉，清空前发出、迟到的旧结果不再写入。
+const chatHistory=new Map(),historyLoading=new Map();
 async function loadChatHistory(chat){
-  const key=robot+':'+chat,requested=robot;
+  const key=robot+':'+chat,requested=robot,token={};
   if(!chat||chatHistory.has(key)||historyLoading.has(key))return;
-  historyLoading.add(key);
+  historyLoading.set(key,token);
   const live=messages.filter(message=>message.chat_id===chat&&message.timestamp).map(message=>message.timestamp);
   const before=live.length?Math.min(...live):0;  // 只取本次已显示消息之前的，两段接上不重复
   try{
     const {rows}=await api('chat-history?chat='+encodeURIComponent(chat)+(before?'&before='+before:''),undefined,requested);
-    if(requested===robot){chatHistory.set(key,rows);chatTimelineSignature='';renderChatWorkspace();}
-  }catch{}finally{historyLoading.delete(key);}
+    if(requested===robot&&historyLoading.get(key)===token){chatHistory.set(key,rows);chatTimelineSignature='';renderChatWorkspace();}
+  }catch{}finally{if(historyLoading.get(key)===token)historyLoading.delete(key);}
 }
 const accountKey = row => row.pid + ':' + row.wxid;
 const activeStates = ['starting','running','stopping'];
@@ -263,7 +264,7 @@ $('#chat-forget').onclick = async () => {
   if(!chat||!confirm(`清空「${name}」的长期记忆？\n机器人会忘掉以前的聊天，开关不变，之后的新消息照常记录。`))return;
   try{
     const {cleared}=await api('chat-forget',{chat_id:chat},requested);if(requested!==robot)return;
-    chatHistory.delete(requested+':'+chat);switchHint={chat,text:`已清空 ${cleared} 条记忆`};
+    chatHistory.delete(requested+':'+chat);historyLoading.delete(requested+':'+chat);switchHint={chat,text:`已清空 ${cleared} 条记忆`};
   }catch(error){switchHint={chat,text:error.message};}
   chatListMarkup='';chatTimelineSignature='';renderChatWorkspace();
 };

@@ -89,6 +89,8 @@ class TextRoutingTests(unittest.TestCase):
         mapped = service._map_message(own)
         self.assertTrue(mapped["bot_generated"])
         self.assertFalse(mapped["dispatch_to_plugins"])
+        # 一次发送只认领一条回传：随后手动再发同样的话，是自己说的，不当成机器人消息
+        self.assertFalse(service._map_message(own).get("bot_generated"))
         own.text = (SELF + ":\n发扬光大").encode("utf-8")
         self.assertEqual(service._map_message(own)["msg"], "发扬光大")
         own.text = (FRIEND + ":\n意气风发").encode("utf-8")

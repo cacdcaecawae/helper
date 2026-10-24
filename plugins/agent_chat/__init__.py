@@ -81,16 +81,21 @@ class Plugin:
         def trace(kind, text="", status=None):
             ctx.trace(message, run, {"kind": kind, "text": text, **({"status": status} if status else {})})
 
+        # 开始处理时先取 epoch：之后清空的由发送前的 reply_guard 拦下；排队期间就清空的，下面看这条还在不在记录里。
+        epoch = self.members.epoch(message.chat_id)
         if not message.is_group:
             # 私聊先等对方说完：从收到起满 PRIVATE_WAIT 秒再看（排队时已等过的不重复等），期间又来了就留给最新那条一起回。
             time.sleep(max(0.0, PRIVATE_WAIT - (time.monotonic() - message.received_at)))
+            if not self.members.recorded(message):  # 群里由 conversation_snapshot 做同样的检查
+                trace("error", "已取消：记忆已清空", status="error")
+                return
             if self.members.has_newer(message):
                 trace("done", "对方又发了消息，合并到最新一条一起回", status="done")
                 return
         if self._too_frequent(message.chat_id):  # 防刷屏：每个会话每分钟最多回 per_minute 次，额度不被刷光
             trace("error", f"一分钟内已回复 {self.per_minute} 次，这条先不回（防刷屏）", status="error")
             return
-        personality, epoch = ctx.personality(message), self.members.epoch(message.chat_id)
+        personality = ctx.personality(message)
         # 每次发送前都再确认“自动回复”还开着、记忆没被清空：生成途中关掉或清空就不发。
         guard = lambda: self.members.reply_guard(message.chat_id, epoch, lambda: ctx.personality_guard(personality))
         try:

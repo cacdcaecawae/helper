@@ -155,8 +155,11 @@ class FakeTimeline:
     def epoch(self, chat):
         return self.wipes
 
+    def recorded(self, message):
+        return any(line["text"] == message.text for line in self.lines)
+
     def has_newer(self, message):
-        return self.lines[-1]["text"] != message.text
+        return bool(self.lines) and self.lines[-1]["text"] != message.text
 
     def reply_guard(self, chat, epoch, inner=None):
         from contextlib import contextmanager
@@ -250,6 +253,12 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.llm = SimpleNamespace(complete_json=answer)
         self.say("我喜欢什么")
         self.assertEqual((self.sent, self.timeline.lines), ([], []))  # 没发出去，也没写回记忆
+
+    def test_a_message_queued_before_a_clear_is_not_answered(self):
+        self.timeline.add("小王", "我喜欢科幻电影")
+        self.timeline.forget("wxid_friend")  # 这条还在排队时，页面上清空了记忆
+        self.plugin.on_message(Message("我喜欢科幻电影", "wxid_friend", "wxid_friend"), self.ctx)
+        self.assertEqual((self.sent, self.llm.calls, self.timeline.lines), ([], [], []))
 
     def test_a_burst_of_private_messages_gets_one_reply_to_the_latest(self):
         self.timeline.add("小王", "在吗")

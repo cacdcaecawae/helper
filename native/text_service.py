@@ -318,9 +318,13 @@ class NativeTextService(NativeFileHelperService):
             data["is_at_self"] = bool(data["room_wxid"] and self.self_wxid in data["at_members"])
             if data["at_members"]:
                 self.mention_messages += 1
-            if data["is_self"] and any(chat == data["chat_id"] and text == data["msg"] and
-                                       time.monotonic() - sent_at < 120
-                                       for chat, text, sent_at in tuple(self._sent_texts)):
+            sent = data["is_self"] and next((entry for entry in tuple(self._sent_texts) if entry[0] == data["chat_id"] and
+                                             entry[1] == data["msg"] and time.monotonic() - entry[2] < 120), None)
+            if sent:
+                try:  # 一次发送只认领一条回传：之后手动发同样的话是你自己说的，照常显示、记录
+                    self._sent_texts.remove(sent)
+                except ValueError:
+                    pass
                 self.router.ignored_self += 1
                 data["bot_generated"] = True
                 data["dispatch_to_plugins"] = False
