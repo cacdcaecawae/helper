@@ -39,11 +39,13 @@ class AgentTests(unittest.TestCase):
     def test_unknown_tools_and_failures_become_observations_not_crashes(self):
         def broken(args):
             raise ToolError("服务未启动")
-        llm = ScriptedLLM({"tool": "missing", "args": {}}, {"tool": "broken", "args": {}}, {"reply": "画图服务没开。"})
+        llm = ScriptedLLM({"tool": "missing", "args": {}}, {"tool": "broken", "args": {}}, {"tool": [], "args": {}},
+                          {"reply": "画图服务没开。"})
         self.assertEqual(Agent(llm, {"broken": ("坏工具", broken)}, self.record).run({"current": "画猫"}), "画图服务没开。")
-        results = [step["result"] for step in llm.calls[2][1]["steps"]]
+        results = [step["result"] for step in llm.calls[3][1]["steps"]]
         self.assertIn("不存在", results[0])
         self.assertEqual(results[1], "失败：服务未启动")
+        self.assertIn("不存在", results[2])  # 工具名不是字符串（不可哈希）也只是一条观察，不会抛 TypeError
 
     def test_tool_calls_are_bounded_and_must_end_with_a_valid_reply(self):
         loop = {"tool": "lookup", "args": {}}
@@ -106,6 +108,11 @@ class AgentPluginGateTests(unittest.TestCase):
         return Message(text, chat, "wxid_x" if chat.endswith("@chatroom") else chat,
                        is_group=chat.endswith("@chatroom"), data=data)
 
+    def test_refuses_to_load_without_saved_chat_history(self):
+        ctx = SimpleNamespace(members=SimpleNamespace(history_enabled=False), config={})
+        with self.assertRaisesRegex(ValueError, "history_enabled"):
+            Plugin().on_load(ctx)
+
     def test_only_real_mentions_in_configured_groups_and_whitelisted_friends(self):
         mention = {"is_at_self": True, "at_members": ["wxid_bot"]}
         self.assertTrue(self.plugin._wanted(self.message("123@chatroom", **mention)))
@@ -126,7 +133,7 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.plugin = Plugin()
         self.plugin.members = SimpleNamespace(
             agent_memory=lambda chat: ("", [turn for turn in turns if turn["chat"] == chat]),
-            remember_agent_turn=lambda chat, sender, speaker, asked, answered: turns.append(
+            remember_agent_turn=lambda chat, sender, speaker, asked, answered, snapshot=None: turns.append(
                 {"chat": chat, "id": len(turns) + 1, "at": "2026-10-23T06:00:00+00:00",
                  "speaker": speaker, "asked": asked, "answered": answered}),
             compact_agent_memory=lambda chat, summary, upto: self.compacted.append((chat, summary, upto)))

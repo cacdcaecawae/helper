@@ -76,6 +76,18 @@ class MemberTests(unittest.TestCase):
         self.assertEqual(reopened.agent_memory(ROOM), ("", []))
         self.assertEqual([turn["asked"] for turn in reopened.agent_memory("wxid_friend")[1]], ["私聊问"])
 
+    def test_agent_turn_is_not_written_back_after_the_group_was_cleared(self):
+        message = self.message("推荐个电影")
+        self.store.record(message)
+        snapshot = self.store.conversation_snapshot(message)
+        self.store.clear(ROOM)  # 回复已发出、记忆还没写时被 /清空
+        self.assertFalse(self.store.remember_agent_turn(ROOM, JING, "成员乙", "推荐个电影", "白日梦想家", snapshot=snapshot))
+        self.assertEqual(self.store.agent_memory(ROOM), ("", []))
+        self.store.record(message)
+        self.assertTrue(self.store.remember_agent_turn(ROOM, JING, "成员乙", "推荐个电影", "白日梦想家",
+                                                       snapshot=self.store.conversation_snapshot(message)))
+        self.assertEqual(len(self.store.agent_memory(ROOM)[1]), 1)
+
     def test_keyword_search_returns_room_text_in_order_without_bot_replies(self):
         self.store.record(self.message("周六晚上开黑", sequence=1))
         self.store.record(self.message("周六见", sender=SMALL, sequence=2))

@@ -38,6 +38,8 @@ def history(turns):
 class Plugin:
     def on_load(self, ctx):
         self.members = ctx.members
+        if not self.members.history_enabled:  # 群聊要从已保存的记录里取当前消息，关掉记录会静默取消每次艾特
+            raise ValueError("智能体需要成员配置 history_enabled: true")
         friends, tools = ctx.config.get("private_friends", []), ctx.config.get("tools", list(TOOLS))
         if not isinstance(friends, list) or len(friends) > 1000 or not all(isinstance(f, str) and f for f in friends):
             raise ValueError("private_friends 应为微信 ID 列表")
@@ -88,7 +90,8 @@ class Plugin:
                 display = self.members.display_name(message.sender_id, message.chat_id) or snapshot.speaker_name
             for index, part in enumerate(parts):
                 deliver_model_reply(ctx, message, part, display_name=display if index == 0 else None, delivery_guard=guard)
-            self.members.remember_agent_turn(message.chat_id, sender, context["name"], context["current"], "\n".join(parts))
+            self.members.remember_agent_turn(message.chat_id, sender, context["name"], context["current"], "\n".join(parts),
+                                             snapshot=snapshot if message.is_group else None)
             trace("done", f"{len(parts)} 条回复，用时 {time.monotonic() - started:.1f} 秒", status="done")
             self._compact(message.chat_id, ctx)
         except SnapshotExpired:

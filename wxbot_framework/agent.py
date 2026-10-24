@@ -59,7 +59,7 @@ class Agent:
                     raise LLMError("智能体没有给出有效回复，请重试")
                 return reply.strip()
             name, args = result.get("tool"), result.get("args")
-            if name not in self.tools or not isinstance(args, dict):
+            if not isinstance(name, str) or name not in self.tools or not isinstance(args, dict):
                 observation = f"工具 {name!r} 不存在或参数不是 JSON 对象"
             else:
                 self.trace("tool", f"{name} {json.dumps(args, ensure_ascii=False)}"[:500])

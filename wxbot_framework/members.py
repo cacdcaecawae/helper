@@ -624,11 +624,16 @@ class MemberStore:
                 (self.account, chat, keyword, keyword, keyword, limit)).fetchall()
             return [dict(row) for row in reversed(rows)]
 
-    def remember_agent_turn(self, chat, sender, speaker, asked, answered):
-        """记下一轮问答和提问人；不限条数，过长时由调用方用 compact_agent_memory 压缩。"""
-        with self._lock, self._connection() as db:
-            db.execute("INSERT INTO agent_turns(account,chat,sender,speaker,at,asked,answered) VALUES(?,?,?,?,?,?,?)",
-                       (self.account, chat, sender, speaker, self._now().astimezone(timezone.utc).isoformat(), asked, answered))
+    def remember_agent_turn(self, chat, sender, speaker, asked, answered, *, snapshot=None):
+        """记下一轮问答和提问人；不限条数，过长时由调用方用 compact_agent_memory 压缩。
+        群聊传入回复时的 snapshot：回复发出后群被 /清空 或跨天就不写，和清空在同一把锁里判断。"""
+        with self._lock:
+            if snapshot is not None and not self.snapshot_is_current(snapshot):
+                return False
+            with self._connection() as db:
+                db.execute("INSERT INTO agent_turns(account,chat,sender,speaker,at,asked,answered) VALUES(?,?,?,?,?,?,?)",
+                           (self.account, chat, sender, speaker, self._now().astimezone(timezone.utc).isoformat(), asked, answered))
+            return True
 
     def compact_agent_memory(self, chat, summary, upto):
         """摘要从此代替 id<=upto 的问答给模型看；原文保留，供 search_agent_memory 查找。
