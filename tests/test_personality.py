@@ -38,6 +38,7 @@ class PersonalityTests(unittest.TestCase):
     def setup_chat(self, provider=None):
         self.backend.send_at_text = lambda room, text, ids: self.backend.sent.append((room, text, ids)) or True
         self.ctx._llm = Mock(complete_json=provider or Mock(return_value={"reply": "这是回答。", "summary": "这是总结。"}))
+        self.store.set_chat(ROOM, memory=True, reply=True)  # 聊天页“自动回复”开关
         plugin = ChatPlugin()
         plugin.on_load(self.ctx)
         return plugin

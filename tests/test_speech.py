@@ -129,6 +129,7 @@ class SpeechTests(unittest.TestCase):
 
     def test_mention_model_output_uses_speech_and_keeps_personality_context(self):
         self.setup_speech()
+        self.store.set_chat(ROOM, memory=True, reply=True)  # 聊天页“自动回复”开关
         self.store.record(self.message('今天写代码'))
         msg = self.message('@机器人\u2005评价一下', sequence=11,
                            data={'is_at_self': True, 'at_members': [daily.ROBOT]})

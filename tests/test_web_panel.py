@@ -67,6 +67,9 @@ class FakePlugins:
     def reload(self, name):
         self.thread_ids.append(threading.get_ident())
 
+    def is_active(self, name):
+        return self.active and name == 'echo'
+
 
 class FakeApp:
     submit_control = BotApplication.submit_control
@@ -133,6 +136,27 @@ class ControllerTests(PanelFixture):
         self.wait_stopped()
         self.assertEqual(self.controller.snapshot()['state'], 'stopped')
         self.controller.start()
+        self.wait_stopped()
+
+    def test_chat_switches_come_with_chats_and_save_while_running(self):
+        class Members:
+            settings = {}
+
+            def chat_setting(self, chat):
+                return dict(self.settings.get(chat, {'memory': False, 'reply': False}))
+
+            def set_chat(self, chat, *, memory, reply):
+                self.settings[chat] = {'memory': memory or reply, 'reply': reply}
+                return self.chat_setting(chat)
+        self.controller.start()
+        self.controller.app.members = Members()
+        self.assertEqual(self.controller.chats(), [{'chat_id':'123@chatroom','is_group':True,'memory':False,'reply':False}])
+        # 运行中直接改，不用停机；智能体没开时提醒一句
+        self.assertEqual(self.controller.set_chat_settings({'chat_id':'123@chatroom','memory':False,'reply':True}),
+                         {'memory':True, 'reply':True, 'notice':'还需在插件管理中开启“智能体”才会自动回复'})
+        self.assertEqual(self.controller.chats()[0]['reply'], True)
+        with self.assertRaises(ValueError):
+            self.controller.set_chat_settings({'chat_id':'../x', 'memory':True, 'reply':False})
         self.wait_stopped()
 
     def test_multi_account_requires_explicit_binding_and_stale_selection_rejected(self):

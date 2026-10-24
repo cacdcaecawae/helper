@@ -116,8 +116,8 @@ class TraceBufferTests(unittest.TestCase):
 class AgentPluginGateTests(unittest.TestCase):
     def setUp(self):
         self.plugin = Plugin()
-        self.plugin.members = SimpleNamespace(groups={"123@chatroom"}, account="wxid_bot")
-        self.plugin.friends = frozenset({"wxid_friend"})
+        # 聊天页开了“自动回复”的会话：一个群、一个私聊
+        self.plugin.members = SimpleNamespace(account="wxid_bot", replies=lambda chat: chat in {"123@chatroom", "wxid_friend"})
 
     def message(self, chat, text="你好", **data):
         return Message(text, chat, "wxid_x" if chat.endswith("@chatroom") else chat,
@@ -128,7 +128,7 @@ class AgentPluginGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "history_enabled"):
             Plugin().on_load(ctx)
 
-    def test_only_real_mentions_in_configured_groups_and_whitelisted_friends(self):
+    def test_only_real_mentions_and_private_messages_in_chats_with_auto_reply(self):
         mention = {"is_at_self": True, "at_members": ["wxid_bot"]}
         self.assertTrue(self.plugin._wanted(self.message("123@chatroom", **mention)))
         self.assertTrue(self.plugin._wanted(self.message("wxid_friend")))
@@ -143,7 +143,13 @@ class FakeTimeline:
 
     def __init__(self):
         self.lines, self.compacted, self.summary, self.upto = [], [], "", 0
-        self.groups, self.account = {"123@chatroom"}, "wxid_bot"
+        self.account = "wxid_bot"
+
+    def remembers(self, chat):
+        return chat in ("123@chatroom", "wxid_friend")
+
+    def replies(self, chat):
+        return chat == "wxid_friend"
 
     def add(self, name, text):
         self.lines.append({"id": len(self.lines) + 1, "at": "2026-10-23T06:00:00+00:00", "name": name, "text": text})
@@ -168,7 +174,7 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.timeline = FakeTimeline()
         self.plugin = Plugin()
         self.plugin.members = self.timeline
-        self.plugin.friends, self.plugin.tools, self.plugin.image = frozenset({"wxid_friend"}), frozenset(), None
+        self.plugin.tools, self.plugin.image = frozenset(), None
         self.sent, self.llm = [], ScriptedLLM({"reply": "推荐《星际穿越》。\n\n周末看正合适。"}, {"reply": "讲的是穿越虫洞找新家园。"})
         self.summarizer = SimpleNamespace(calls=[], complete_json=lambda system, user: self.summarizer.calls.append(
             json.loads(user)) or {"summary": "较早的聊天"}, provider="openai_compatible")

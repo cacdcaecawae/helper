@@ -77,12 +77,36 @@ class MemberTests(unittest.TestCase):
         self.assertFalse(reopened.compact_memory(ROOM, "清空后不能写回", rest[-1]["id"]))
         self.assertEqual(reopened.memory(ROOM), ("", []))
 
-    def test_whitelisted_private_chat_and_spoken_replies_are_recorded(self):
+    def test_chat_switches_persist_and_control_recording(self):
         friend = "wxid_friend"
         private = lambda text, sequence, chat=friend, **kwargs: Message(text, chat, chat, session_id="first",
                                                                          sequence=sequence, **kwargs)
-        self.assertFalse(self.store.record(private("没登记的私聊不记", 1)))
-        self.store.track_private({friend})
+        self.assertFalse(self.store.record(private("默认只接收，不记录", 1)))
+        self.assertEqual(self.store.chat_setting(friend), {"memory": False, "reply": False})
+        # 开自动回复会一并开长期记忆；重启后仍在
+        self.assertEqual(self.store.set_chat(friend, memory=False, reply=True), {"memory": True, "reply": True})
+        self.assertEqual(self.create_store().chat_setting(friend), {"memory": True, "reply": True})
+        # 配置里的群默认记录；聊天页关掉后以开关为准
+        self.assertTrue(self.store.remembers(ROOM))
+        self.store.set_chat(ROOM, memory=False, reply=False)
+        reopened = self.create_store()
+        reopened.initialize()
+        self.assertFalse(reopened.remembers(ROOM))
+        self.assertFalse(reopened.record(self.message("关了记忆就不记", sequence=9)))
+        new_group = "87654321@chatroom"  # 不在配置里的群，打开开关后当场就能艾特取到当前消息
+        self.store.set_chat(new_group, memory=True, reply=True)
+        message = Message("@小雪 你好", new_group, sender_id=SMALL, is_group=True, sequence=10, session_id="first")
+        self.assertTrue(self.store.record(message))
+        self.assertEqual(self.store.conversation_snapshot(message).current, "@小雪 你好")
+        for value in (None, "yes"):
+            with self.subTest(value=value), self.assertRaises(MemberError):
+                self.store.set_chat(friend, memory=value, reply=False)
+
+    def test_private_chat_and_spoken_replies_are_recorded(self):
+        friend = "wxid_friend"
+        private = lambda text, sequence, chat=friend, **kwargs: Message(text, chat, chat, session_id="first",
+                                                                         sequence=sequence, **kwargs)
+        self.store.set_chat(friend, memory=True, reply=False)
         self.assertTrue(self.store.record(private("推荐本书", 2, data={"sender_wechat_name": "小王"})))
         self.assertTrue(self.store.record_spoken(private("推荐本书", 2), "推荐《白夜行》"))  # 语音回复没有文字回传，补记
         self.assertEqual([(line["name"], line["text"]) for line in self.store.memory(friend)[1]],

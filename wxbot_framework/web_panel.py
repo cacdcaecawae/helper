@@ -442,7 +442,24 @@ class PanelController:
                     self.store.set_enabled(name, action == 'enable')
 
     def chats(self):
-        return self._call(lambda app: app.backend.chats() if app.backend and hasattr(app.backend, 'chats') else [])
+        def query(app):
+            rows = app.backend.chats() if app.backend and hasattr(app.backend, 'chats') else []
+            members = getattr(app, 'members', None)  # 每个会话带上聊天页的两个开关
+            return [dict(row, **members.chat_setting(row['chat_id'])) if members else dict(row) for row in rows]
+        return self._call(query)
+
+    def set_chat_settings(self, data):
+        """聊天页顶部的“长期记忆”“自动回复”开关；运行中立即生效，不用停机。"""
+        chat = validate_target(data.get('chat_id'))
+        def apply(app):
+            members = getattr(app, 'members', None)
+            if members is None:
+                raise PanelError('请先在主配置设置 members_config_file')
+            setting = members.set_chat(chat, memory=data.get('memory'), reply=data.get('reply'))
+            if setting['reply'] and not (app.plugins.is_active('agent_chat') or app.plugins.is_active('mention_chat')):
+                setting['notice'] = '还需在插件管理中开启“智能体”才会自动回复'
+            return setting
+        return self._call(apply)
 
     def group_members(self, room):
         from .group_management import validate_group_id
@@ -618,6 +635,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                     return self.send(200, controller.send_text(data))
                 if path == '/api/llm-models':
                     return self.send(200, controller.llm_models(data))
+                if path == '/api/chat-settings':
+                    return self.send(200, controller.set_chat_settings(data))
                 actions = {'/api/start': lambda: controller.start(), '/api/stop': lambda: controller.stop(),
                     '/api/restart': lambda: controller.restart(),
                     '/api/account': lambda: controller.bind_account(data),

@@ -132,6 +132,7 @@ class RobotProxy:
     def save_configuration(self, data): return self.request('config', data)
     def plugin_action(self, data): return self.request('plugin', data)
     def llm_models(self, data): return self.request('llm-models', data)
+    def set_chat_settings(self, data): return self.request('chat-settings', data)
 
 
 class RobotHub:

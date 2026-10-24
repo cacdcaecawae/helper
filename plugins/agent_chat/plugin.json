@@ -1,7 +1,7 @@
 {
   "api": "v1",
   "default_enabled": false,
-  "description": "智能体：群里艾特或白名单好友私聊时，可画图、查本群记录、联网搜索后回复；过程显示在聊天页",
+  "description": "智能体：在聊天页给会话打开“自动回复”后，群里被艾特或私聊时，可画图、查聊天记录、联网搜索后回复；过程显示在聊天页",
   "message_types": [1],
   "requires": ["text.receive", "text.send", "group.text.receive", "group.text.send", "group.text.mention", "image.send"]
 }

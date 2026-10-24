@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .account import validate_account
 from .config import validate_name
-from .text import validate_mentions
+from .text import validate_mentions, validate_target
 
 
 class MemberError(ValueError):
@@ -101,8 +101,9 @@ class MemberStore:
             raise MemberError("daily_clear 必须是布尔值")
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._active_day = None
+        # 记录哪些会话：配置里的群默认记录；聊天页的开关（chat_settings 表）优先，打开数据库时读入。
         self.groups = set(options["groups"])
-        self.private_chats = frozenset()  # 智能体私聊白名单，由插件 track_private 登记后才记录
+        self.private_chats, self.reply_chats = set(), set()
         self.profiles = []
         for room, profiles in options["groups"].items():
             validate_mentions(room, [self.account])
@@ -190,6 +191,9 @@ class MemberStore:
                     account TEXT NOT NULL, room TEXT NOT NULL, voice_id TEXT NOT NULL,
                     name TEXT NOT NULL, enabled INTEGER NOT NULL, generation INTEGER NOT NULL,
                     PRIMARY KEY(account,room));
+                CREATE TABLE IF NOT EXISTS chat_settings (
+                    account TEXT NOT NULL, chat TEXT NOT NULL, memory INTEGER NOT NULL, reply INTEGER NOT NULL,
+                    PRIMARY KEY(account,chat));
                 CREATE TABLE IF NOT EXISTS agent_summaries (
                     account TEXT NOT NULL, chat TEXT NOT NULL, summary TEXT NOT NULL, upto INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(account,chat));
@@ -201,6 +205,8 @@ class MemberStore:
                 db.execute("ALTER TABLE messages ADD COLUMN bot_generated INTEGER NOT NULL DEFAULT 0")
             if "upto" not in {row["name"] for row in db.execute("PRAGMA table_info(agent_summaries)")}:
                 db.execute("ALTER TABLE agent_summaries ADD COLUMN upto INTEGER NOT NULL DEFAULT 0")
+            for row in db.execute("SELECT chat,memory,reply FROM chat_settings WHERE account=?", (self.account,)):
+                self._apply_setting(row["chat"], bool(row["memory"]), bool(row["reply"]))
             with db:
                 for room, key, name, display, wxid, aliases in self.profiles:
                     existing = db.execute("SELECT wxid FROM people WHERE account=? AND room=? AND person_key=?",
@@ -569,14 +575,49 @@ class MemberStore:
                 db.execute("INSERT OR IGNORE INTO aliases VALUES(?,?,?,?)", (self.account, room, alias, key))
             return self._member(self._row(name, room))
 
-    def track_private(self, chats):
-        self.private_chats = frozenset(chats)
+    def _settings(self):
+        if self._db is None:  # 开关存在库里，打开数据库时读入
+            with self._lock:
+                self._connection()
 
-    def _tracked(self, chat):
-        return chat in self.groups if chat.endswith("@chatroom") else chat in self.private_chats
+    def remembers(self, chat):
+        """这个会话是否记录（长期记忆）。"""
+        self._settings()
+        return chat in (self.groups if chat.endswith("@chatroom") else self.private_chats)
+
+    def replies(self, chat):
+        """这个会话是否自动回复（群里被艾特时、私聊每条）。"""
+        self._settings()
+        return chat in self.reply_chats
+
+    def chat_setting(self, chat):
+        return {"memory": self.remembers(chat), "reply": self.replies(chat)}
+
+    def _apply_setting(self, chat, memory, reply):
+        target = self.groups if chat.endswith("@chatroom") else self.private_chats
+        (target.add if memory else target.discard)(chat)
+        (self.reply_chats.add if reply else self.reply_chats.discard)(chat)
+
+    def set_chat(self, chat, *, memory, reply):
+        """聊天页的两个开关，立即生效、重启后仍在。自动回复离不开记录：开自动回复会一并开长期记忆；
+        页面关长期记忆时会同时关自动回复。"""
+        validate_target(chat)
+        if type(memory) is not bool or type(reply) is not bool:
+            raise MemberError("开关应为 true 或 false")
+        memory = memory or reply
+        if memory and not self.history_enabled:
+            raise MemberError("请先在群聊配置中开启“记录当天文字”")
+        with self._lock, self._connection() as db:
+            db.execute("""INSERT INTO chat_settings VALUES(?,?,?,?) ON CONFLICT(account,chat)
+                DO UPDATE SET memory=excluded.memory,reply=excluded.reply""", (self.account, chat, int(memory), int(reply)))
+            if memory and chat.endswith("@chatroom"):  # 新开记录的群也要有当天缓冲，艾特时才能取到当前消息
+                db.execute("INSERT OR IGNORE INTO chat_buffers(account,room,local_day) VALUES(?,?,?)",
+                           (self.account, chat, self._day_bounds()[0]))
+            self._apply_setting(chat, memory, reply)
+        return self.chat_setting(chat)
 
     def record(self, message):
-        if not self.history_enabled or message.type != 1 or not self._tracked(message.chat_id) \
+        if not self.history_enabled or message.type != 1 or not self.remembers(message.chat_id) \
                 or message.is_group != message.chat_id.endswith("@chatroom"):
             return False
         if message.data.get("self_wxid", self.account) != self.account:
@@ -653,7 +694,7 @@ class MemberStore:
 
     def record_spoken(self, message, text):
         """语音回复没有文字回传；补记机器人说的话，聊天记录（也就是智能体的记忆）里才有。sequence 为 0，不与原生消息冲突。"""
-        if not self.history_enabled or not self._tracked(message.chat_id):
+        if not self.history_enabled or not self.remembers(message.chat_id):
             return False
         with self._lock, self._connection() as db:
             self.rollover()
@@ -682,8 +723,8 @@ class MemberStore:
     def search(self, room, keyword=None, *, date=None, name=None, limit=20):
         """在本群（或白名单私聊）保存的聊天原文里查找，关键词、日期（北京时间 YYYY-MM-DD）、发言人称呼可任意组合，
         至少给一项；发言人填“你”查本账号说过的话。返回符合条件的最近 limit 条，按时间顺序。"""
-        if not self._tracked(room):
-            raise MemberError("这个会话尚未启用聊天记录")
+        if not self.remembers(room):
+            raise MemberError("这个会话没有开启长期记忆")
         if keyword is None and date is None and name is None:
             raise MemberError("至少需要关键词、日期或发言人之一")
         sql, values = " FROM messages WHERE account=? AND room=?", [self.account, room]

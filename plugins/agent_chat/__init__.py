@@ -1,8 +1,9 @@
-"""智能体对话：群里真实艾特机器人，或白名单好友私聊时，按需调用工具后回复。
+"""智能体对话：开了“自动回复”的会话里，群聊被真实艾特、私聊收到消息时，按需调用工具后回复。
 
 开启后代替“艾特对话”；每一步思考和工具调用都推送到管理台聊天页。
+哪些会话记录、哪些自动回复，由聊天页顶部每个会话的“长期记忆”“自动回复”两个开关决定。
 记忆就是这个群或私聊的完整聊天记录（所有人＋机器人自己说的），太长时把较早部分压成摘要，原文都保留可查。
-插件选项：private_friends 私聊白名单（微信 ID 列表）；tools 可用工具；image_server 本机画图服务地址。
+插件选项：tools 可用工具；image_server 本机画图服务地址。
 """
 import json
 from pathlib import Path
@@ -39,27 +40,24 @@ class Plugin:
         self.members = ctx.members
         if not self.members.history_enabled:  # 记忆就是保存的聊天记录，关掉记录就什么都记不住
             raise ValueError("智能体需要成员配置 history_enabled: true")
-        friends, tools = ctx.config.get("private_friends", []), ctx.config.get("tools", list(TOOLS))
-        if not isinstance(friends, list) or len(friends) > 1000 or not all(isinstance(f, str) and f for f in friends):
-            raise ValueError("private_friends 应为微信 ID 列表")
+        tools = ctx.config.get("tools", list(TOOLS))
         if not isinstance(tools, list) or not set(tools) <= set(TOOLS):
             raise ValueError("tools 只能包含 " + "、".join(TOOLS))
-        self.friends, self.tools = frozenset(friends), frozenset(tools)
-        self.members.track_private(self.friends)  # 白名单好友的私聊也记进聊天记录
+        self.tools = frozenset(tools)
         self.image = ImageServer(ctx.config.get("image_server", "http://127.0.0.1:7860")) if "draw_image" in tools else None
         ctx.llm  # 启动时核对配置，不请求接口。
 
     def _wanted(self, message):
-        if message.type != 1 or message.is_self or message.data.get("bot_generated"):
+        # 只回开了“自动回复”的会话：私聊每条都回，群里真实艾特机器人才回。
+        if (message.type != 1 or message.is_self or message.data.get("bot_generated") or
+                not self.members.replies(message.chat_id)):
             return False
-        if not message.is_group:
-            return message.chat_id in self.friends
-        return (message.chat_id in self.members.groups and "WXBOT_AT_CHAT_PROBE" not in message.text and
-                bool(message.data.get("is_at_self")) and self.members.account in message.data.get("at_members", ()))
+        return not message.is_group or ("WXBOT_AT_CHAT_PROBE" not in message.text and bool(message.data.get("is_at_self"))
+                                         and self.members.account in message.data.get("at_members", ()))
 
     def on_message(self, message, ctx):
         # 每来一条消息都看看记忆是否超长（不只在艾特时），艾特时拼出的材料就不会超过上限。
-        if message.type == 1 and (message.chat_id in self.members.groups or message.chat_id in self.friends):
+        if message.type == 1 and self.members.remembers(message.chat_id):
             self._compact(message.chat_id, ctx)
         if not self._wanted(message):
             return
