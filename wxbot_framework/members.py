@@ -254,10 +254,7 @@ class MemberStore:
                     if self.daily_clear:
                         db.execute("DELETE FROM messages WHERE account=? AND room=? AND received_at<?",
                                    (self.account, room, start))
-                # 智能体对话记忆和聊天记录同一规则：开启每日清理时一起清。
-                if self.daily_clear:
-                    db.execute("DELETE FROM agent_turns WHERE account=? AND at<?", (self.account, start))
-                    db.execute("DELETE FROM agent_summaries WHERE account=?", (self.account,))  # 摘要只含今天之前的内容
+                # 智能体记忆是长期的，不随每日清理删除；只有本群 /清空 会清。
             self._active_day = day
             return True
 
@@ -637,8 +634,8 @@ class MemberStore:
 
     def compact_agent_memory(self, chat, summary, upto):
         """摘要从此代替 id<=upto 的问答给模型看；原文保留，供 search_agent_memory 查找。
-        期间被 /清空 或跨天清理过（upto 已不在）就放弃，不把清掉的内容写回。"""
-        # ponytail: 原文只在 /清空 或每日清理时删除，不开每日清理会一直增长（每轮几百字）；真占地方再加保留天数。
+        期间被 /清空 过（upto 已不在）就放弃，不把清掉的内容写回。"""
+        # ponytail: 原文只在本群 /清空 时删除，会一直增长（每轮几百字，活跃群一年几十 MB）；真占地方再加保留天数。
         with self._lock, self._connection() as db:
             if not db.execute("SELECT 1 FROM agent_turns WHERE account=? AND chat=? AND id=?",
                               (self.account, chat, upto)).fetchone():
