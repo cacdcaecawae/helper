@@ -105,6 +105,17 @@ class MemberTests(unittest.TestCase):
             with self.subTest(criteria=criteria), self.assertRaises(MemberError):
                 store.search(ROOM, **criteria)
 
+    def test_everyone_snapshot_is_the_recent_group_chat(self):
+        self.store.record(self.message("周末去哪玩", sender=SMALL, sequence=1))
+        self.store.record(self.message("/总结群聊", sender=SMALL, sequence=2))  # 命令不算聊天
+        self.store.record(self.message("推荐《白日梦想家》", sender=ROBOT, sequence=3, is_self=True, data={"bot_generated": True}))
+        current = self.message("@小雪 你觉得呢", sequence=4)
+        self.store.record(current)
+        self.store.record(self.message("后来的消息", sender=SMALL, sequence=5))
+        everyone = self.store.conversation_snapshot(current, everyone=True).messages
+        self.assertEqual([(row["name"], row["text"]) for row in everyone], [("成员甲昵称", "周末去哪玩"), ("你", "推荐《白日梦想家》")])
+        self.assertEqual(self.store.conversation_snapshot(current).messages, ())  # 默认仍只取本人的（艾特对话不变）
+
     def test_search_finds_speaker_by_group_nickname(self):
         self.store.remember_group_nickname("wxid_wang", ROOM, "群里小王")
         self.store.record(self.message("周末加班", sender="wxid_wang", sequence=1))

@@ -386,8 +386,9 @@ class MemberStore:
                 raise PersonalityExpired("人格已切换")
             yield
 
-    def conversation_snapshot(self, message):
-        """当前发言者在本群、当前消息之前的 10 条有效文本，不混入后来消息。"""
+    def conversation_snapshot(self, message, *, everyone=False):
+        """当前消息之前的本群有效文本，不混入后来消息。默认取当前发言者今天的 10 条（艾特对话用）；
+        everyone=True 取群里所有人最近 30 条，含本账号自己发的（name 为“你”），不限当天（智能体用）。"""
         from .summary import CONTROL
         if message.chat_id not in self.groups:
             raise MemberError("这个群尚未启用聊天记录")
@@ -401,15 +402,22 @@ class MemberStore:
                 message.session_id, message.sequence, message.text, start, end)).fetchone()
             if current is None:
                 raise SnapshotExpired("当前消息已被清空或已跨天")
-            cursor = db.execute("""SELECT * FROM messages WHERE account=? AND room=? AND sender_id=?
-                AND id<? AND received_at>=? AND received_at<? AND bot_generated=0 ORDER BY id DESC""",
-                (self.account, message.chat_id, message.sender_id, current[0], start, end))
+            if everyone:
+                cursor, limit = db.execute("SELECT * FROM messages WHERE account=? AND room=? AND id<? ORDER BY id DESC",
+                                           (self.account, message.chat_id, current[0])), 30
+            else:
+                cursor, limit = db.execute("""SELECT * FROM messages WHERE account=? AND room=? AND sender_id=?
+                    AND id<? AND received_at>=? AND received_at<? AND bot_generated=0 ORDER BY id DESC""",
+                    (self.account, message.chat_id, message.sender_id, current[0], start, end)), 10
             previous = []
             for row in cursor:
                 text = row["text"].strip()
                 if text and "WXBOT_AT_CHAT_PROBE" not in text and text.split(maxsplit=1)[0] not in CONTROL:
-                    previous.append(dict(row))
-                    if len(previous) == 10:
+                    item = dict(row)
+                    if everyone:
+                        item["name"] = "你" if row["is_self"] else self.display_name(row["sender_id"], message.chat_id) or "群友"
+                    previous.append(item)
+                    if len(previous) == limit:
                         break
             member = self.find_by_wxid(message.sender_id, message.chat_id)
             state = db.execute("SELECT generation FROM chat_buffers WHERE account=? AND room=?",

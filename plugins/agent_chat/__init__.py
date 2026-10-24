@@ -68,17 +68,20 @@ class Plugin:
         personality = ctx.personality(message)
         guard = lambda: ctx.personality_guard(personality)
         try:
+            # 材料三块：长期记忆（摘要＋全群和你的问答）、眼前的群聊（最近 30 条，所有人）、这次的话。
             if message.is_group:
-                snapshot = self.members.conversation_snapshot(message)
+                snapshot = self.members.conversation_snapshot(message, everyone=True)
                 guard = lambda: ctx.response_guard(snapshot, personality)
-                context = {"scene": "群聊", "name": snapshot.speaker_name, "current": strip_at_labels(snapshot.current),
-                           "previous": [strip_at_labels(row["text"]) for row in snapshot.messages]}
+                context = {"scene": "群聊", "name": snapshot.speaker_name}
             else:
-                context = {"scene": "私聊", "name": message.data.get("sender_wechat_name") or "对方", "current": message.text}
+                context = {"scene": "私聊", "name": message.data.get("sender_wechat_name") or "对方"}
             sender = message.sender_id or message.chat_id
-            # 一个群共用一份记忆：群里谁问过什么、你答了什么都在，按提问人区分。
             context["summary"], turns = self.members.agent_memory(message.chat_id)
             context["history"] = history(turns)
+            if message.is_group:
+                context["recent"] = [f"{beijing_time(row['received_at'])} {row['name']}：{strip_at_labels(row['text'])[:300]}"
+                                     for row in snapshot.messages]
+            context["current"] = strip_at_labels(snapshot.current) if message.is_group else message.text
             trace("start", context["current"][:300])
             reply = Agent(ctx.llm_for(message, personality=personality),
                           self._toolbox(message, ctx, guard, compacted=bool(context["summary"])), trace).run(context)
