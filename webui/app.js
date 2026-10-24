@@ -415,6 +415,19 @@ function chatAvatar(name){
   let color=0;for(const c of String(name))color=(color+c.codePointAt(0))%6;
   return `<span class="hc-avatar hc-color-${color}" aria-hidden="true">${escape([...String(name||'聊')][0])}</span>`;
 }
+const shortChatId=id=>String(id||'').replace(/@chatroom$/,'');
+let chatNamesAt=0;
+async function refreshChatNames(){
+  // 只合并名字，不动发送状态；10 秒内最多一次。
+  if(Date.now()-chatNamesAt<10000)return;
+  chatNamesAt=Date.now();const requested=robot;
+  try{
+    const {chats}=await api('chats',undefined,requested);if(requested!==robot)return;
+    const known=new Map(chatRows.map(row=>[row.chat_id,row]));
+    for(const chat of chats)known.set(chat.chat_id,{...known.get(chat.chat_id),...chat});
+    chatRows=[...known.values()];chatListMarkup='';chatTimelineSignature='';renderChatWorkspace();
+  }catch{}
+}
 function renderChatWorkspace(){
   if(!$('#chat-conversations'))return;
   const connected=!!state?.connected&&serviceAvailable;
@@ -429,15 +442,16 @@ function renderChatWorkspace(){
     if(!all.has(message.chat_id))all.set(message.chat_id,{chat_id:message.chat_id,name:message.chat_name||message.chat_id});
     all.get(message.chat_id).last=message;
   }
+  if(connected&&[...all.values()].some(row=>!row.name||row.name===row.chat_id))refreshChatNames();
   const selected=$('#send-chat').value,query=$('#chat-filter').value.trim().toLowerCase();
   const rows=[...all.values()].filter(row=>!query||[row.name,row.chat_id,row.last?.content].some(v=>String(v||'').toLowerCase().includes(query)));
   rows.sort((a,b)=>(b.last?.id||0)-(a.last?.id||0));
   const listMarkup=rows.map(row=>{
-    const name=row.name||row.chat_id,last=row.last;
+    const name=row.name&&row.name!==row.chat_id?row.name:shortChatId(row.chat_id),last=row.last;
     return `<button type="button" class="hc-session ${row.chat_id===selected?'selected':''}" data-chat="${escape(row.chat_id)}" aria-label="打开会话 ${escape(name)}" ${pendingSend?'disabled':''}>${chatAvatar(name)}<span class="hc-session-info"><span class="hc-session-row"><strong>${escape(name)}</strong><time>${escape(last?.time||'')}</time></span><span class="hc-preview">${escape(last?.content||'暂无本次连接的消息')}</span></span></button>`;
   }).join('')||`<p class="hc-empty-list">${query?'没有匹配的会话':connected?'等待消息，或刷新会话':'先在账号管理中启动一个账号'}</p>`;
   if(listMarkup!==chatListMarkup){chatListMarkup=listMarkup;$('#chat-conversations').innerHTML=listMarkup;}
-  const row=all.get(selected),name=row?.name||selected;
+  const row=all.get(selected),name=row?.name&&row.name!==selected?row.name:shortChatId(selected);
   $('#chat-heading').textContent=name||'';
   $('#chat-mention-toggle').classList.toggle('hidden',!selected.endsWith('@chatroom'));
   $('#chat-mention-toggle').textContent='@'+(mentionSelection.size?' '+mentionSelection.size:'');
@@ -471,6 +485,25 @@ $('#chat-timeline').addEventListener('toggle',event=>{
   if(event.target.open)openAgentRuns.add(run);else openAgentRuns.delete(run);
 },true);
 $('#chat-filter').oninput=renderChatWorkspace;
+// 会话栏右缘可拖动调宽（200–480px），双击恢复默认；宽度只记在本机浏览器。
+(()=>{
+  const layout=$('.hc-layout'),handle=$('.hc-resizer');if(!layout||!handle)return;
+  const set=width=>{width=Math.round(Math.max(200,Math.min(480,width)));layout.style.setProperty('--hc-list-width',width+'px');handle.setAttribute('aria-valuenow',width);return width;};
+  const save=width=>{try{width?localStorage.setItem('helper-chat-list-width',width):localStorage.removeItem('helper-chat-list-width');}catch{}};
+  try{const saved=Number(localStorage.getItem('helper-chat-list-width'));if(saved)set(saved);}catch{}
+  handle.addEventListener('pointerdown',event=>{
+    event.preventDefault();handle.setPointerCapture(event.pointerId);document.body.classList.add('resizing');
+    const left=layout.getBoundingClientRect().left;let width=0;
+    const move=moveEvent=>{width=set(moveEvent.clientX-left);};
+    const end=()=>{handle.removeEventListener('pointermove',move);handle.removeEventListener('pointerup',end);handle.removeEventListener('pointercancel',end);document.body.classList.remove('resizing');if(width)save(width);};
+    handle.addEventListener('pointermove',move);handle.addEventListener('pointerup',end);handle.addEventListener('pointercancel',end);
+  });
+  handle.addEventListener('keydown',event=>{
+    const step={ArrowLeft:-16,ArrowRight:16}[event.key];if(!step)return;event.preventDefault();
+    save(set($('.hc-list').getBoundingClientRect().width+step));
+  });
+  handle.addEventListener('dblclick',()=>{layout.style.removeProperty('--hc-list-width');handle.removeAttribute('aria-valuenow');save(0);});
+})();
 $('#chat-refresh').onclick=()=>{if(!$('#refresh-send-chats').disabled)loadSendChats();};
 $('#chat-conversations').onclick=event=>{
   const button=event.target.closest('[data-chat]');if(!button||pendingSend)return;

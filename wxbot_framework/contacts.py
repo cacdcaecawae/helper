@@ -4,6 +4,7 @@ from __future__ import annotations
 import struct
 
 from .account import APP_GLOBAL_RVA, _pointer, read_current_account, validate_account
+from .text import validate_target
 from .native_profiles import select_memory_profile
 
 CACHE_PROVIDER_GETTER_RVA = 0x36C7B0
@@ -11,12 +12,17 @@ CACHE_PROVIDER_VTABLE_RVA = 0x8F9BF98
 CONTACT_CACHE_VTABLE_RVA = 0x8FA2538
 
 
-def read_contact_name(read_memory, core_base, wxid, *, expected_account=None):
-    """按实际成员 ID 读取微信名。缺失、切换、重建缓存时返回 None，不猜名字。
+def read_contact_name(read_memory, core_base, wxid, *, expected_account=None, group=False):
+    """按实际成员 ID 读取微信名；group=True 时按群 ID 读取群名。缺失、切换、重建缓存时返回 None，不猜名字。
 
     仅遍历已核对的缓存对象，不调用微信函数、不扫描整个进程、不读取群昵称或备注。
     """
-    validate_account(wxid)
+    if group:
+        validate_target(wxid)
+        if not wxid.endswith("@chatroom"):
+            raise ValueError("群名读取需要群 ID")
+    else:
+        validate_account(wxid)
     account = read_current_account(read_memory, core_base)
     if not account or (expected_account is not None and account != expected_account):
         return None

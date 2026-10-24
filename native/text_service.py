@@ -270,6 +270,25 @@ class NativeTextService(NativeFileHelperService):
             name = profile["name"] if profile and profile["wxid"] == wxid else None
         return name
 
+    def _chat_name(self, chat):
+        """私聊取好友微信名、群聊取群名；读不到（未命名群、公众号、缓存不符）时返回 None。"""
+        if self._channel is None:
+            return None
+        try:
+            if chat.endswith("@chatroom"):
+                return read_contact_name(self._channel.read_memory, self._channel.core_base, chat,
+                                         expected_account=self.self_wxid, group=True)
+            return self._sender_wechat_name(chat)
+        except ValueError:
+            return None
+
+    def _remember_chat(self, chat, group):
+        entry = self.chats.setdefault(chat, {"chat_id": chat, "is_group": group})
+        if not entry.get("name"):
+            name = self._chat_name(chat)
+            if name:
+                entry["name"] = name
+
     def _map_message(self, message):
         if message.type == 37:
             return self._map_friend_request(message)
@@ -303,8 +322,7 @@ class NativeTextService(NativeFileHelperService):
                 data["dispatch_to_plugins"] = False
             elif data["is_at_self"]:
                 data["dispatch_to_plugins"] = True
-            self.chats[data["chat_id"]] = {"chat_id": data["chat_id"],
-                                           "is_group": bool(data["room_wxid"])}
+            self._remember_chat(data["chat_id"], bool(data["room_wxid"]))
             if message.type in (34, 43, 47, 62):
                 data['monitor_only'] = True
                 return data
@@ -377,7 +395,7 @@ class NativeTextService(NativeFileHelperService):
         group = chat.endswith('@chatroom')
         if not group and recall is None:
             return None
-        self.chats[chat] = {"chat_id": chat, "is_group": group}
+        self._remember_chat(chat, group)
         data = {"msg": "", "content": "", "system_content": content, "wx_type": message.type,
                 "chat_id": chat, "room_wxid": chat if group else "", "sender_id": "",
                 "native_sender": sender, "native_receiver": receiver,
@@ -472,7 +490,7 @@ class NativeTextService(NativeFileHelperService):
             if self.last_result.get("success") is not True:
                 raise RuntimeError("微信未确认创建群聊，请检查返回状态")
             room = validate_group_id(self.last_result.get("report", {}).get("room_id"))
-            self.chats[room] = {"chat_id": room, "is_group": True}
+            self._remember_chat(room, True)
             return room
 
     def send_text(self, to_wxid, content):

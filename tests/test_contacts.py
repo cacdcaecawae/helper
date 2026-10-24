@@ -13,7 +13,7 @@ PROVIDER, HEAD, NODE, CACHE, SENTINEL, BUCKETS, ENTRY, CONTACT, STRINGS = [
 
 
 class ContactMemory(AccountMemory):
-    def __init__(self, name='DemoUser'):
+    def __init__(self, name='DemoUser', peer=PEER):
         super().__init__()
         self.add(BASE + CONTEXT_VTABLE_RVA, 0x80)
         self.write(BASE + CONTEXT_VTABLE_RVA + 0x18, struct.pack('<Q', BASE + IDENTITY_GETTER_RVA))
@@ -37,14 +37,14 @@ class ContactMemory(AccountMemory):
         self.q(CACHE + 0xE0, BUCKETS)
         self.q(CACHE + 0xF8, 1)
         hashed = 0xCBF29CE484222325
-        for byte in PEER.encode():
+        for byte in peer.encode():
             hashed = ((hashed ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
         for slot in (0, 16):
             self.write(BUCKETS + slot, struct.pack('<QQ', SENTINEL, SENTINEL))
         self.write(BUCKETS + (hashed & 1) * 16, struct.pack('<QQ', ENTRY, ENTRY))
         self.q(ENTRY + 0x30, CONTACT)
-        self.s(ENTRY + 0x10, PEER, STRINGS)
-        self.s(CONTACT + 8, PEER, STRINGS + 128)
+        self.s(ENTRY + 0x10, peer, STRINGS)
+        self.s(CONTACT + 8, peer, STRINGS + 128)
         self.s(CONTACT + 0xD8, name, STRINGS + 256)
 
     def q(self, address, value):
@@ -64,6 +64,14 @@ class ContactTests(unittest.TestCase):
         for name in ('DemoUser', '微信原始名字🌸很长'):
             ram = ContactMemory(name)
             self.assertEqual(read_contact_name(ram.read, BASE, PEER, expected_account=SELF), name)
+
+    def test_group_name_is_read_only_when_asked_for_a_group(self):
+        ram = ContactMemory('课题组', peer='12345678@chatroom')
+        self.assertEqual(read_contact_name(ram.read, BASE, '12345678@chatroom', expected_account=SELF, group=True), '课题组')
+        with self.assertRaises(ValueError):
+            read_contact_name(ram.read, BASE, '12345678@chatroom', expected_account=SELF)
+        with self.assertRaises(ValueError):
+            read_contact_name(ram.read, BASE, PEER, expected_account=SELF, group=True)
 
     def test_other_account_and_unknown_member_never_get_someone_elses_name(self):
         ram = ContactMemory()
