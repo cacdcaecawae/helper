@@ -94,3 +94,26 @@ static uintptr_t core_address(uintptr_t base, uintptr_t legacy) {
     const auto rva = core_rva(legacy);
     return rva ? base + rva : 0;
 }
+
+// These quote targets have only been verified in the exact .56 fingerprint.
+// Do not invent .13 aliases or fall back to a raw RVA on another profile.
+enum class Core56Target {
+    QuoteReferenceVtable, LookupMessage, MaterializeReference,
+    BuildQuote, DestroyReference, DestroyTyped
+};
+static uintptr_t core56_rva(Core56Target target) {
+    if (InterlockedCompareExchange(&core_profile_id, 0, 0) != 2) return 0;
+    switch (target) {
+        case Core56Target::QuoteReferenceVtable: return 0x8f704b8;
+        case Core56Target::LookupMessage: return 0x17da070;
+        case Core56Target::MaterializeReference: return 0x183b690;
+        case Core56Target::BuildQuote: return 0x3a1b050;
+        case Core56Target::DestroyReference: return 0x1b64f0;
+        case Core56Target::DestroyTyped: return 0x1cc640;
+        default: return 0;
+    }
+}
+static uintptr_t core56_address(uintptr_t base, Core56Target target) {
+    const auto rva = core56_rva(target);
+    return rva ? base + rva : 0;
+}

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -171,7 +172,16 @@ class BridgeMutexTests(unittest.TestCase):
             # 只结束本测试创建、未连接微信的子进程，模拟强制退出后的占用锁释放。
             child.terminate()
             child.wait(timeout=5)
-            guard = BridgeGuard(os.getpid())
+            # 进程退出通知可能略早于内核交还互斥锁；有界等待清理完成，不放宽活跃占用检查。
+            deadline = time.monotonic() + 1
+            while True:
+                try:
+                    guard = BridgeGuard(os.getpid())
+                    break
+                except RuntimeError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.01)
             guard.close()
         finally:
             if child.poll() is None:

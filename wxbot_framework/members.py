@@ -6,7 +6,9 @@ import json
 import re
 import sqlite3
 import threading
+import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone, timedelta
@@ -15,6 +17,9 @@ from pathlib import Path
 from .account import validate_account
 from .config import validate_name
 from .text import validate_mentions, validate_target
+from .quotes import normalize_quote, quote_context_text
+from .recall import message_id as native_message_id
+from .message_identity import event_key, quote_token
 
 
 class MemberError(ValueError):
@@ -107,6 +112,8 @@ class MemberStore:
         self.groups = set(options["groups"])
         self.private_chats, self.reply_chats = set(), set()
         self._epochs = {}  # 每个会话清空过几次：生成中途清空了，旧回复就不发（重启后进行中的回复本来就不在）
+        self._quote_namespace = uuid.uuid4().hex
+        self._pending_send_ids = OrderedDict()  # 回传先于成功发送入库时，按发送序号暂存 ID，不按正文猜测。
         self.profiles = []
         for room, profiles in options["groups"].items():
             validate_mentions(room, [self.account])
@@ -173,6 +180,7 @@ class MemberStore:
                     text TEXT NOT NULL, received_at TEXT NOT NULL, session_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL, is_self INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS messages_by_member ON messages(account, room, sender_id, id);
+                CREATE INDEX IF NOT EXISTS messages_by_chat_id ON messages(account, room, id);
                 CREATE UNIQUE INDEX IF NOT EXISTS messages_by_sequence
                     ON messages(account, session_id, sequence) WHERE sequence > 0;
                 CREATE TABLE IF NOT EXISTS chat_buffers (
@@ -209,6 +217,13 @@ class MemberStore:
                 db.execute("ALTER TABLE messages ADD COLUMN bot_generated INTEGER NOT NULL DEFAULT 0")
             if "image" not in columns:  # 图片消息的原图路径（接收器保存的文件），文字消息为空
                 db.execute("ALTER TABLE messages ADD COLUMN image TEXT")
+            for column, definition in (
+                ('native_message_id', "TEXT NOT NULL DEFAULT ''"),
+                ('native_type', 'INTEGER NOT NULL DEFAULT 1'),
+                ('quote_json', "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in columns:
+                    db.execute(f'ALTER TABLE messages ADD COLUMN {column} {definition}')
             if "upto" not in {row["name"] for row in db.execute("PRAGMA table_info(agent_summaries)")}:
                 db.execute("ALTER TABLE agent_summaries ADD COLUMN upto INTEGER NOT NULL DEFAULT 0")
             if "cleared_at" not in {row["name"] for row in db.execute("PRAGMA table_info(chat_settings)")}:
@@ -294,6 +309,9 @@ class MemberStore:
                 (self.account, chat, int(setting["memory"]), int(setting["reply"]),
                  self._now().astimezone(timezone.utc).isoformat()))
         self._epochs[chat] = self._epochs.get(chat, 0) + 1
+        for key in tuple(self._pending_send_ids):
+            if key[0] == chat:
+                self._pending_send_ids.pop(key, None)
         return count
 
     def today_snapshot(self, name, room):
@@ -625,23 +643,71 @@ class MemberStore:
         self._settings()
         return sorted(self.groups | self.private_chats)
 
-    def chat_history(self, chat, *, before=None, limit=200):
+    def chat_history(self, chat, *, before=None, limit=200, include_boundary=False):
         """聊天页重开时显示的以前的聊天：开了长期记忆的会话最近 limit 条原文（含已压缩的），按时间顺序。
-        before 为 Unix 时间时只取它 2 秒之前的，和管理台本次已显示的消息接上而不重复。"""
+        before 为 Unix 时间；页面可包含边界，使用消息身份与实时记录去重，不丢弃时间窗口。"""
         if not self.remembers(chat):
             return []
-        sql, values = "SELECT id,sender_id,text,received_at,is_self FROM messages WHERE account=? AND room=?", [self.account, chat]
+        sql, values = "SELECT id,sender_id,text,received_at,is_self,native_message_id,native_type,quote_json,session_id,sequence FROM messages WHERE account=? AND room=?", [self.account, chat]
         if before is not None:
-            sql += " AND received_at<?"
-            values.append(datetime.fromtimestamp(before - 2, timezone.utc).isoformat())
+            sql += " AND received_at<=?" if include_boundary else " AND received_at<?"
+            values.append(datetime.fromtimestamp(before, timezone.utc).isoformat())
         with self._lock:
             rows = self._connection().execute(sql + " ORDER BY id DESC LIMIT ?", values + [limit]).fetchall()
             names = {}
             for row in rows:
                 if not row["is_self"] and row["sender_id"] not in names:
                     names[row["sender_id"]] = self.speaker_name(row["sender_id"], chat)
-            return [{"id": row["id"], "at": row["received_at"], "text": row["text"], "own": bool(row["is_self"]),
-                     "name": "我" if row["is_self"] else names[row["sender_id"]]} for row in reversed(rows)]
+            result = []
+            for row in reversed(rows):
+                item = {"id": row["id"], "at": row["received_at"], "text": row["text"], "own": bool(row["is_self"]),
+                        "quote_token": self._quote_token(chat, row),
+                        "name": "我" if row["is_self"] else names[row["sender_id"]]}
+                key = event_key(self.account, chat, row['session_id'], row['sequence'])
+                if key:
+                    item['event_keys'] = [key]
+                identifier = native_message_id(row['native_message_id'])
+                if identifier:
+                    item.update(message_id=identifier, sender_id=row['sender_id'])
+                quote = normalize_quote(row['quote_json'])
+                if quote is not None:
+                    item.update(quote=quote, native_type=49)
+                result.append(item)
+            return result
+
+    def _quote_token(self, chat, row):
+        # 必须在 _lock 内与取行/清空同步；不使用昵称或可能稍后补齐的服务器 ID。
+        return quote_token(self._quote_namespace, self._epochs.get(chat, 0), self.account, chat,
+                           row['id'], row['sender_id'], row['text'], row['received_at'])
+
+    def quote_source(self, chat, identifier):
+        """历史行号仅用于定位本项目原文，不当作微信消息 ID。"""
+        if not self.remembers(chat) or type(identifier) is not int or identifier <= 0:
+            return None
+        with self._lock:
+            row = self._connection().execute('''SELECT id,sender_id,text,received_at,native_message_id,native_type,quote_json
+                FROM messages WHERE account=? AND room=? AND id=?''', (self.account, chat, identifier)).fetchone()
+            if row is None or row['native_type'] != 1 or row['quote_json']:
+                return None
+            return {'id':'h'+str(row['id']), 'history':True, 'account':self.account,'chat_id':chat,
+                    'sender_id':row['sender_id'],'sender_name':self.speaker_name(row['sender_id'],chat),
+                    'content':row['text'],'timestamp':datetime.fromisoformat(row['received_at']).timestamp(),
+                    'message_id':native_message_id(row['native_message_id']), 'type':1,
+                    'quote_token':self._quote_token(chat, row)}
+
+    def attach_quote_id(self, chat, identifier, source, verified_id):
+        verified_id = native_message_id(verified_id)
+        if not verified_id:
+            return False
+        with self._lock, self._connection() as db:
+            current = self.quote_source(chat, identifier)
+            if current is None or any(current.get(k) != source.get(k) for k in ('quote_token','sender_id','content','timestamp')):
+                return False
+            if current['message_id'] not in ('', verified_id):
+                return False
+            db.execute('UPDATE messages SET native_message_id=? WHERE account=? AND room=? AND id=?',
+                       (verified_id,self.account,chat,identifier))
+            return True
 
     def epoch(self, chat):
         """开始生成回复前取一次，发送时交给 reply_guard 比对。"""
@@ -649,10 +715,11 @@ class MemberStore:
             return self._epochs.get(chat, 0)
 
     @contextmanager
-    def reply_guard(self, chat, epoch, inner=None):
-        """自动回复发送前再确认一次：生成途中关掉了“自动回复”、或清空了记忆就不发。inner 为插件原有的发送保护。"""
+    def reply_guard(self, chat, epoch, inner=None, *, auto=True):
+        """自动回复发送前再确认一次：生成途中关掉了“自动回复”、或清空了记忆就不发。inner 为插件原有的发送保护。
+        auto=False（网页交代的任务）不要求开着自动回复。"""
         with self._lock:
-            if chat not in self.reply_chats:
+            if auto and chat not in self.reply_chats:
                 raise SnapshotExpired("自动回复已关闭")
             if self._epochs.get(chat, 0) != epoch:
                 raise SnapshotExpired("记忆已清空")
@@ -692,6 +759,24 @@ class MemberStore:
             self._apply_setting(chat, memory, reply)
         return self.chat_setting(chat)
 
+    def media_context(self, chat):
+        """媒体入下载队列前固定收到时间和清空代次；异步完成不能变成一条新消息。"""
+        with self._lock:
+            self.rollover()
+            return {'store': self._quote_namespace, 'account': self.account, 'chat': chat,
+                    'epoch': self._epochs.get(chat, 0), 'at': self._now().astimezone(timezone.utc).isoformat(),
+                    'received_at': time.monotonic()}
+
+    def media_is_current(self, message):
+        context = message.data.get('_media_context')
+        if context is None:  # 普通同步消息与没有异步下载的适配器保持原行为。
+            return True
+        with self._lock:
+            self.rollover()
+            return (isinstance(context, dict) and context.get('store') == self._quote_namespace and
+                    context.get('account') == self.account and context.get('chat') == message.chat_id and
+                    type(context.get('epoch')) is int and context['epoch'] == self._epochs.get(message.chat_id, 0))
+
     def record(self, message):
         """记一条文字或图片。图片在下载好后才分发过来，正文记成“[图片#编号]”，原图路径另存，
         需要时智能体按编号再看；不复制原图，文件仍归接收器管。"""
@@ -701,8 +786,23 @@ class MemberStore:
             return False
         if message.data.get("self_wxid", self.account) != self.account:
             return False
-        if message.is_self and not message.is_group and message.data.get("bot_generated"):
-            return False  # 私聊里本程序发出的文字发送时已补记（record_own），回传不重复记
+        outgoing = message.data.get('outgoing_sequence')
+        if message.is_self and message.data.get('bot_generated') and type(outgoing) is int and outgoing < 0:
+            self._remember_send_id(message, outgoing)
+            return False
+        if message.data.get('echo_update'):
+            # 清空/关闭记录后迟到的回传不能复活旧消息，只补已存在的本机记录。
+            identifier = native_message_id(message.data.get('native_message_id'))
+            if message.is_self and message.sequence > 0 and message.session_id and identifier:
+                with self._lock, self._connection() as db:
+                    db.execute("""UPDATE messages SET native_message_id=? WHERE account=? AND room=?
+                        AND session_id=? AND sequence=? AND is_self=1 AND text=?
+                        AND native_message_id IN ('','0')""", (identifier, self.account, message.chat_id,
+                        message.session_id, message.sequence, message.text))
+            return False
+        if message.is_self and message.data.get("bot_generated") and (
+                not message.is_group or message.data.get("own_text_recorded")):
+            return False  # 发送入口负责补记；已认领的原生回传不重复保存。
         if message.is_group:
             validate_mentions(message.chat_id, [message.sender_id])
         else:
@@ -717,14 +817,21 @@ class MemberStore:
             self._learn_mentioned_name(message)
         with self._lock, self._connection() as db:
             self.rollover()
+            if not self.media_is_current(message):
+                return False
             if message.is_group:
                 db.execute("INSERT OR IGNORE INTO room_members VALUES(?,?,?)",
                            (self.account, message.chat_id, message.sender_id))
+            quote = normalize_quote(message.data.get('quote'))
             result = db.execute("""INSERT OR IGNORE INTO messages
-                (account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated,image) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated,image,
+                 native_message_id,native_type,quote_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.account, message.chat_id, message.sender_id or message.chat_id, "[图片]" if image else message.text,
-                 self._now().astimezone(timezone.utc).isoformat(), message.session_id, message.sequence,
-                 int(message.is_self), int(bool(message.data.get("bot_generated"))), str(image) if image else None))
+                 message.data['_media_context']['at'] if message.data.get('_media_context') else
+                    self._now().astimezone(timezone.utc).isoformat(), message.session_id, message.sequence,
+                 int(message.is_self), int(bool(message.data.get("bot_generated"))), str(image) if image else None,
+                 native_message_id(message.data.get('native_message_id')), 49 if quote else message.type,
+                 json.dumps(quote, ensure_ascii=False, separators=(',', ':')) if quote else ''))
             if image and result.rowcount:
                 db.execute("UPDATE messages SET text=? WHERE id=?", (f"[图片#{result.lastrowid}]", result.lastrowid))
             return result.rowcount > 0
@@ -751,6 +858,8 @@ class MemberStore:
 
     def recorded(self, message):
         """这条消息还在记录里：排队期间被清空就不在了，不再回复它。没有原生序号的无法核对，按在。"""
+        if not self.media_is_current(message):
+            return False
         if not message.sequence:
             return True
         with self._lock:
@@ -767,6 +876,29 @@ class MemberStore:
                              (self.account, message.chat_id, message.session_id, message.sequence)).fetchone()
             return bool(row and db.execute("""SELECT 1 FROM messages WHERE account=? AND room=? AND is_self=0
                 AND received_at>? LIMIT 1""", (self.account, message.chat_id, row[0])).fetchone())
+
+    def since_own(self, message):
+        """这条消息收到时，离本账号在这个会话上一次说话过了几秒；之前没说过或这条没记过返回 None。
+        按收到时刻算，在队列里排了一会儿也不影响。智能体的“接话窗口”用：它每说一次话就重新计时。"""
+        with self._lock:
+            db = self._connection()
+            row = db.execute("SELECT received_at FROM messages WHERE account=? AND room=? AND session_id=? AND sequence=? AND sequence>0",
+                             (self.account, message.chat_id, message.session_id, message.sequence)).fetchone()
+            own = row and db.execute("""SELECT received_at FROM messages WHERE account=? AND room=? AND is_self=1
+                AND received_at<=? ORDER BY received_at DESC LIMIT 1""", (self.account, message.chat_id, row[0])).fetchone()
+            if not own:
+                return None
+            return (datetime.fromisoformat(row[0]) - datetime.fromisoformat(own[0])).total_seconds()
+
+    def said_more(self, message):
+        """发这条的人之后又说了话（已入库）：分几条回复时，停顿中对方又开口就不发剩下的，像真人先停下看他说什么。
+        群里只看这个人，别人说话不算；没记过的消息（如网页交代的任务）返回 False。"""
+        with self._lock:
+            db = self._connection()
+            row = db.execute("SELECT received_at FROM messages WHERE account=? AND room=? AND session_id=? AND sequence=? AND sequence>0",
+                             (self.account, message.chat_id, message.session_id, message.sequence)).fetchone()
+            return bool(row and db.execute("""SELECT 1 FROM messages WHERE account=? AND room=? AND is_self=0
+                AND sender_id=? AND received_at>? LIMIT 1""", (self.account, message.chat_id, message.sender_id, row[0])).fetchone())
 
     def others_after(self, message):
         """这条之后别人（不算发这条的人和本账号）又说了几条：插话多了，回复才需要艾特对方，免得对不上在回谁。
@@ -798,7 +930,7 @@ class MemberStore:
             db = self._connection()
             row = db.execute("SELECT summary,upto FROM agent_summaries WHERE account=? AND chat=?", (self.account, chat)).fetchone()
             summary, upto = tuple(row) if row else ("", 0)
-            rows = db.execute("""SELECT id,sender_id,text,received_at,is_self,session_id,sequence FROM messages
+            rows = db.execute("""SELECT id,sender_id,text,received_at,is_self,session_id,sequence,quote_json FROM messages
                 WHERE account=? AND room=? AND id>? ORDER BY id""", (self.account, chat, upto)).fetchall()
             names, lines = {}, []
             for row in rows:
@@ -812,6 +944,9 @@ class MemberStore:
                     names[row["sender_id"]] = self.speaker_name(row["sender_id"], chat)
                 lines.append({"id": row["id"], "at": row["received_at"], "text": text[:MEMORY_LINE_CHARS],
                               "sender": row["sender_id"], "name": "你" if row["is_self"] else names[row["sender_id"]]})
+                projection = quote_context_text(row['quote_json'], MEMORY_LINE_CHARS)
+                if projection is not None:
+                    lines[-1]['text'] = projection
             return summary, lines
 
     def memory_size(self, chat):
@@ -864,21 +999,51 @@ class MemberStore:
                         self.remember_wechat_name(sender, row["sender_name"])
                     except (MemberError, ValueError):
                         pass
-                db.execute("""INSERT INTO messages(account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated)
-                    VALUES(?,?,?,?,?,'backfill',0,?,?)""", (self.account, chat, sender, text, at, int(own), int(own)))
+                quote = normalize_quote(row.get('quote'))
+                db.execute("""INSERT INTO messages(account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated,
+                    native_message_id,native_type,quote_json) VALUES(?,?,?,?,?,'backfill',0,?,?,?,?,?)""",
+                    (self.account, chat, sender, text, at, int(own), int(own), native_message_id(row.get('message_id')),
+                     49 if quote else 1, json.dumps(quote, ensure_ascii=False, separators=(',', ':')) if quote else ''))
                 count += 1
             return count
 
-    def record_own(self, chat, text, session_id):
-        """补记本账号发出的话（语音、私聊文字都没有原生回传），聊天记录（也就是智能体的记忆）里才有。
-        sequence 为 0，不与原生消息冲突；没开长期记忆的会话不记。"""
+    def _remember_send_id(self, message, outgoing):
+        """原生正序号与发送负序号由发送入口关联；只补 ID，不插入或复活消息。"""
+        identifier = native_message_id(message.data.get('native_message_id'))
+        if not identifier or not message.session_id:
+            return
+        key = (message.chat_id, message.session_id, outgoing)
+        with self._lock, self._connection() as db:
+            row = db.execute('''SELECT id,native_message_id FROM messages WHERE account=? AND room=?
+                AND session_id=? AND sequence=? AND is_self=1 AND bot_generated=1''',
+                (self.account, *key)).fetchone()
+            if row is not None:
+                self._pending_send_ids.pop(key, None)
+                if native_message_id(row['native_message_id']) in ('', identifier):
+                    db.execute('UPDATE messages SET native_message_id=? WHERE id=? AND account=?',
+                               (identifier, row['id'], self.account))
+                return
+            self._pending_send_ids.setdefault(key, identifier)
+            while len(self._pending_send_ids) > 512:
+                self._pending_send_ids.popitem(last=False)
+
+    def record_own(self, chat, text, session_id, *, quote=None, sequence=0, expected_epoch=None):
+        """补记本账号成功发出的话，不依赖群聊/私聊是否产生原生回传。
+        发送入口使用负 sequence，不与原生正序号冲突；旧调用默认 0。"""
+        if type(sequence) is not int or sequence > 0:
+            raise MemberError('发送记录序号必须为非正整数')
         if not self.history_enabled or not self.remembers(chat) or not isinstance(text, str) or not text.strip():
             return False
         with self._lock, self._connection() as db:
             self.rollover()
-            db.execute("""INSERT INTO messages(account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated)
-                VALUES(?,?,?,?,?,?,0,1,1)""", (self.account, chat, self.account, text,
-                                               self._now().astimezone(timezone.utc).isoformat(), session_id or "own"))
+            if not self.remembers(chat) or (expected_epoch is not None and self._epochs.get(chat, 0) != expected_epoch):
+                return False
+            quote = normalize_quote(quote)
+            identifier = self._pending_send_ids.pop((chat, session_id, sequence), '') if sequence < 0 else ''
+            db.execute("""INSERT INTO messages(account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated,
+                native_type,quote_json,native_message_id) VALUES(?,?,?,?,?,?,?,1,1,?,?,?)""", (self.account, chat, self.account, text,
+                    self._now().astimezone(timezone.utc).isoformat(), session_id or "own", sequence, 49 if quote else 1,
+                    json.dumps(quote, ensure_ascii=False, separators=(',', ':')) if quote else '', identifier))
             return True
 
     def _speaker_wxid(self, name, room):
@@ -897,6 +1062,20 @@ class MemberStore:
         if rows:
             raise MemberError(f"群昵称“{name}”对应多人，请换个称呼")
         raise error
+
+    def speaker_wxid(self, name, room):
+        """按模型看到的发言人名字找微信 ID（智能体主动艾特用）：先比对这个会话里说过话的人在聊天记录里的名字，
+        再查绑定称呼、微信名和群昵称；找不到或对应多人时返回 None。"""
+        with self._lock:
+            senders = [row[0] for row in self._connection().execute(
+                "SELECT DISTINCT sender_id FROM messages WHERE account=? AND room=? AND is_self=0", (self.account, room))]
+            matches = [wxid for wxid in senders if self.speaker_name(wxid, room) == name]
+            if matches:
+                return matches[0] if len(matches) == 1 else None
+            try:
+                return self._speaker_wxid(name, room)
+            except MemberError:
+                return None
 
     def search(self, room, keyword=None, *, date=None, name=None, limit=20):
         """在本群（或白名单私聊）保存的聊天原文里查找，关键词、日期（北京时间 YYYY-MM-DD）、发言人称呼可任意组合，
@@ -952,6 +1131,7 @@ class MemberStore:
 
     def close(self):
         with self._lock:
+            self._pending_send_ids.clear()
             if self._db:
                 self._db.close()
                 self._db = None

@@ -636,8 +636,11 @@ h2{font-size:16px;font-weight:600;}
 .hc-composer #send-text{min-height:32px;height:32px;padding:4px 24px;font-size:14px;background:var(--hc-send);color:var(--accent-text);border:0;border-radius:4px;}
 .hc-composer #send-text:hover:not(:disabled){background:var(--hc-send-hover);}
 .hc-composer #send-text:disabled{color:var(--disabled-text);background:var(--hc-send);}
-#chat-mention-toggle{position:absolute;left:14px;top:6px;min-height:28px;padding:0 6px;background:none;font-size:17px;color:var(--muted);border-radius:4px;}
-#chat-mention-toggle:hover{background:var(--hc-hover);}
+.hc-composer-tools{position:absolute;left:14px;top:6px;display:flex;gap:2px;}
+#chat-mention-toggle,#chat-task-toggle{min-height:28px;padding:0 6px;background:none;font-size:17px;color:var(--muted);border-radius:4px;}
+#chat-task-toggle{font-size:13px;}
+#chat-mention-toggle:hover,#chat-task-toggle:hover{background:var(--hc-hover);}
+#chat-task-toggle[aria-pressed="true"]{color:var(--accent);background:var(--hc-hover);}
 .hc-composer #send-group:not(.hidden){display:none;}
 .chat-mentions-open .hc-composer #send-group:not(.hidden){display:block;}
 .hc-composer .member-scroll{max-height:150px;margin-block:7px;}
@@ -672,4 +675,10 @@ h2{font-size:16px;font-weight:600;}
   .hc-composer #send-content{height:54px;min-height:46px;max-height:110px;resize:none;}
   .hc-composer .member-scroll{max-height:100px;}
 }
+.hc-quote-button{display:block;min-height:22px;padding:1px 3px;margin-top:3px;border:0;background:none;color:var(--muted);font-size:11px;}
+.hc-quote-button:hover{color:var(--accent);}
+.hc-quote-preview{display:flex;align-items:center;gap:8px;margin:3px 0 8px;padding:6px 9px;border-left:3px solid var(--muted);background:var(--hc-hover);color:var(--muted);font-size:12px;}
+.hc-quote-preview span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.hc-quote-preview button{min-height:24px;padding:0 5px;border:0;background:none;color:inherit;}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important;scroll-behavior:auto!important;}}
+.hc-native-reference{margin-top:8px;padding-left:8px;border-left:2px solid currentColor;font-size:12px;opacity:.65;white-space:pre-wrap;overflow-wrap:anywhere}

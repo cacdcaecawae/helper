@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from .sdk import Message
@@ -59,6 +60,17 @@ class NativeFileHelperBackend:
 class NativeTextBackend(NativeFileHelperBackend):
     scope = "文本、图片与文件收发；语音、表情发送；好友申请与控制台群管理"
 
+    @contextmanager
+    def outgoing_identity(self, sequence):
+        """发送前固定 SDK 序号，供本机监听/同步回传准确补写同一条发送记录。"""
+        with self.raw._calls:
+            previous = self.raw._outgoing_sequence
+            self.raw._outgoing_sequence = sequence
+            try:
+                yield
+            finally:
+                self.raw._outgoing_sequence = previous
+
     def __init__(self, root, config, *, data_root=None):
         data_root = Path(data_root or root)
         native = Path(root) / "native"
@@ -78,6 +90,12 @@ class NativeTextBackend(NativeFileHelperBackend):
                                      preserve_reports=False)
         self.session_id = uuid.uuid4().hex
 
+    def set_media_chat_policy(self, policy):
+        self.raw.media_chat_allowed = policy
+
+    def set_media_context_provider(self, provider):
+        self.raw.media_context_provider = provider
+
     def diagnostics(self):
         router = self.raw.router
         return {"account_ready": bool(self.raw.self_wxid),
@@ -87,6 +105,7 @@ class NativeTextBackend(NativeFileHelperBackend):
                 "unidentified_messages": router.unidentified,
                 "unparsed_groups": router.unparsed_groups,
                 "ignored_self_messages": router.ignored_self,
+                "contact_names": self.raw._contact_names.status if self.raw._contact_names is not None else "stopped",
                 "mention_messages": self.raw.mention_messages}
 
     def chats(self):
@@ -97,6 +116,12 @@ class NativeTextBackend(NativeFileHelperBackend):
 
     def send_at_text(self, room_wxid, content, at_list):
         return self.raw.send_at_text(room_wxid, content, at_list)
+
+    def send_quote(self, chat_id, quote, *, created_at=0):
+        return self.raw.send_quote(chat_id, quote, created_at=created_at)
+
+    def resolve_quote_reference(self, source):
+        return self.raw.resolve_quote_reference(source)
 
     def send_image(self, chat_id, path):
         return self.raw.send_image(chat_id, path)

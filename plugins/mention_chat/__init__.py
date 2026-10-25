@@ -16,10 +16,10 @@ class Plugin:
     def on_message(self, message, ctx):
         if ctx.plugin_is_active("agent_chat"):
             return  # 智能体开启时由它接管艾特，避免同一句话回两次
-        if (message.type != 1 or not message.is_group or not self.members.replies(message.chat_id) or
+        if (message.type != 1 or message.is_self or not message.is_group or not self.members.replies(message.chat_id) or
                 "WXBOT_AT_CHAT_PROBE" in message.text or
-                message.data.get("bot_generated") or not message.data.get("is_at_self") or
-                self.members.account not in message.data.get("at_members", ())):
+                message.data.get("bot_generated") or not (message.data.get("quote_is_self") or (
+                    message.data.get("is_at_self") and self.members.account in message.data.get("at_members", ())))):
             return
         personality, epoch = ctx.personality(message), self.members.epoch(message.chat_id)
         try:

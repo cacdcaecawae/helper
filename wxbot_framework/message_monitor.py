@@ -6,6 +6,8 @@ import time
 import uuid
 from .members import BEIJING
 from .recall import message_id
+from .message_identity import event_key, quote_token
+from .message_projection import preview_row
 
 
 def beijing(timestamp, fmt):
@@ -19,6 +21,7 @@ class MessageBuffer:
         self.seen = deque(maxlen=capacity * 2)
         self.seen_keys = set()
         self.forwarded_rows = {}
+        self.outgoing_pairs = deque(maxlen=capacity * 2)
         self.recalls = OrderedDict()
         self.sequence = 0
         self.stream_id = uuid.uuid4().hex
@@ -34,18 +37,35 @@ class MessageBuffer:
             self.seen.clear()
             self.seen_keys.clear()
             self.forwarded_rows.clear()
+            self.outgoing_pairs.clear()
             self.recalls.clear()
             self.sequence = 0
             self.stream_id = uuid.uuid4().hex
 
+    def _merge_identity(self, index, row):
+        """保留原来显示的位置/时间；关联发送入口、本机监听和服务器回传的身份。"""
+        old = self.rows[index]
+        keys = list(dict.fromkeys([*old.get('event_keys', ()), *row.get('event_keys', ())]))
+        updated = dict(old)
+        if keys:
+            updated['event_keys'] = keys
+        if row['message_id'] and not old.get('message_id'):
+            updated['message_id'] = row['message_id']
+            recall = self.recalls.get((old['account'], old['chat_id'], row['message_id']))
+            if recall:
+                updated.update(recalled=True, recalled_at=recall[0], recall_notice=recall[1])
+        if updated != old:
+            self.sequence += 1
+            self.rows[index] = dict(updated, revision=self.sequence)
+
     def append(self, message, *, account='', sender_name=''):
         data = message.data
-        account = account or data.get('self_wxid', '')
+        account = account or data.get('self_wxid', '') or (message.sender_id if message.is_self else '')
         if message.type in (10000, 10002) and isinstance(data.get('recall'), dict):
             self._recall(message, account)
             return
         # 机器人原生回显与发送入口只记一次；媒体下载状态更新也不重复。
-        if message.is_self and data.get('bot_generated') and not data.get('monitor_outgoing'):
+        if message.is_self and data.get('bot_generated') and not data.get('monitor_outgoing') and message.type != 1:
             return
         group = bool(message.is_group or message.chat_id.endswith('@chatroom'))
         sender = message.sender_id or (account if message.is_self else '' if group else message.chat_id)
@@ -53,7 +73,9 @@ class MessageBuffer:
             content = self._text(message.text)
         elif message.type == 49:
             name = self._text(data.get('file_name'), 256).replace('\\', '/').rsplit('/', 1)[-1]
-            if data.get('app_type') == 19:
+            if data.get('local_send') and data.get('app_type') == 57:
+                content = self._text(data.get('msg')) or '[本机引用：结构待确认]'
+            elif data.get('app_type') == 19:
                 content = '[合并转发] ' + self._text(data.get('forwarded_title'), 256)
                 content += '（无法解析）' if data.get('forwarded_status') == 'failed' else (
                     f"（{len(data.get('forwarded_records', ()))} 条" +
@@ -71,13 +93,27 @@ class MessageBuffer:
                'date': beijing(now, '%Y-%m-%d'), 'account': self._text(account, 128),
                'chat_id': self._text(message.chat_id, 128), 'is_group': group,
                'sender_id': self._text(sender, 128),
-               'sender_name': '机器人' if data.get('monitor_outgoing') else self._text(sender_name, 128),
+               'sender_name': '机器人' if data.get('monitor_outgoing') or data.get('bot_generated') else self._text(sender_name, 128),
                'direction': 'outgoing' if data.get('monitor_outgoing') or message.is_self else 'incoming',
                'type': message.type, 'content': content,
                'message_id': message_id(data.get('native_message_id'))}
+        identity = event_key(account, message.chat_id, message.session_id, message.sequence)
+        if identity:
+            row['event_keys'] = [identity]
+        from .quotes import normalize_quote
+        quote = normalize_quote(data.get('quote'))
+        if quote is not None:
+            row['quote'] = quote
+            row['native_type'] = 49
         if group:
             role = data.get('sender_role', 'unknown')
             row['sender_role'] = role if role in ('owner', 'admin', 'member') else 'unknown'
+        if data.get('local_send') and message.is_self:
+            row['local_send'] = True
+            from .quotes import quote_capture_metadata
+            metadata = quote_capture_metadata(data.get('quote_capture'))
+            if metadata is not None:
+                row['quote_capture'] = metadata
         projected = [row]
         records = data.get('forwarded_records')
         if data.get('app_type') == 19 and isinstance(records, (list, tuple)):
@@ -104,6 +140,12 @@ class MessageBuffer:
                message.chat_id, message.is_self, row['message_id'])
         deduplicate = bool(message.session_id and message.sequence)
         with self.lock:
+            if data.get('echo_update'):
+                for index, old in enumerate(self.rows):
+                    if identity and identity in old.get('event_keys', ()) and not old.get('forwarded'):
+                        self._merge_identity(index, row)
+                        break
+                return  # 已清空/淘汰的消息不因迟到的 ID 回传重新出现。
             if deduplicate:
                 if key in self.seen_keys:
                     previous = self.forwarded_rows.get(key)
@@ -130,6 +172,22 @@ class MessageBuffer:
                     self.forwarded_rows.pop(oldest, None)
                 self.seen.append(key)
                 self.seen_keys.add(key)
+            # 发送通知和原生回显可能任意先后到达。按次一对一认领，不能直接丢回显：
+            # 若发送通知缺失，回显本身仍应让网页显示机器人说过的话。
+            source = ('send' if data.get('monitor_outgoing') else 'echo') if (
+                message.type == 1 and message.is_self and data.get('bot_generated')) else ''
+            pair_key = ('quote', quote['reply'].strip(), quote['reference']['message_id']) if quote else ('text', row['content'])
+            if source:
+                match = next((item for item in self.outgoing_pairs if item['source'] != source and
+                    item['session'] == message.session_id and
+                    item['account'] == row['account'] and item['chat_id'] == row['chat_id'] and
+                    item['pair_key'] == pair_key and 0 <= now - item['at'] < 120), None)
+                if match is not None:
+                    self.outgoing_pairs.remove(match)
+                    for index, old in enumerate(self.rows):
+                        if old['id'] == match['id']:
+                            self._merge_identity(index, row)
+                            return
             identifiers = []
             recall_key = (row['account'], row['chat_id'], row['message_id'])
             recall = self.recalls.get(recall_key) if row['message_id'] else None
@@ -149,6 +207,10 @@ class MessageBuffer:
                 identifiers.append(identifier)
             if deduplicate and records is not None:
                 self.forwarded_rows[key] = identifiers
+            if source:
+                self.outgoing_pairs.append({'source': source, 'session': message.session_id,
+                    'account': row['account'], 'chat_id': row['chat_id'],
+                    'pair_key': pair_key, 'at': now, 'id': identifiers[0]})
 
     def _recall(self, message, account):
         recall = message.data['recall']
@@ -190,6 +252,54 @@ class MessageBuffer:
             return [dict(row) for row in self.rows if row.get('chat_id') == chat and row.get('type') == 1
                     and not row.get('forwarded') and row.get('kind') != 'agent']
 
+    def _quote_snapshot(self, row):
+        return dict(row, quote_token=quote_token(self.stream_id, 0, *(row.get(k) for k in
+                    ('id', 'account', 'chat_id', 'sender_id', 'content', 'timestamp'))))
+
+    def quote_source(self, chat, identifier, *, account):
+        """只允许本次连接已看到、未撤回的原始文字；不相信浏览器提交的作者/正文。"""
+        identifier = message_id(identifier)
+        if not identifier:
+            return None
+        with self.lock:
+            matches = [row for row in self.rows if row['account'] == account and row['chat_id'] == chat
+                and row.get('message_id') == identifier and row.get('type') == 1
+                and row.get('native_type', 1) == 1 and not row.get('quote') and not row.get('recalled')
+                and not row.get('forwarded') and row.get('kind') != 'agent']
+            if len(matches) != 1:
+                return None
+            return self._quote_snapshot(matches[0])
+
+    def quote_row(self, chat, identifier, *, account):
+        with self.lock:
+            row = next((r for r in self.rows if r['id'] == identifier and r['chat_id'] == chat and r['account'] == account), None)
+            if (row is None or row.get('type') != 1 or row.get('native_type',1) != 1 or row.get('quote') or
+                    row.get('recalled') or row.get('forwarded') or row.get('kind') == 'agent'):
+                return None
+            return self._quote_snapshot(row)
+
+    def quote_recalled(self, chat, identifier, *, account):
+        with self.lock:
+            return (account,chat,identifier) in self.recalls or any(r.get('recalled') and
+                r.get('message_id') == identifier and r['chat_id'] == chat and r['account'] == account for r in self.rows)
+
+    def attach_quote_id(self, chat, identifier, source, verified_id, *, account):
+        verified_id = message_id(verified_id)
+        if not verified_id:
+            return False
+        with self.lock:
+            for index,row in enumerate(self.rows):
+                if row['id'] == identifier and row['chat_id'] == chat and row['account'] == account:
+                    if (row.get('recalled') or self._quote_snapshot(row)['quote_token'] != source.get('quote_token') or
+                            any(row.get(k)!=source.get(k) for k in ('sender_id','content','timestamp'))):
+                        return False
+                    if row.get('message_id') not in ('',verified_id):
+                        return False
+                    self.sequence += 1
+                    self.rows[index] = dict(row,message_id=verified_id,revision=self.sequence)
+                    return True
+        return False
+
     def trace(self, message, run, step, *, account=''):
         """智能体每次运行占一行（kind=agent），每走一步追加 step 并提升 revision，前端增量刷新。"""
         step = {key: self._text(step.get(key), 2000) if isinstance(step.get(key), str) else step.get(key)
@@ -219,6 +329,9 @@ class MessageBuffer:
             rows = available[-200:] if initial else sorted(
                 (row for row in available if row['revision'] > after), key=lambda row:row['revision'])[:200]
             cursor = self.sequence if initial or not rows else rows[-1]['revision']
-            return {'rows': [dict(row) for row in rows], 'cursor': cursor, 'latest': self.sequence,
-                    'stream_id': self.stream_id, 'reset': reset,
-                    'dropped': bool(after and available and after < available[0]['id'] - 1)}
+            result = {'rows': [self._quote_snapshot(row) for row in rows], 'cursor': cursor, 'latest': self.sequence,
+                      'stream_id': self.stream_id, 'reset': reset,
+                      'dropped': bool(after and available and after < available[0]['id'] - 1)}
+        # 存储行只替换不原地修改；投影在锁外处理，长预览不能阻塞接收线程。
+        result['rows'] = [preview_row(row) for row in result['rows']]
+        return result

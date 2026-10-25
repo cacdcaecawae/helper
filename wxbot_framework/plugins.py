@@ -45,13 +45,15 @@ class PluginRecord:
 
     def enqueue(self, message):
         if not self.active:
-            return
+            return False
         try:
             self.queue.put_nowait(message)
+            return True
         except queue.Full:
             self.dropped += 1
             if self.dropped == 1 or self.dropped % 100 == 0:
                 self.context.logger.warning("插件队列已满，累计丢弃 %d 条", self.dropped)
+            return False
 
     def _run(self):
         try:
@@ -265,9 +267,11 @@ class PluginManager:
     def dispatch(self, message, *, only=None):
         with self._lock:
             records = tuple(self.records.values())
+        accepted = 0
         for record in records:
             if (only is None or record.spec.name == only) and message.type in record.spec.message_types:
-                record.enqueue(message)
+                accepted += int(bool(record.enqueue(message)))
+        return accepted
 
     def status(self):
         specs = self.discover()

@@ -1,11 +1,14 @@
 """本地 Qwen3-TTS 语音服务：只实现 helper 用到的 Fish Audio 接口子集，仅监听本机。
 
-运行：.venv-tts\\Scripts\\python.exe -s tools\\local_tts_server.py（start_web 会自动后台启动）
+运行：.venv-tts\\Scripts\\python.exe tools\\local_tts_server.py（管理台 web.py 启动时会自动无窗口启动它，
+带 --parent 管理台进程号：管理台退出时本服务跟着退出）。不要加 -s：torch 装在用户目录的 site-packages 里。
 固定随机种子，同一音色、同一句话每次合成结果一致。
 """
 import hashlib
 import io
 import json
+import os
+import sys
 import threading
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -73,9 +76,24 @@ class Handler(BaseHTTPRequestHandler):
         pass  # 不记录请求，避免聊天内容落盘
 
 
+def exit_with(pid):
+    """管理台（进程号 pid）一退出（含直接关窗口）就跟着退出，不在后台占显存。等的是进程句柄、不碰标准输入：
+    后台线程同步读 stdin 管道时，主线程加载 torch 等库要查询 stdin，会被一起卡住，模型就一直加载不完。"""
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if not handle:  # 管理台已经不在了
+        os._exit(0)
+    threading.Thread(target=lambda: (kernel32.WaitForSingleObject(handle, 0xFFFFFFFF), os._exit(0)), daemon=True).start()
+
+
 if __name__ == "__main__":
     # 先占端口：已有实例在运行时直接退出，不重复加载模型。
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    if "--parent" in sys.argv:
+        exit_with(int(sys.argv[sys.argv.index("--parent") + 1]))
     import numpy as np
     import torch
     from qwen_tts import Qwen3TTSModel

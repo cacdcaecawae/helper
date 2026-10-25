@@ -30,9 +30,8 @@ class BotApplication:
         self.service.message_observer = self._observe_message
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
         if self.members is not None:
-            # 私聊里本程序发出的文字在发送时补记（回传标为 bot_generated，不重复记）；手动发的由回传记录。
-            self.service.sent_recorder = lambda chat, text, session: (
-                chat.endswith("@chatroom") or self.members.record_own(chat, text, session))
+            # 所有会话的成功发送都立即补记，群聊也不能依赖可能缺失的原生回传。
+            self.service.sent_recorder = self.members.record_own
         generic = self.config.get("backend") == "native_text"
         capabilities = TEXT_CAPABILITIES if generic else CAPABILITIES
         self.plugins = PluginManager(root / "plugins", store, self.service, capabilities,
@@ -66,6 +65,11 @@ class BotApplication:
             candidate = self.backend_factory()
             self.backend = candidate
             self.service.bind(candidate)
+            # 只在真实适配器声明了此能力时配置，不探测 Mock 动态生成的属性。
+            if callable(getattr(type(candidate), 'set_media_chat_policy', None)):
+                candidate.set_media_chat_policy(self._chat_allowed)
+            if callable(getattr(type(candidate), 'set_media_context_provider', None)):
+                candidate.set_media_context_provider(self._media_context)
             candidate.start(self._emit)
             self._connection_ready = True
             self._last_connection_error = ""
@@ -92,6 +96,8 @@ class BotApplication:
                 logger.warning('消息监控暂不可用，消息继续处理')
 
     def _emit(self, message):
+        if not self._media_is_current(message):
+            return
         message = self._with_group_role(message)
         self._observe_message(message)
         allowed = self.config.get('chat_allowlist', [])
@@ -149,7 +155,20 @@ class BotApplication:
         for name in ('anti_recall', 'anti_recall_image', 'anti_recall_file'):
             self.plugins.dispatch(message, only=name)
 
+    def _media_context(self, chat):
+        return self.members.media_context(chat) if self.members is not None else None
+
+    def _media_is_current(self, message):
+        return self.members is None or not callable(getattr(type(self.members), 'media_is_current', None)) or self.members.media_is_current(message)
+
+    def _chat_allowed(self, chat):
+        allowed = self.config.get('chat_allowlist', [])
+        switched = self.members is not None and (self.members.remembers(chat) or self.members.replies(chat))
+        return not allowed or chat in allowed or switched
+
     def _emit_chat(self, message):
+        if not self._media_is_current(message):
+            return
         # 先显示会话 ID，未加入白名单的新群也能被发现；群正文不进入消息日志。
         if message.is_group or message.chat_id.endswith("@chatroom"):
             logger.info("群消息 | 群ID=%s", message.chat_id)
@@ -171,17 +190,14 @@ class BotApplication:
             logger.info("私聊消息 | 发送者微信ID=%s | 内容=%s",
                         message.sender_id or message.chat_id,
                         json.dumps(message.text, ensure_ascii=False))
-        allowed = self.config.get("chat_allowlist", [])
-        # 聊天页开了“长期记忆”或“自动回复”的会话不受旧的收发白名单限制。
-        switched = self.members is not None and (self.members.remembers(message.chat_id) or
-                                                 self.members.replies(message.chat_id))
-        if not allowed or message.chat_id in allowed or switched:
+        # 与媒体接收共用实时配置；开关更新后不依赖重连。
+        if self._chat_allowed(message.chat_id):
             if self.members is not None:
                 try:
                     self.members.record(message)
                 except Exception:
                     logger.exception("群文本保存失败，消息继续分发到插件")
-            if message.data.get("dispatch_to_plugins", True):
+            if message.data.get("dispatch_to_plugins", True) and self._media_is_current(message):
                 if self.plugins.is_active("personality"):
                     message = prepare_switch(message, self.members)
                 self.plugins.dispatch(message)
@@ -203,7 +219,8 @@ class BotApplication:
         for row in rows:
             if row.get("wechat_name"):
                 self.members.remember_wechat_name(row["wxid"], row["wechat_name"])
-            nickname = row.get("group_nickname") or row.get("nickname") or ""
+            # 明确提供群昵称字段时，nickname 可能只是微信名回退，不能固化成群昵称。
+            nickname = (row.get("group_nickname") if "group_nickname" in row else row.get("nickname")) or ""
             if nickname:  # 名单里非好友常常没有名字：空的不覆盖已知的（比如从艾特里学到的）
                 self.members.remember_group_nickname(row["wxid"], room, nickname[:64])
 

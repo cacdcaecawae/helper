@@ -78,6 +78,15 @@ class MemberTests(unittest.TestCase):
         self.assertFalse(reopened.compact_memory(ROOM, "清空后不能写回", rest[-1]["id"], epoch))
         self.assertEqual(reopened.memory(ROOM), ("", []))
 
+    def test_group_send_is_saved_without_echo_and_claimed_echo_does_not_duplicate(self):
+        self.assertTrue(self.store.record_own(ROOM, "机器人主动说的话", "first"))
+        echo = self.message("机器人主动说的话", sender=ROBOT, is_self=True,
+            data={"bot_generated": True, "own_text_recorded": True})
+        self.assertFalse(self.store.record(echo))
+        self.assertEqual([r['text'] for r in self.store.chat_history(ROOM)], ["机器人主动说的话"])
+        self.assertTrue(self.store.chat_history(ROOM)[0]['own'])
+        self.assertEqual([r['name'] for r in self.store.memory(ROOM)[1]], ["你"])
+
     def test_compaction_started_before_a_clear_is_not_written_back_even_if_ids_are_reused(self):
         for sequence, text in enumerate(("周末去哪玩", "去爬山吧", "好"), 1):
             self.store.record(self.message(text, sequence=sequence))
@@ -166,6 +175,18 @@ class MemberTests(unittest.TestCase):
             app.service.send_text(friend, "在的", expected_session="first")
             self.assertEqual([(line["name"], line["text"]) for line in app.members.memory(friend)[1]],
                              [("对方", "在吗"), ("你", "在的")])
+            from wxbot_framework.message_monitor import MessageBuffer
+            buffer = MessageBuffer()
+            app.message_observer = lambda message: buffer.append(message, account=ROBOT)
+            app.service.send_text(ROOM, "群里这句也必须显示并记住", expected_session="first")
+            app._emit(self.message("群里这句也必须显示并记住", sender=ROBOT, sequence=99, is_self=True,
+                data={"bot_generated":True,"own_text_recorded":True,"dispatch_to_plugins":False}))
+            self.assertEqual([r['text'] for r in app.members.chat_history(ROOM)], ["群里这句也必须显示并记住"])
+            self.assertEqual([(r['direction'],r['content']) for r in buffer.rows],
+                             [('outgoing',"群里这句也必须显示并记住")])
+            backend.send_text.return_value = False
+            self.assertFalse(app.service.send_text(ROOM, "未发送的不能记", expected_session="first"))
+            self.assertEqual(len(app.members.chat_history(ROOM)), 1)
         finally:
             app.stop()
 
@@ -267,6 +288,47 @@ class MemberTests(unittest.TestCase):
         self.assertEqual(self.store.others_after(self.message(sender=JING, sequence=1)), 2)  # 自己追问、机器人说的都不算
         self.assertEqual(self.store.others_after(self.message(sender=JING, sequence=99)), 0)  # 没记过的消息
 
+    def test_since_own_measures_from_the_bots_last_words_to_when_the_message_arrived(self):
+        now = [datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)]
+        self.store._now = lambda: now[0]
+        self.store.record(self.message("随便聊", sender=JING, sequence=1))
+        self.assertIsNone(self.store.since_own(self.message(sender=JING, sequence=1)))  # 它还没说过话
+        self.store.record(self.message("我来了", sender=ROBOT, sequence=2, is_self=True))
+        now[0] += timedelta(seconds=30)
+        self.store.record(self.message("接话", sender=SMALL, sequence=3))
+        now[0] += timedelta(seconds=300)  # 在队列里排了很久才处理，也按收到时刻算
+        self.assertEqual(self.store.since_own(self.message(sender=SMALL, sequence=3)), 30)
+        self.assertIsNone(self.store.since_own(self.message(sender=SMALL, sequence=99)))  # 没记过的消息
+
+    def test_said_more_counts_only_the_same_person_after_the_message(self):
+        clock = iter(datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc) + timedelta(seconds=n) for n in range(100))
+        self.store._now = lambda: next(clock)
+        for sender, sequence in ((JING, 1), (SMALL, 2), (ROBOT, 3)):
+            self.store.record(self.message("随便聊", sender=sender, sequence=sequence, is_self=sender == ROBOT))
+        self.assertFalse(self.store.said_more(self.message(sender=JING, sequence=1)))  # 别人和机器人说话不算
+        self.store.record(self.message("等下", sender=JING, sequence=4))
+        self.assertTrue(self.store.said_more(self.message(sender=JING, sequence=1)))
+        self.assertFalse(self.store.said_more(self.message(sender=JING, sequence=0)))  # 没记过的（网页交代的任务）
+
+    def test_speaker_wxid_finds_who_the_model_named_by_the_name_it_saw(self):
+        for sender, sequence in ((JING, 1), (SMALL, 2), ("wxid_other", 3)):
+            self.store.record(self.message("随便聊", sender=sender, sequence=sequence))
+        self.assertEqual(self.store.speaker_wxid(UNNAMED_JING, ROOM), JING)  # 还不知道名字的“群友·xxxx”
+        self.assertEqual(self.store.speaker_wxid("成员甲昵称", ROOM), SMALL)
+        self.assertEqual(self.store.speaker_wxid("小号", ROOM), SMALL)  # 绑定的别名
+        self.store.remember_group_nickname(JING, ROOM, "同名")
+        self.store.remember_group_nickname("wxid_other", ROOM, "同名")
+        self.assertIsNone(self.store.speaker_wxid("同名", ROOM))  # 对应多人不猜
+        self.assertIsNone(self.store.speaker_wxid("没这个人", ROOM))
+
+    def test_tasks_from_the_panel_may_send_where_auto_reply_is_off(self):
+        from wxbot_framework.members import SnapshotExpired
+        self.store.set_chat(ROOM, memory=True, reply=False)
+        with self.store.reply_guard(ROOM, self.store.epoch(ROOM), auto=False):
+            pass
+        with self.assertRaises(SnapshotExpired), self.store.reply_guard(ROOM, self.store.epoch(ROOM)):
+            pass
+
     def test_images_are_timeline_lines_looked_up_by_number_within_their_chat(self):
         friend, photo = "wxid_friend", self.root / "photo.png"
         self.store.set_chat(friend, memory=True, reply=True)
@@ -315,6 +377,15 @@ class MemberTests(unittest.TestCase):
         self.assertEqual(self.store.speaker_name("wxid_wang", ROOM), "小王")
         BotApplication._remember_group_members(app, ROOM, [{"wxid": "wxid_wang", "group_nickname": "王老师"}])
         self.assertEqual(self.store.speaker_name("wxid_wang", ROOM), "王老师")  # 名单里有真名时以名单为准
+
+    def test_database_wechat_name_is_not_persisted_as_a_group_nickname(self):
+        from types import SimpleNamespace
+        app = SimpleNamespace(backend=None, members=self.store, _group_roles={})
+        for name in ("原微信名", "新微信名"):
+            BotApplication._remember_group_members(app, ROOM, [{"wxid": "wxid_from_contact_db",
+                "group_nickname": "", "wechat_name": name, "nickname": name}])
+            self.assertEqual(self.store.wechat_name("wxid_from_contact_db"), name)
+            self.assertIsNone(self.store.group_nickname("wxid_from_contact_db", ROOM))
 
     def test_has_newer_sees_later_lines_from_the_friend_only(self):
         friend = "wxid_friend"

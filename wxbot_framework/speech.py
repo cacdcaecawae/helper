@@ -3,7 +3,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 import hashlib
+import importlib.util
 from pathlib import Path
+import re
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -11,6 +15,33 @@ import time
 from .members import SnapshotExpired
 from .summary import split_text
 from .tts import FishTTS, TTSError, VOICE_ID
+
+REQUIREMENTS = Path(__file__).resolve().parents[1] / 'requirements-voice.txt'
+
+
+def ensure_encoder(logger):
+    """本机 Qwen3 和 Fish 都返回 WAV，发微信语音要先编码成 SILK。缺编码器时按 requirements-voice.txt 锁定的版本
+    自动装进当前 Python，装不上抛 ValueError 并给出手动命令，不等到发语音时才出错。"""
+    def available():
+        importlib.invalidate_caches()
+        try:
+            importlib.import_module('pysilk')
+            return True
+        except (ImportError, OSError):
+            return False
+    if available():
+        return
+    package = re.search(r'^silk-python==\S+$', REQUIREMENTS.read_text(encoding='utf-8'), re.M).group(0)
+    logger.info('语音缺少编码器，正在自动安装 %s', package)
+    try:
+        result = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', package],
+                                capture_output=True, timeout=300, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if result.returncode:
+            logger.warning('自动安装失败：%s', result.stdout.decode('utf-8', 'replace')[-500:])
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if not available():
+        raise ValueError(f'自动安装语音编码器失败，请手动运行：{sys.executable} -m pip install {package}')
 
 
 def speech_chunks(text, limit):
@@ -133,9 +164,33 @@ class SpeechController:
             raise TTSError('音色未找到，请发送 /查看音色 关键词 搜索；切换时使用完整名称或 ID')
         return matches[0]
 
-    def selected(self, room):
+    def mode(self, room):
+        """智能体这次的语音情况：always 开了语音回复且本会话没 /音色 关闭，每句都念；optional 默认发文字，
+        模型可以自己选语音（对方要求时）；空串表示发不了语音（配置读不了、缺编码器，或既没选音色也没默认音色）。"""
+        if self.members is None:
+            return ""
         state = self.members.voice_selection(room)
-        if not state.enabled:
+        if self.enabled and state.enabled:
+            return "always"
+        if importlib.util.find_spec("pysilk") is None:  # 微信语音要先编码成 SILK
+            return ""
+        with self._lock:
+            if self._closed:
+                return ""
+            loaded = self._client is not None
+        if not loaded:  # 语音回复插件没开过：配置还没加载，这里临时加载
+            try:
+                self.reload()
+            except (TTSError, ValueError):
+                return ""
+        with self._lock:
+            default = self._client.default_voice if self._client is not None else ""
+        return "optional" if state.voice_id or default else ""
+
+    def selected(self, room, *, forced=False):
+        """forced：模型主动选了语音，本会话 /音色 关闭了也照用（选过的音色或默认音色）。"""
+        state = self.members.voice_selection(room)
+        if not state.enabled and not forced:
             return state, None
         with self._lock:
             client = self._client
@@ -157,8 +212,10 @@ class SpeechController:
             self._public_pages.clear()
             self._public_voices.clear()
 
-    def reply(self, ctx, message, text, *, delivery_guard=None):
-        state, voice = self.selected(message.chat_id)
+    def reply(self, ctx, message, text, *, delivery_guard=None, forced=False):
+        self.members.rollover()
+        memory_epoch = self.members.epoch(message.chat_id)
+        state, voice = self.selected(message.chat_id, forced=forced)
         if voice is None:
             return False
         with self._lock:
@@ -168,10 +225,12 @@ class SpeechController:
         def guard():
             if not ctx._service.session_is_current(message.session_id):
                 raise SnapshotExpired("微信连接已结束")
-            if not self.enabled:
+            if not (forced or self.enabled):
                 raise SnapshotExpired("语音回复已停用")
             with delivery_guard() if delivery_guard else nullcontext():
                 with self.members.voice_delivery_guard(state), self._lock:
+                    if self.members.epoch(message.chat_id) != memory_epoch:
+                        raise SnapshotExpired("记忆已清空")
                     if self._closed or generation != self._generation:
                         raise SnapshotExpired("语音回复配置已变更")
                     yield
@@ -193,27 +252,35 @@ class SpeechController:
                     pass
                 path = owned / f'{index}.wav'
                 path.write_bytes(data)
-                paths.append(path)
+                paths.append((path, part))
             with guard():
                 pass
-            for path in paths:
-                if not ctx.reply_voice(message, path, delivery_guard=guard):
+            for path, part in paths:
+                try:
+                    sent = ctx.reply_voice(message, path, delivery_guard=guard)
+                except TTSError as error:
+                    # 已进入发送阶段，不能再由上层按“合成失败”回退整段文字。
+                    raise RuntimeError("语音发送失败，未重发文字") from error
+                if not sent:
                     # 微信是否已送达不确定，不在此处重复发文字或重试。
                     raise RuntimeError("原生语音发送未确认成功")
-        # 语音没有文字回传：补记说了什么，聊天记录（也是智能体的记忆）里才有；期间被清空就不记。
-        try:
-            with guard():
-                self.members.record_own(message.chat_id, text, message.session_id)
-        except SnapshotExpired:
-            pass
+                # 每段确认发送后立即保存该段正文；后段失败不影响已确认的前段。
+                # 只检查记忆代次：已说出口的内容不因随后断线/切音色而丢失，但清空后不能复活。
+                self.members.record_own(message.chat_id, part, message.session_id, expected_epoch=memory_epoch)
         return True
 
 
-def deliver_model_reply(ctx, message, text, *, display_name=None, delivery_guard=None):
+def deliver_model_reply(ctx, message, text, *, display_name=None, delivery_guard=None, voice=False):
+    """开了语音回复就念出来；voice=True 是模型主动选了语音，没开语音回复也念。合成失败（还没发出）退回文字。
+    text 为空时只艾特 display_name 那个人、不说话（后台任务点名时）。"""
+    if not text:
+        if display_name is None or not ctx.reply_at(message, "", display_name=display_name, delivery_guard=delivery_guard):
+            raise RuntimeError("原生回复发送未成功")
+        return True
     speech = getattr(ctx, '_speech', None)
-    if speech is not None and speech.enabled is True:
+    if speech is not None and (voice or speech.enabled is True):
         try:
-            if speech.reply(ctx, message, text, delivery_guard=delivery_guard):
+            if speech.reply(ctx, message, text, delivery_guard=delivery_guard, forced=voice):
                 return True
         except TTSError as error:
             ctx.logger.warning("语音合成失败，回退文字：%s", error)

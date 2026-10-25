@@ -17,6 +17,45 @@ ROOM, OTHER_ROOM, CAT = daily.ROOM, daily.OTHER_ROOM, daily.CAT
 FIRST, SECOND = Voice('a' * 32, '测试甲'), Voice('b' * 32, '测试乙')
 
 
+class EncoderTests(unittest.TestCase):
+    """启用语音回复时缺编码器就按 requirements-voice.txt 锁定的版本自动安装；装不上则启用失败并给出手动命令。"""
+
+    def test_missing_encoder_is_installed_on_enable(self):
+        from wxbot_framework import speech
+        present = iter([False, True])  # 第一次检查没有，装完再检查就有了
+
+        def load(name):
+            if not next(present):
+                raise ImportError(name)
+        run = Mock(return_value=Mock(returncode=0, stdout=b''))
+        with patch.object(speech.subprocess, 'run', run), patch.object(speech.importlib, 'import_module', side_effect=load):
+            speech.ensure_encoder(Mock())
+        command = run.call_args.args[0]
+        self.assertEqual((command[1:4], command[-1]), (['-m', 'pip', 'install'], 'silk-python==0.2.8'))
+
+    def test_failed_install_blocks_enabling_with_a_manual_command(self):
+        from wxbot_framework import speech
+        run = Mock(return_value=Mock(returncode=1, stdout=b'network down'))
+        with patch.object(speech.subprocess, 'run', run), \
+                patch.object(speech.importlib, 'import_module', side_effect=ImportError), self.assertRaisesRegex(ValueError, 'pip install silk-python==0.2.8'):
+            speech.ensure_encoder(Mock())
+
+    def test_agent_installs_the_encoder_on_load_without_failing_on_errors(self):
+        from types import SimpleNamespace
+        from plugins.agent_chat import Plugin as AgentPlugin
+        ctx = SimpleNamespace(members=SimpleNamespace(history_enabled=True), config={"tools": []}, logger=Mock(), llm=None)
+        with patch('plugins.agent_chat.ensure_encoder', side_effect=ValueError('装不上')) as ensure:
+            AgentPlugin().on_load(ctx)  # 装不上也照常启用
+        ensure.assert_called_once()
+
+    def test_present_encoder_installs_nothing(self):
+        from wxbot_framework import speech
+        run = Mock()
+        with patch.object(speech.subprocess, 'run', run), patch.object(speech.importlib, 'import_module'):
+            speech.ensure_encoder(Mock())
+        run.assert_not_called()
+
+
 class SpeechTests(unittest.TestCase):
     setUp = daily.DailySummaryTests.setUp
     tearDown = daily.DailySummaryTests.tearDown
@@ -66,6 +105,26 @@ class SpeechTests(unittest.TestCase):
         self.client.synthesize.assert_called_once_with('这是模型生成的回答。', FIRST.id)
         # 语音没有文字回传：说了什么补记进聊天记录，智能体的记忆里才有
         self.assertEqual([(line['name'], line['text']) for line in self.store.memory(ROOM)[1]], [('你', '这是模型生成的回答。')])
+
+    def test_mode_tells_the_agent_whether_it_speaks_and_forced_voice_works_with_voice_reply_off(self):
+        self.setup_speech()
+        with patch('wxbot_framework.speech.importlib.util.find_spec', return_value=object()):
+            self.assertEqual(self.speech.mode(ROOM), 'always')
+            self.speech.select(ROOM, '关闭')
+            self.assertEqual(self.speech.mode(ROOM), 'optional')  # 本群关了语音：模型仍可在被要求时选语音
+            self.active = False  # 语音回复插件没开
+            self.assertEqual(self.speech.mode(OTHER_ROOM), 'optional')
+        with patch('wxbot_framework.speech.importlib.util.find_spec', return_value=None):
+            self.assertEqual(self.speech.mode(OTHER_ROOM), '')  # 缺 SILK 编码器发不了语音
+        deliver_model_reply(self.ctx, self.message('说句话'), '只发文字')
+        deliver_model_reply(self.ctx, self.message('用语音说', sequence=2), '念给你听', voice=True)
+        self.assertEqual([entry[0:2] for entry in self.backend.sent], [(ROOM, '只发文字'), (ROOM, 'voice')])
+        self.client.synthesize.assert_called_once_with('念给你听', FIRST.id)  # 关闭过也用默认音色
+        with patch('wxbot_framework.speech.importlib.util.find_spec', return_value=object()):
+            self.client.default_voice = ''
+            self.assertEqual(self.speech.mode(OTHER_ROOM), '')  # 没选音色也没默认音色：选了语音也合成不了
+            self.speech.select(OTHER_ROOM, SECOND.name)
+            self.assertEqual(self.speech.mode(OTHER_ROOM), 'optional')  # 选过音色就能用
 
     def test_synthesis_failure_falls_back_before_any_voice_is_sent(self):
         self.setup_speech()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -58,12 +59,16 @@ class Message:
         # 群图片可能暂时没有作者；显式空作者不能回退成群 ID。
         sender = (snapshot.get("sender_id") or "") if "sender_id" in snapshot else (
             snapshot.get("native_sender") or snapshot.get("from_wxid") or "")
+        media = snapshot.get('_media_context')
+        arrived = media.get('received_at') if isinstance(media, dict) else None
+        if type(arrived) not in (int, float) or not math.isfinite(arrived) or arrived < 0:
+            arrived = time.monotonic()
         return cls(text=text,
                    chat_id=snapshot.get("chat_id") or room or snapshot.get("from_wxid") or "",
                    sender_id=sender,
                    receiver_id=snapshot.get("native_receiver") or "", protocol=protocol, type=msg_type,
                    is_group=bool(room), is_self=bool(snapshot.get("is_self", False)), sequence=snapshot.get("sequence", 0),
-                   session_id=session_id, data=MappingProxyType(snapshot))
+                   session_id=session_id, received_at=arrived, data=MappingProxyType(snapshot))
 
 
 class ServiceFacade:
@@ -71,6 +76,7 @@ class ServiceFacade:
 
     def __init__(self, *, text_delay=None):
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._backend = None
         self._available = False
@@ -79,27 +85,45 @@ class ServiceFacade:
         self.message_observer = None
         self.trace_observer = None  # 管理台设置：接收智能体每一步，显示在聊天时间线
         self.sent_recorder = None  # 运行时设置：发出的文字交给它补记进聊天记录
+        self._outgoing_sequence = 0
 
-    def _sent(self, result, backend, chat_id, msg_type, *, text='', path=''):
+    def _next_outgoing(self):
+        with self._lock:
+            self._outgoing_sequence -= 1
+            return self._outgoing_sequence
+
+    @staticmethod
+    def _outgoing_identity(backend, sequence):
+        # 只有显式实现此可选接口的后端参与，不能把 Mock/动态属性误当能力。
+        method = getattr(type(backend), 'outgoing_identity', None)
+        return method(backend, sequence) if callable(method) else nullcontext()
+
+    def _sent(self, result, backend, chat_id, msg_type, *, text='', path='', quote=None, sequence=None):
+        if sequence is None:
+            sequence = self._next_outgoing()
         observer = self.message_observer
         if observer is not None and result is not False:
             try:
                 observer(Message(text, chat_id, type=msg_type, is_self=True,
-                    is_group=chat_id.endswith('@chatroom'), session_id=backend.session_id,
+                    is_group=chat_id.endswith('@chatroom'), session_id=backend.session_id, sequence=sequence,
                     data={'monitor_outgoing': True, 'bot_generated': True,
+                          **({'quote': quote, 'native_type': 49} if quote is not None else {}),
                           'file_name': str(path).replace('\\', '/').rsplit('/', 1)[-1] if path else ''}))
             except Exception:
                 logger.warning('发送已完成，消息监控记录暂不可用')
         recorder = self.sent_recorder
         if recorder is not None and result is not False and msg_type == 1 and text:
             try:
-                recorder(chat_id, text, backend.session_id)
+                if quote is not None:
+                    recorder(chat_id, text, backend.session_id, quote=quote, sequence=sequence)
+                else:
+                    recorder(chat_id, text, backend.session_id, sequence=sequence)
             except Exception:
                 logger.warning('发送已完成，聊天记录暂未写入')
         return result
 
     def bind(self, backend):
-        with self._lock:
+        with self._lifecycle_lock, self._lock:
             if self._backend is not None:
                 raise RuntimeError("已有连接，需先关闭")
             self._backend = backend
@@ -144,11 +168,45 @@ class ServiceFacade:
                 self._check_pending(backend, cancel)
                 # 在文本节奏等待之后检查记录版本，清空后不发送旧总结。
                 with delivery_guard() if delivery_guard is not None else nullcontext():
-                    if _mentions:
-                        result = backend.send_at_text(to_wxid, content, _mentions)
-                    else:
-                        result = backend.send_text(to_wxid, content)
-                    return self._sent(result, backend, to_wxid, 1, text=content)
+                    sequence = self._next_outgoing()
+                    with self._outgoing_identity(backend, sequence):
+                        if _mentions:
+                            result = backend.send_at_text(to_wxid, content, _mentions)
+                        else:
+                            result = backend.send_text(to_wxid, content)
+                    return self._sent(result, backend, to_wxid, 1, text=content, sequence=sequence)
+
+    def send_quote(self, to_wxid, quote, *, created_at=0, expected_session=None, delivery_check=None):
+        from .quotes import normalize_quote
+        validate_target(to_wxid)
+        quote = normalize_quote(quote)
+        if quote is None or to_wxid.endswith('@chatroom') or quote['reference']['type'] != 1:
+            raise ValueError('原生引用暂限私聊普通文字')
+        if len(quote['reply'].encode('utf-8')) > 1023:
+            raise ValueError('引用回复正文超过 1023 字节')
+        with self._lock:
+            if not self._available or self._backend is None:
+                raise RuntimeError('微信尚未连接')
+            if expected_session is not None and expected_session != self._backend.session_id:
+                raise RuntimeError('微信连接已变化，取消旧会话引用')
+            if not callable(getattr(self._backend, 'send_quote', None)):
+                raise CapabilityError('当前后端尚未开放原生引用')
+            backend, cancel = self._backend, self._cancel
+        with self._send_lock:
+            with self._lock:
+                self._check_pending(backend, cancel)
+            if cancel.wait(self.text_delay.seconds_for(quote['reply'])):
+                raise RuntimeError('微信连接已结束，取消待发送引用')
+            with self._lock:
+                self._check_pending(backend, cancel)
+                if delivery_check is not None and not delivery_check():
+                    raise RuntimeError('原引用消息已撤回或变化，取消发送')
+                sequence = self._next_outgoing()
+                with self._outgoing_identity(backend, sequence):
+                    result = backend.send_quote(to_wxid, quote, created_at=created_at)
+                ref = quote['reference']
+                text = f"「引用 {ref['sender_name']}：{ref['content']}」\n{quote['reply']}"
+                return self._sent(result, backend, to_wxid, 1, text=text, quote=quote, sequence=sequence)
 
     def send_image(self, to_wxid, path, *, expected_session=None, delivery_guard=None):
         validate_target(to_wxid)
@@ -257,7 +315,7 @@ class ServiceFacade:
                 self._check_pending(backend, cancel)
                 return result
 
-    def _manage(self, operation, *arguments, expected_session=None):
+    def _manage(self, operation, *arguments, expected_session=None, read_only=False):
         """将账号管理操作与发送、切号和卸载串行化，不使用文本等待。"""
         with self._lock:
             if self._backend is None or not self._available:
@@ -268,13 +326,17 @@ class ServiceFacade:
             if not callable(method):
                 raise CapabilityError("当前后端尚未开放此账号管理操作")
             backend, cancel = self._backend, self._cancel
-        with self._send_lock:
+        # 只读缓存查询不排队等打字节奏；真实读操作仍受连接锁保护，不能与卸载并行。
+        with nullcontext() if read_only else self._send_lock:
             with self._lock:
                 self._check_pending(backend, cancel)
                 return method(*arguments)
 
     def friend_requests(self, *, expected_session=None):
-        return self._manage("friend_requests", expected_session=expected_session)
+        return self._manage("friend_requests", expected_session=expected_session, read_only=True)
+
+    def resolve_quote_reference(self, source, *, expected_session=None):
+        return self._manage('resolve_quote_reference', dict(source), expected_session=expected_session, read_only=True)
 
     def accept_friend(self, request_id, *, expected_session=None):
         if not isinstance(request_id, str) or not request_id or len(request_id) > 80:
@@ -295,7 +357,7 @@ class ServiceFacade:
     def group_members(self, room, *, expected_session=None):
         """读取当前账号的完整群成员快照；缓存未就绪时返回 None。"""
         from .group_management import validate_group_id
-        return self._manage("group_members", validate_group_id(room), expected_session=expected_session)
+        return self._manage("group_members", validate_group_id(room), expected_session=expected_session, read_only=True)
 
     def group_member_name(self, room, wxid, *, expected_session=None):
         from .account import validate_account
@@ -319,8 +381,8 @@ class ServiceFacade:
 
     def send_at_text(self, room_wxid, content, at_list, *, expected_session=None, display_names=None, delivery_guard=None):
         members = validate_mentions(room_wxid, at_list)
-        if not isinstance(content, str) or not content:
-            raise ValueError("文本正文必须是非空字符串")
+        if not isinstance(content, str):
+            raise ValueError("文本正文必须是字符串")
         names = members if display_names is None else display_names
         if not isinstance(names, (list, tuple)) or len(names) != len(members) or any(
                 not isinstance(name, str) or not name.strip() or len(name) > 64 or
@@ -328,7 +390,7 @@ class ServiceFacade:
             raise ValueError("艾特显示昵称必须与成员列表一一对应，且每个昵称最多 64 字符")
         # 标签用于显示；真实通知始终使用 members 中的微信 ID。
         labels = " ".join("@" + name + "\u2005" for name in names)
-        return self.send_text(room_wxid, labels + "\n" + content,
+        return self.send_text(room_wxid, labels + ("\n" + content if content else ""),  # \u6b63\u6587\u4e3a\u7a7a\u5c31\u53ea\u827e\u7279
                               expected_session=expected_session, _mentions=members, delivery_guard=delivery_guard)
 
     def _check_pending(self, backend, cancel):
@@ -347,13 +409,18 @@ class ServiceFacade:
         return self.send_text(data["to_wxid"], data["content"], expected_session=expected_session)
 
     def close(self):
-        with self._lock:
-            self.cancel_pending()
-            if self._backend is None:
-                return None
-            # 清理失败时仍持有此实例，下次可以继续清理，不能重新注入。
-            result = self._backend.stop()
-            self._backend = None
+        with self._lifecycle_lock:
+            with self._lock:
+                self.cancel_pending()
+                backend = self._backend
+                if backend is None:
+                    return None
+            # stop 会 join 接收线程；不能持连接锁，否则接收回调无法检查失效会话。
+            # 生命周期锁禁止清理期间 bind，失败时保留原实例以便重试。
+            result = backend.stop()
+            with self._lock:
+                if self._backend is backend:
+                    self._backend = None
             return result
 
 

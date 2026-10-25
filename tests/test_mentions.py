@@ -33,6 +33,10 @@ class MentionTests(unittest.TestCase):
         self.service.send_at_text(ROOM, "测试", [MEMBER], display_names=["群昵称"])
         self.assertEqual(self.backend.sent, (ROOM, "@群昵称\u2005\n测试", (MEMBER,)))
 
+    def test_empty_body_sends_only_the_mention(self):
+        self.service.send_at_text(ROOM, "", [MEMBER], display_names=["群昵称"])
+        self.assertEqual(self.backend.sent, (ROOM, "@群昵称" + chr(0x2005), (MEMBER,)))
+
     def test_reply_at_keeps_session_and_uses_sender(self):
         ctx = PluginContext("example", {}, self.service, [])
         message = Message("测试", ROOM, MEMBER, is_group=True, session_id="one")

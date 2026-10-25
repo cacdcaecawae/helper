@@ -1,11 +1,11 @@
 """验证独立接龙、合并首答和发送失败时的状态，使用内存上下文。"""
 import logging
-import time
 import unittest
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from plugins.idiom_chain import Plugin, HELP
+from plugins.idiom_chain import Plugin, HELP, Game
 from wxbot_framework.llm import LLMError
 from wxbot_framework.sdk import Message
 from wxbot_framework.personality import PersonalityState
@@ -50,13 +50,26 @@ class Context:
 
 class IdiomPluginTests(unittest.TestCase):
     def setUp(self):
+        self.clock_value = 1000.0
+        clock = patch('plugins.idiom_chain.time', SimpleNamespace(monotonic=self.tick))
+        clock.start()
+        self.addCleanup(clock.stop)
+        # dataclass 的默认工厂在导入时已捕获真实时钟，实例起始时间也使用同一个测试时钟。
+        factory = patch('plugins.idiom_chain.Game', side_effect=lambda *args, **kwargs:
+                        Game(*args, started_at=self.tick(), **kwargs))
+        factory.start()
+        self.addCleanup(factory.stop)
         self.ctx = Context()
         self.plugin = Plugin()
         self.plugin.on_load(self.ctx)
 
+    def tick(self):
+        self.clock_value += 0.01
+        return self.clock_value
+
     def send(self, text, sender=A, room=ROOM, *, session="one", received_at=None, is_self=False, is_group=True):
         message = Message(text, room, sender_id=sender, session_id=session, is_group=is_group,
-                          is_self=is_self, received_at=time.monotonic() if received_at is None else received_at)
+                          is_self=is_self, received_at=self.tick() if received_at is None else received_at)
         self.plugin.on_message(message, self.ctx)
         return message
 
@@ -67,7 +80,7 @@ class IdiomPluginTests(unittest.TestCase):
     def test_two_players_are_independent_and_use_member_names(self):
         self.start()
         # 两个答案都在机器人第一次回复之前到达：B 仍应从开场词接。
-        b_received = time.monotonic()
+        b_received = self.tick()
         self.send("意气风发", A)
         self.send("意气风发", B, received_at=b_received)
         game = self.plugin.games[ROOM]
@@ -105,7 +118,7 @@ class IdiomPluginTests(unittest.TestCase):
         game = self.plugin.games[ROOM]
         self.assertEqual(game.shared.current, "发扬光大")
         self.assertEqual(game.players, {})
-        arrived = time.monotonic()
+        arrived = self.tick()
         self.ctx.llm.result["next_idiom"] = "方兴未艾"
         self.send("大大方方", A, received_at=arrived)
         count = len(self.ctx.sent)
@@ -117,7 +130,7 @@ class IdiomPluginTests(unittest.TestCase):
     def test_failed_merged_answer_still_consumes_round(self):
         self.start()
         self.send("合并接龙")
-        arrived = time.monotonic()
+        arrived = self.tick()
         self.send("异想天开", received_at=arrived)
         count = len(self.ctx.sent)
         self.send("意气风发", B, received_at=arrived)

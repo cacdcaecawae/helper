@@ -118,6 +118,8 @@ static bool valid_target(const char* target) {
     return true;
 }
 
+#include "manual_text_receive.h"
+
 struct TextCompletion {
     volatile LONG references;
     uint32_t padding;
@@ -289,6 +291,24 @@ struct ReceiveStatistics {
 static ReceiveStatistics receive_statistics{};
 static_assert(sizeof(ReceiveStatistics) == 64, "Unexpected receive statistics ABI");
 
+static void copy_sync_text(const unsigned char* message, const char* sender,
+                           const char* receiver, const char* source, uint64_t message_id) {
+    char short_text[1024]{};
+    if (read_pb_string(message, 0x20, short_text, sizeof(short_text))) {
+        enqueue_received(sender, receiver, short_text, source, 1, nullptr, 0, message_id);
+        return;
+    }
+    // Reuse the V5 large field and flag 16, also used by local text capture.
+    // Keep the ABI and small-message path unchanged; never truncate UTF-8.
+    constexpr size_t capacity = sizeof(ReceivedMessage::image_xml);
+    char* content = static_cast<char*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, capacity));
+    if (!content) return;
+    __try {
+        if (read_pb_string(message, 0x20, content, capacity))
+            enqueue_received(sender, receiver, "", source, 1, content, 16, message_id);
+    } __finally { HeapFree(GetProcessHeap(), 0, content); }
+}
+
 static void copy_app_message(const unsigned char* message, const char* sender,
                              const char* receiver, const char* source) {
     char* content = static_cast<char*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 262144));
@@ -319,7 +339,7 @@ static void sample_all_text(const uintptr_t* batch, size_t stride) {
             if (type == 3) _InterlockedIncrement64(&receive_statistics.images);
             const bool monitor_only = type == 34 || type == 43 || type == 47 || type == 62;
             if (type != 1 && type != 3 && type != 49 && type != 10000 && type != 10002 && !monitor_only) continue;
-            char sender[128]{}, receiver[128]{}, text[1024]{};
+            char sender[128]{}, receiver[128]{};
             if (!read_pb_string(message, 8, sender, sizeof(sender)) || !valid_target(sender) ||
                 !read_pb_string(message, 0x18, receiver, sizeof(receiver)) || !valid_target(receiver)) continue;
             // 接收瞬间复制元数据，不持有任何微信消息对象或字符串指针。
@@ -342,8 +362,8 @@ static void sample_all_text(const uintptr_t* batch, size_t stride) {
                 } else {
                     if (type == 3) _InterlockedIncrement64(&receive_statistics.invalid_images);
                 }
-            } else if (read_pb_string(message, 0x20, text, sizeof(text))) {
-                enqueue_received(sender, receiver, text, source, 1, nullptr, 0, message_id);
+            } else {
+                copy_sync_text(message, sender, receiver, source, message_id);
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -385,7 +405,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxStartTextReceiver(void* paramete
     receive_hook_created = true;
     const DWORD friend_status = friend_receive_start();
     if (friend_status != ERROR_SUCCESS) return friend_status;
-    return recall_receive_start();
+    const DWORD recall_status = recall_receive_start();
+    if (recall_status != ERROR_SUCCESS) return recall_status;
+    return manual_text_receive_start();
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxPollTextMessage(void* parameter) {
@@ -451,6 +473,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxGetReceiveStatistics(void* param
 #include "voice_send.h"
 #include "file_download.h"
 #include "file_send.h"
+#include "quote_send.h"
 #include "group_management.h"
 #include "friend_request.h"
 #include "friend_receive.h"

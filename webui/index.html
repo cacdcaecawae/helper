@@ -46,13 +46,14 @@
             <section class="settings-section manual-send hc-composer" aria-labelledby="send-heading">
       <div class="section-heading"><h2 id="send-heading">发送消息</h2><button id="refresh-send-chats" class="secondary small" type="button">刷新会话</button></div>
       <form id="send-form">
+          <div id="chat-quote-preview" class="hc-quote-preview hidden" role="status"><span id="chat-quote-text"></span><button id="chat-quote-cancel" type="button" aria-label="取消引用">×</button></div>
         <div class="hidden"><label for="send-chat">会话</label><select id="send-chat" required><option value="">选择会话</option></select></div>
         <div id="send-group" class="hidden">
           <div class="section-heading member-heading"><h3>艾特成员 <span id="mention-count" class="count">已选 0 / 8</span></h3><button id="refresh-send-members" class="text-button small" type="button">刷新成员</button></div>
           <label class="sr-only" for="member-search">搜索群成员</label><input id="member-search" type="search" placeholder="搜索昵称、微信 ID 或身份" autocomplete="off">
           <div class="table-container member-scroll"><table class="member-table"><thead><tr><th scope="col"><span class="sr-only">选择</span></th><th scope="col">群成员</th><th scope="col">身份</th></tr></thead><tbody id="send-members"><tr><td colspan="3" class="table-empty">请先选择群聊。</td></tr></tbody></table></div>
         </div>
-        <button type="button" id="chat-mention-toggle" class="hidden" title="艾特群成员" aria-label="艾特群成员">@</button><label class="sr-only" for="send-content">正文</label><textarea id="send-content" rows="3" required placeholder="输入文字" spellcheck="false"></textarea>
+        <div class="hc-composer-tools"><button type="button" id="chat-mention-toggle" class="hidden" title="艾特群成员" aria-label="艾特群成员">@</button><button type="button" id="chat-task-toggle" aria-pressed="false" title="交代：写给智能体的一次性任务，它接着上下文在这个会话里主动说话；任务本身不发到微信、不入库">交代</button></div><label class="sr-only" for="send-content">正文</label><textarea id="send-content" rows="3" required placeholder="输入文字" spellcheck="false"></textarea>
         <div class="form-footer"><p id="send-status" class="send-status" role="status" aria-live="polite"></p><button id="send-text" class="primary" type="submit" disabled>发送</button></div>
       </form>
     </section>

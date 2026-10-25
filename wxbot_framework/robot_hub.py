@@ -119,6 +119,7 @@ class RobotProxy:
         from urllib.parse import urlencode
         return self.request('group-members?' + urlencode({'room': room}))
     def send_text(self, data): return self.request('send-text', data)
+    def agent_task(self, data): return self.request('agent-task', data)
     def send_connection(self): return self.request('send-connection')
     def send_status(self, identifier):
         from urllib.parse import urlencode

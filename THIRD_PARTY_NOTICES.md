@@ -12,4 +12,9 @@
 
 Python 依赖通过 `requirements.txt` 安装，不将它们的二进制复制进本仓库。表情缓存解密使用 cryptography，图片结构校验使用 Pillow，WXGF 动画转换使用 imageio-ffmpeg 所带的 FFmpeg；这些软件的许可证随各自发行包提供。
 
+`wxbot_framework/contact_keys.py` 的 Windows `Config.Cipher` 对象布局与混淆格式参考并改写自
+[CloudDreamAI / TANGandXUE 的 wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool/blob/main/wcdb_key_tool_windows.py)，
+遵循 MIT License，版权与完整许可见 [`docs/licenses/wcdb-key-tool.txt`](docs/licenses/wcdb-key-tool.txt)。
+这里只读取绑定账号的 `contact.db`，不使用上游的落盘密钥缓存、批量数据库导出或调试器路线。
+
 可选的 WAV 语音转码依赖通过 `requirements-voice.txt` 安装，使用 [silk-python / pysilk](https://github.com/synodriver/pysilk)；其 Python 绑定与 SILK 编码器的许可证随发行包提供。本仓库不复制编码器源码或二进制。

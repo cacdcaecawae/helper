@@ -163,6 +163,22 @@ class NativeVersionBridgeTests(unittest.TestCase):
             self.assertIsNone(re.search(r"vtable_rva\s*!=\s*0x[0-9a-f]+", text), path.name)
         self.assertEqual(used, set(VERIFIED_RVAS))
 
+    def test_quote_only_targets_use_named_exact_56_resolver_without_legacy_aliases(self):
+        expected = {'QuoteReferenceVtable':0x8f704b8, 'LookupMessage':0x17da070,
+                    'MaterializeReference':0x183b690, 'BuildQuote':0x3a1b050,
+                    'DestroyReference':0x1b64f0, 'DestroyTyped':0x1cc640}
+        text = code_without_comments(source('core_version.h'))
+        rows = re.findall(r'case Core56Target::(\w+): return (0x[0-9a-f]+);', text)
+        self.assertEqual(len(rows), len(expected))
+        self.assertEqual({name:int(rva,16) for name,rva in rows}, expected)
+        resolver = text.split('static uintptr_t core56_rva(', 1)[1]
+        self.assertIn('if (InterlockedCompareExchange(&core_profile_id, 0, 0) != 2) return 0;', resolver)
+        self.assertIn('default: return 0;', resolver)
+        used = set()
+        for name in ('manual_text_receive.h', 'quote_send.h'):
+            used.update(re.findall(r'core56_address\(core_base, Core56Target::(\w+)\)', source(name)))
+        self.assertEqual(used, set(expected))
+
     def test_hook_cleanup_uses_the_same_canonical_targets_as_install(self):
         text = code_without_comments(source("selftest_bridge.cpp"))
         removal = text.split("DWORD WINAPI WxRemoveSelfTest(void*)", 1)[1].split("BOOL WINAPI DllMain", 1)[0]

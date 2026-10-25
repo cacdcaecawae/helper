@@ -14,6 +14,7 @@ from run_selftest import TEXT_DLL, K, check, modules, wechat_candidates, run
 from wxbot_framework.text import TextRouter, validate_target, validate_mentions
 from wxbot_framework.account import read_current_account, read_current_profile, select_account_process, validate_account
 from wxbot_framework.contacts import read_contact_name
+from wxbot_framework.message_identity import OwnTextEchoes
 
 logger = logging.getLogger("NativeText")
 
@@ -80,9 +81,14 @@ class NativeTextService(NativeFileHelperService):
         self.chats = {}
         self._next_account_check = 0
         self._sent_texts = deque(maxlen=64)
+        self._own_text_echoes = OwnTextEchoes()
+        self._sent_quotes = deque(maxlen=64)
+        self._outgoing_sequence = 0
         self.mention_messages = 0
         self.media_directory = Path(media_directory or Path(__file__).resolve().parent.parent / ".runtime/images")
         self.image_allowlist = frozenset(image_allowlist)
+        self.media_chat_allowed = None  # 运行时注入，与文字共用实时白名单/会话开关
+        self.media_context_provider = None
         self._image_receiver = None
         self._file_receiver = None
         self._forwarded_receiver = None
@@ -96,15 +102,27 @@ class NativeTextService(NativeFileHelperService):
         self.last_send_result = None
         self._friend_requests = None
         self._friend_session_id = ""
+        self._contact_names = None
 
     @property
     def self_wxid(self):
         return self.router.self_wxid
 
+    def _media_allowed(self, chat):
+        if self.media_chat_allowed is None:
+            return not self.image_allowlist or chat in self.image_allowlist
+        try:
+            return bool(self.media_chat_allowed(chat))
+        except Exception:
+            logger.warning('媒体会话配置暂不可读，跳过下载')
+            return False
+
     def start(self):
         self.router = TextRouter(include_self=True)
         self.chats = {}
         self._sent_texts.clear()
+        self._own_text_echoes.clear()
+        self._sent_quotes.clear()
         if self.pid is None:
             self.pid = find_account_process(self.preferred_account)
         elif self.preferred_account and inspect_account(self.pid) != self.preferred_account:
@@ -124,6 +142,7 @@ class NativeTextService(NativeFileHelperService):
         if self.preferred_account and account != self.preferred_account:
             raise RuntimeError("目标进程登录的不是绑定的机器人账号，等待正确账号登录")
         self.router.set_account(account)
+        self._start_contact_names(account)
         from wxbot_framework.friend_requests import PendingFriendRequests
         self._friend_session_id = uuid.uuid4().hex
         self._friend_requests = PendingFriendRequests(account, self._friend_session_id)
@@ -213,6 +232,9 @@ class NativeTextService(NativeFileHelperService):
 
     def stop(self):
         self._stop.set()
+        if self._contact_names is not None:
+            self._contact_names.close()
+            self._contact_names = None
         if self._friend_requests is not None:
             self._friend_requests.close()
             self._friend_requests = None
@@ -238,6 +260,9 @@ class NativeTextService(NativeFileHelperService):
             return
         account = self._read_account()
         if not account or account != self.self_wxid:
+            if self._contact_names is not None:
+                self._contact_names.close()
+                self._contact_names = None
             error = RuntimeError("微信已退出登录或当前账号发生变化，重新连接并自动识别")
             self.last_error = error
             self._stop.set()
@@ -257,8 +282,43 @@ class NativeTextService(NativeFileHelperService):
             self._check_account(force=True)
             rows = read_group_members(self._channel.read_memory, self._channel.core_base, room,
                                       expected_account=self.self_wxid)
+            if rows is not None and self._contact_names is not None:
+                enriched = []
+                for row in rows:
+                    row = dict(row)
+                    if not row.get("wechat_name"):
+                        name = self._contact_names.get(row["wxid"], account=self.self_wxid)
+                        if name:
+                            row["wechat_name"] = name
+                            row["nickname"] = row.get("group_nickname") or name
+                    enriched.append(row)
+                rows = tuple(enriched)
             self._check_account(force=True)
             return rows
+
+    def _start_contact_names(self, account):
+        """已有账号/PID 选择负责绑定；可选只读补全失败不影响原生连接。"""
+        from wxbot_framework.contact_names import ContactNames, load_contact_names
+        from wxbot_framework.contact_keys import ContactProcess
+        if self._contact_names is not None:
+            self._contact_names.close()
+        pid = self.pid  # 不在后台随可变服务字段切换账号或进程。
+        directory = self.wechat_data_directory
+
+        def process_factory():
+            core = modules(pid).get("weixin.dll")
+            if not core:
+                raise RuntimeError("联系人进程已退出")
+            return ContactProcess(pid, core[0], core[1])
+
+        def loader(**options):
+            return load_contact_names(account, process_factory, directory, **options)
+
+        try:
+            self._contact_names = ContactNames(account, loader)
+        except Exception:
+            self._contact_names = None
+            logger.warning("联系人名字补全未启动，保留原有缓存")
 
     def _sender_wechat_name(self, wxid):
         if self._channel is None:
@@ -268,6 +328,9 @@ class NativeTextService(NativeFileHelperService):
         if name is None and wxid == self.self_wxid:
             profile = read_current_profile(self._channel.read_memory, self._channel.core_base)
             name = profile["name"] if profile and profile["wxid"] == wxid else None
+        if (not name and self._contact_names is not None and
+                read_current_account(self._channel.read_memory, self._channel.core_base) == self.self_wxid):
+            name = self._contact_names.get(wxid, account=self.self_wxid)
         return name
 
     def _chat_name(self, chat):
@@ -302,23 +365,46 @@ class NativeTextService(NativeFileHelperService):
             return None
         previous = self.self_wxid
         previous_unparsed = self.router.unparsed_groups
-        body = (getattr(message, "image_xml", b"") if message.type != 1 else message.text).decode("utf-8", errors="replace")
-        data = self.router.convert(message.sender.decode("utf-8"), message.receiver.decode("utf-8"),
+        local_send = bool(getattr(message, 'reserved', 0) & 8)
+        local_quote = local_send and message.type == 49 and bool(getattr(message, 'reserved', 0) & 32)
+        if local_send:
+            if message.type != 1 and not local_quote:
+                return None
+            self._check_account(force=True)
+        large_text = message.type == 1 and bool(getattr(message, 'reserved', 0) & 16)
+        body = (getattr(message, "image_xml", b"") if message.type != 1 or large_text else message.text).decode("utf-8", errors="replace")
+        sender = self.self_wxid if local_send else message.sender.decode("utf-8")
+        data = self.router.convert(sender, message.receiver.decode("utf-8"),
                                    body, sequence=message.sequence, msg_type=message.type,
                                    thread_id=message.thread_id)
         if self.self_wxid and not previous:
             logger.info("当前账号已识别；好友和群聊文本已就绪")
         if data:
             data['native_message_id'] = str(getattr(message, 'native_message_id', 0) or '')
+            if data['is_self'] and message.type == 1:
+                data = self._own_text_echoes.accept(data, local=local_send)
+                if data is None:
+                    return None
+                if data.get('echo_update'):
+                    return data
+            if local_send:
+                data['local_send'] = True
+            if local_quote:
+                from wxbot_framework.quotes import quote_capture_metadata
+                metadata = quote_capture_metadata(getattr(message, 'mention_source', b''))
+                if metadata is not None:
+                    data['quote_capture'] = metadata
+                # 原生发送监听只观察，绝不因引用自己而触发再次回复（含文件助手）。
+                data['dispatch_to_plugins'] = False
             name = self._sender_wechat_name(data["sender_id"]) if data["sender_id"] else None
             if name:
                 data["sender_wechat_name"] = name
-            source = getattr(message, "mention_source", b"").decode("utf-8", errors="replace")
+            source = '' if local_quote else getattr(message, "mention_source", b"").decode("utf-8", errors="replace")
             data["at_members"] = parse_at_members(source)
             data["is_at_self"] = bool(data["room_wxid"] and self.self_wxid in data["at_members"])
             if data["at_members"]:
                 self.mention_messages += 1
-            sent = data["is_self"] and next((entry for entry in tuple(self._sent_texts) if entry[0] == data["chat_id"] and
+            sent = message.type == 1 and data["is_self"] and next((entry for entry in tuple(self._sent_texts) if entry[0] == data["chat_id"] and
                                              entry[1] == data["msg"] and time.monotonic() - entry[2] < 120), None)
             if sent:
                 try:  # 一次发送只认领一条回传：之后手动发同样的话是你自己说的，照常显示、记录
@@ -327,13 +413,66 @@ class NativeTextService(NativeFileHelperService):
                     pass
                 self.router.ignored_self += 1
                 data["bot_generated"] = True
+                data["own_text_recorded"] = message.type == 1
                 data["dispatch_to_plugins"] = False
+                if len(sent) > 4 and type(sent[4]) is int and sent[4] < 0:
+                    data['outgoing_sequence'] = sent[4]
             elif data["is_at_self"]:
                 data["dispatch_to_plugins"] = True
             self._remember_chat(data["chat_id"], bool(data["room_wxid"]))
+            if message.type == 49:
+                from wxbot_framework.quotes import parse_quote, parse_local_quote_snapshot, QuoteError
+                try:
+                    if local_quote and getattr(message, 'reserved', 0) & 64:
+                        quote = parse_local_quote_snapshot(body, chat_id=data['chat_id'], self_id=self.self_wxid,
+                                                           resolve_name=self._sender_wechat_name)
+                    else:
+                        quote = parse_quote(data.get('raw_content', data['msg']), chat_id=data['chat_id'])
+                except QuoteError:
+                    quote = None
+                if quote is not None:
+                    data.update(msg=quote.text, content=quote.text, wx_type=1, native_type=49, app_type=57,
+                        quote_is_self=quote.scope_valid and quote.author_id == self.self_wxid,
+                        quote_reply=quote.reply, quoted_sender_id=quote.author_id, quoted_message_id=quote.message_id)
+                    data['quote'] = quote.public()
+                    data.pop('raw_content', None)
+                    if data['is_self']:
+                        # XML 与本机 JSON 先统一成结构化引用；昵称差异不影响消息身份。
+                        data = self._own_text_echoes.accept(data, local=local_send)
+                        if data is None or data.get('echo_update'):
+                            return data
+                        marker = next((item for item in tuple(self._sent_quotes) if
+                            (item[0], item[1].strip(), item[2]) == (data['chat_id'], quote.reply.strip(), quote.message_id)
+                            and time.monotonic() - item[3] < 120), None)
+                        if marker is not None:
+                            try:
+                                self._sent_quotes.remove(marker)
+                            except ValueError:
+                                pass
+                            data.update(bot_generated=True, own_text_recorded=True, dispatch_to_plugins=False)
+                            if len(marker) > 4 and type(marker[4]) is int and marker[4] < 0:
+                                data['outgoing_sequence'] = marker[4]
+                    return data
+                if local_quote:
+                    # 布局未确认或 XML 不完整：只显示诊断，不误当文件下载，不写入上下文。
+                    notice = '[本机引用：结构待确认]'
+                    reply = message.text.decode('utf-8', errors='replace')
+                    if reply:
+                        notice += '\n' + reply
+                    data.update(msg=notice, content=notice,
+                                app_type=57, monitor_only=True, dispatch_to_plugins=False)
+                    data.pop('raw_content', None)
+                    return data
             if message.type in (34, 43, 47, 62):
                 data['monitor_only'] = True
                 return data
+            if message.type in (3, 49) and self.media_context_provider is not None:
+                try:
+                    data['_media_context'] = self.media_context_provider(data['chat_id'])
+                except Exception:
+                    logger.warning('媒体接收代次暂不可读，跳过本次下载')
+                    return None
+            media_allowed = self._media_allowed(data['chat_id']) if message.type in (3, 49) else False
             forwarded = None
             if message.type == 49:
                 from wxbot_framework.forwarded import ForwardedError, parse_forwarded
@@ -345,7 +484,7 @@ class NativeTextService(NativeFileHelperService):
                 if forwarded is not None:
                     data.update(forwarded.public())
                     data['forwarded_status'] = 'pending'
-                    if self.image_allowlist and data['chat_id'] not in self.image_allowlist:
+                    if not media_allowed:
                         data['forwarded_status'] = 'metadata'
                         for item in data['forwarded_records']:
                             if item.get('image_status') == 'pending':
@@ -357,19 +496,17 @@ class NativeTextService(NativeFileHelperService):
                 if monitor is not None:
                     monitor(dict(data, monitor_only=True))
             if message.type == 3 and self._image_receiver is not None:
-                if not self.image_allowlist or data["chat_id"] in self.image_allowlist:
+                if media_allowed:
                     self._image_receiver.submit(data)
                 return None
             if message.type == 49:
                 if forwarded is not None:
-                    if self._forwarded_receiver is not None and (
-                            not self.image_allowlist or data['chat_id'] in self.image_allowlist):
+                    if self._forwarded_receiver is not None and media_allowed:
                         self._forwarded_receiver.submit(data, forwarded)
                     return None
                 if data.get('app_type') == 19 or data.get('metadata_unavailable'):
                     return None
-                if self._file_receiver is not None and (
-                        not self.image_allowlist or data["chat_id"] in self.image_allowlist):
+                if self._file_receiver is not None and media_allowed:
                     self._file_receiver.submit(data)
                 return None
         elif self.router.unparsed_groups > previous_unparsed:
@@ -616,15 +753,101 @@ class NativeTextService(NativeFileHelperService):
                 # 不持久化密钥；引用只活到这次显式导出结束。
                 del key
 
+    def resolve_quote_reference(self, source):
+        import hashlib
+        from wxbot_framework.contact_keys import ContactProcess
+        from wxbot_framework.account import read_current_account
+        from wxbot_framework.native_profiles import profile_for_fingerprint
+        from wxbot_framework.quote_references import resolve_cached_quote, QuoteReferenceError
+        with self._calls:
+            if not self._owns_bridge or self._stop.is_set() or self._channel is None:
+                raise QuoteReferenceError('请先连接机器人，再核对原消息')
+            self._check_account(force=True)
+            account = self.self_wxid
+            core = modules(self.pid).get('weixin.dll')
+            if core is None:
+                raise QuoteReferenceError('微信核心模块已变化')
+            path, digest = Path(core[1]), hashlib.sha256()
+            with path.open('rb') as stream:
+                for block in iter(lambda: stream.read(2*1024*1024), b''):
+                    if self._stop.is_set():
+                        raise QuoteReferenceError('连接已停止，取消核对')
+                    digest.update(block)
+            profile = profile_for_fingerprint(path.stat().st_size, digest.hexdigest())
+            if profile is None or profile.version != '4.1.15.56':
+                raise QuoteReferenceError('此微信构建尚未验证旧消息原生引用')
+            with ContactProcess(self.pid, core[0], path) as process:
+                def check():
+                    if self._stop.is_set() or read_current_account(process.read, core[0]) != account:
+                        raise QuoteReferenceError('微信账号或连接已变化，取消核对')
+                result = resolve_cached_quote(process, dict(source), account, check=check)
+            self._check_account(force=True)
+            return result
+
+    def send_quote(self, to_wxid, quote, *, created_at=0, probe=False):
+        from wxbot_framework.quotes import normalize_quote
+        from wxbot_framework.quote_references import QuoteReferenceError
+        validate_target(to_wxid)
+        quote = normalize_quote(quote)
+        if quote is None:
+            raise ValueError('引用消息格式无效')
+        if type(probe) is not bool:
+            raise ValueError('引用检查标志必须是布尔值')
+        with self._calls:
+            if not self._owns_bridge or self._stop.is_set() or self._channel is None:
+                raise RuntimeError('原生引用服务没有运行')
+            self._check_account(force=True)
+            marker = (to_wxid, quote['reply'], quote['reference']['message_id'], time.monotonic(), self._outgoing_sequence)
+            if not probe:
+                self._sent_quotes.append(marker)
+            try:
+                self.last_result = self.last_send_result = self._run('--quote', pid=self.pid, target=to_wxid,
+                    text=quote['reply'], quote=quote, quote_probe=probe, quote_created_at=created_at,
+                    account=self.self_wxid, keep_loaded=True, preserve_report=self.preserve_reports)
+                success = self.last_result.get('success') is True
+            except BaseException:
+                if not probe and marker in self._sent_quotes:
+                    self._sent_quotes.remove(marker)
+                raise
+            if not success and not probe and marker in self._sent_quotes:
+                self._sent_quotes.remove(marker)
+            self._check_account(force=True)
+            if not success:
+                report = self.last_result.get('report', {})
+                if isinstance(report, dict) and report.get('diagnostic_version') == 2:
+                    stage = report.get('stage')
+                    stage = stage if type(stage) is int and 90 <= stage <= 99 else 0
+                    if report.get('send_called') is False:
+                        if report.get('status') == 1168:  # ERROR_NOT_FOUND
+                            raise QuoteReferenceError('微信没有查到这条原消息，未发送引用；请确认原消息仍存在')
+                        if report.get('stage') == 95 and report.get('status') == 13:
+                            raise QuoteReferenceError('原消息数据不完整或会话/作者不符，已取消引用发送')
+                        raise QuoteReferenceError(f'原生引用准备失败（阶段 {stage}），尚未调用发送；需要检查原生日志')
+                    raise QuoteReferenceError(f'原生引用发送状态未确认（阶段 {stage}）；请先核对微信是否收到，不要连续重试')
+            return success
+
     def _send_text(self, to_wxid, content, *, mentions=None):
         validate_target(to_wxid)
         with self._calls:
             if not self._owns_bridge or self._stop.is_set():
                 raise RuntimeError("原生文本服务没有运行")
             self._check_account(force=True)
-            self._sent_texts.append((to_wxid, content, time.monotonic()))
-            self.last_result = self._run("--dispatch", pid=self.pid, text=content, target=to_wxid,
-                                        keep_loaded=True, preserve_report=self.preserve_reports, mentions=mentions)
+            pending = (to_wxid, content, time.monotonic(), uuid.uuid4().hex, self._outgoing_sequence)
+            self._sent_texts.append(pending)
+            try:
+                self.last_result = self._run("--dispatch", pid=self.pid, text=content, target=to_wxid,
+                                            keep_loaded=True, preserve_report=self.preserve_reports, mentions=mentions)
+            except BaseException:
+                try:
+                    self._sent_texts.remove(pending)
+                except ValueError:
+                    pass
+                raise
+            if self.last_result.get("success") is not True:
+                try:
+                    self._sent_texts.remove(pending)
+                except ValueError:
+                    pass
             if content.startswith("WXBOT_"):
                 logger.info("测试文本发送完成：chat_id=%s success=%s native_thread=%s",
                             to_wxid, self.last_result["success"],

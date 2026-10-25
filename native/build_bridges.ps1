@@ -1,4 +1,4 @@
-﻿param([ValidateSet('all', 'text', 'filehelper')][string]$Target = 'all')
+﻿param([ValidateSet('all', 'text', 'filehelper')][string]$Target = 'all', [switch]$StageOnly)
 
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -27,16 +27,18 @@ try {
     & lib.exe /nologo /out:minhook.lib buffer.obj hook.obj trampoline.obj hde64.obj
     if ($LASTEXITCODE -ne 0) { throw 'MinHook 建库失败。' }
     if ($Target -in @('all', 'text')) {
-        New-Item -ItemType Directory -Path '..\build_text' -Force | Out-Null
+        $textOutput = if ($StageOnly) { 'staged' } else { '..\build_text' }
+        New-Item -ItemType Directory -Path $textOutput -Force | Out-Null
         & cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 /LD /MD /O2 /DNDEBUG `
-            ..\text_bridge.cpp /Fe:..\build_text\text_bridge.dll /Fo:text_bridge.obj `
+            ..\text_bridge.cpp "/Fe:$textOutput\text_bridge.dll" /Fo:text_bridge.obj `
             /link /MACHINE:X64 bcrypt.lib minhook.lib
         if ($LASTEXITCODE -ne 0) { throw '文本桥接 DLL 编译失败。' }
     }
     if ($Target -in @('all', 'filehelper')) {
-        New-Item -ItemType Directory -Path '..\build' -Force | Out-Null
+        $helperOutput = if ($StageOnly) { 'staged' } else { '..\build' }
+        New-Item -ItemType Directory -Path $helperOutput -Force | Out-Null
         & cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 /LD /MD /O2 /DNDEBUG `
-            ..\selftest_bridge.cpp /Fe:..\build\selftest_bridge.dll /Fo:selftest_bridge.obj `
+            ..\selftest_bridge.cpp "/Fe:$helperOutput\selftest_bridge.dll" /Fo:selftest_bridge.obj `
             /link /MACHINE:X64 bcrypt.lib minhook.lib
         if ($LASTEXITCODE -ne 0) { throw '文件传输助手桥接 DLL 编译失败。' }
     }

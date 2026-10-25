@@ -180,6 +180,25 @@ class ControllerTests(PanelFixture):
         self.assertEqual(self.controller.forget_chat({'chat_id':'123@chatroom'}), {'cleared': 3})
         self.wait_stopped()
 
+    def test_tasks_go_only_to_the_agent_as_a_marked_message_and_never_to_wechat(self):
+        self.controller.start()
+        app, dispatched = self.controller.app, []
+        app.service = SimpleNamespace(session_is_current=lambda session: session == 'first')
+        app.plugins.dispatch = lambda message, only=None: (dispatched.append((message, only)) or 1)
+        task = {'chat_id': '123@chatroom', 'session_id': 'first', 'task': ' 跟大家自我介绍一下 '}
+        with self.assertRaisesRegex(PanelError, '智能体'):  # 智能体没开
+            self.controller.agent_task(task)
+        app.plugins.is_active = lambda name: name == 'agent_chat'
+        self.assertEqual(self.controller.agent_task(task), {'ok': True})
+        message, only = dispatched[0]
+        self.assertEqual((only, message.protocol, dict(message.data), message.text, message.chat_id, message.is_group, message.session_id),
+                         ('agent_chat', 0, {'agent_task': True}, '跟大家自我介绍一下', '123@chatroom', True, 'first'))
+        for bad, error in (({'task': ''}, '1–500'), ({'task': '长' * 501}, '1–500'), ({'session_id': 'old'}, '连接已变化')):
+            with self.subTest(bad=bad), self.assertRaisesRegex(PanelError, error):
+                self.controller.agent_task({**task, **bad})
+        self.assertEqual(len(dispatched), 1)
+        self.wait_stopped()
+
     def test_remembered_chats_are_listed_and_history_loads_after_restart(self):
         class Members:
             def remembered_chats(self):
@@ -188,7 +207,7 @@ class ControllerTests(PanelFixture):
             def chat_setting(self, chat):
                 return {'memory': chat == 'wxid_old_friend', 'reply': False}
 
-            def chat_history(self, chat, *, before=None, limit=200):
+            def chat_history(self, chat, *, before=None, limit=200, include_boundary=False):
                 if chat != 'wxid_old_friend':
                     return []
                 lines = [{'id': 7, 'at': '2026-10-21T00:00:00+00:00', 'text': '周六见', 'own': False, 'name': '老王'},
@@ -455,6 +474,17 @@ class HTTPTests(PanelFixture):
         self.assertEqual(self.request('/api/config',raw=b'{}',content_type='text/plain')[0],400)
         self.assertEqual(self.request('/../bot_config.json')[0],404)
         self.assertEqual(self.request('/api/unknown',{})[0],404)
+
+
+class ProxyTests(unittest.TestCase):
+    def test_robot_proxy_forwards_every_controller_call_the_handler_makes(self):
+        """多账号时网页请求经 RobotProxy 转给机器人子进程；处理器新用的方法这里没有，就只在单账号模式能用。"""
+        import re
+        from wxbot_framework.robot_hub import RobotProxy
+        source = (ROOT / 'wxbot_framework/web_panel.py').read_text(encoding='utf-8')
+        used = set(re.findall(r'controller\.(\w+)\(', source))
+        self.assertIn('agent_task', used)
+        self.assertEqual(sorted(name for name in used if not hasattr(RobotProxy, name)), [])
 
 
 class LogTests(unittest.TestCase):

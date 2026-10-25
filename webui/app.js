@@ -35,22 +35,64 @@ let pluginSignature = '', accountSignature = '', robotOptionsSignature = '';
 let messages=[], messageCursor=0, messageStream='', messagePaused=false, messageError='', messageGeneration=0, messageSignature='';
 let loggedAccounts = [], selectedAccounts = new Set(), accountsError = '', accountsLoading = true, accountsFetching = false, lastAccountFetch = 0, batchStarting = false;
 let sendMembers = [], mentionSelection = new Set(), sendSession = '', sendGeneration = 0, sendLoading = false, pendingSend = null, sendPolling = false;
+let taskMode = false, taskSending = false;
 let chatRows=[], chatLoadKey='', chatTimelineSignature='', chatConfirm=null, chatDraftId='';
 let chatListMarkup='', chatTimelineTarget='';
 const chatDrafts=new Map();
 // 开了长期记忆的会话，点开时从库里取以前的聊天，接在本次收到的消息前面。
 // historyLoading：会话 → 本次请求的标记；清空记忆时删掉，清空前发出、迟到的旧结果不再写入。
 const chatHistory=new Map(),historyLoading=new Map();
+const chatHistoryScopes=new Map();  // 每个机器人最后看到的窗口/历史代次，切换账号时也保留
+const chatQuotes=new Map();
+let chatRenderedTimeline=[];
+function composeSendText(){
+  // 引用只提交结构化来源，绝不把「引用某某」拼进普通文字。
+  return $('#send-content').value;
+}
+function renderQuotePreview(){
+  const quote=chatQuotes.get(robot+':'+$('#send-chat').value);
+  $('#chat-quote-preview').classList.toggle('hidden',!quote);
+  $('#chat-quote-text').textContent=quote?`${quote.native?'微信原生引用（发送前核对原消息ID）':'引用信息已失效，请取消后重新选择'} · ${quote.author}：${quote.content}`:'';
+  $('#chat-quote-cancel').disabled=!!pendingSend;
+}
+function nativeQuoteId(){const quote=chatQuotes.get(robot+':'+$('#send-chat').value);return quote?.native?quote.messageId:'';}
+function quoteSelectionKey(){const quote=chatQuotes.get(robot+':'+$('#send-chat').value);return quote?JSON.stringify(quote.source||null):'';}
+function canNativeQuote(row,chat){
+  const validRow=row.history?typeof row.id==='string'&&/^h[1-9][0-9]*$/.test(row.id):Number.isSafeInteger(row.id)&&row.id>0;
+  return !chat.endsWith('@chatroom')&&validRow&&typeof row.quote_token==='string'&&/^[0-9a-f]{64}$/.test(row.quote_token)&&!row.quote&&!row.recalled&&!row.forwarded&&row.kind!=='agent'&&
+    (!row.type||row.type===1)&&(!row.native_type||row.native_type===1);
+}
 async function loadChatHistory(chat){
   const key=robot+':'+chat,requested=robot,token={};
   if(!chat||chatHistory.has(key)||historyLoading.has(key))return;
   historyLoading.set(key,token);
   const live=messages.filter(message=>message.chat_id===chat&&message.timestamp).map(message=>message.timestamp);
-  const before=live.length?Math.min(...live):0;  // 只取本次已显示消息之前的，两段接上不重复
+  const before=live.length?Math.min(...live):0;  // 包含边界，重叠部分按消息身份合并。
   try{
     const {rows}=await api('chat-history?chat='+encodeURIComponent(chat)+(before?'&before='+before:''),undefined,requested);
     if(requested===robot&&historyLoading.get(key)===token){chatHistory.set(key,rows);chatTimelineSignature='';renderChatWorkspace();}
-  }catch{}finally{if(historyLoading.get(key)===token)historyLoading.delete(key);}
+  }catch(error){
+    if(requested===robot&&historyLoading.get(key)===token&&$('#send-chat').value===chat)toast('历史加载失败：'+error.message+'；可重新选择会话重试',true);
+  }finally{if(historyLoading.get(key)===token)historyLoading.delete(key);}
+}
+function invalidateChatHistory(requested){
+  const prefix=requested+':';
+  for(const cache of [chatHistory,historyLoading,chatQuotes])for(const key of cache.keys())if(key.startsWith(prefix))cache.delete(key);
+  if(chatConfirm?.robot===requested){chatConfirm=null;$('#chat-send-dialog').close();}
+  chatTimelineSignature='';
+  // 草稿不动，但旧连接标识和旧成员请求不能用来发送。
+  if(requested===robot){sendGeneration++;sendSession='';sendLoading=false;chatLoadKey='';renderSendState();}
+}
+function mergeChatTimeline(history,live){
+  const keys=row=>{
+    if(row.forwarded||row.kind==='agent')return [];
+    const scope=row.chat_id+':';
+    return [...(row.event_keys||[]).map(key=>scope+'event:'+key),
+      ...(row.message_id&&row.message_id!=='0'?[scope+'native:'+row.message_id]:[])];
+  };
+  const seen=new Set(live.flatMap(keys));
+  // 优先实时版本（可能已撤回或补齐 ID）。相同正文但不同身份的两条都保留。
+  return [...history.filter(row=>!keys(row).some(key=>seen.has(key))),...live];
 }
 const accountKey = row => row.pid + ':' + row.wxid;
 const activeStates = ['starting','running','stopping'];
@@ -266,6 +308,8 @@ $('#chat-forget').onclick = async () => {
   if(!chat||!confirm(`清空「${name}」的长期记忆？\n机器人会忘掉以前的聊天，开关不变，之后的新消息照常记录。`))return;
   try{
     const {cleared}=await api('chat-forget',{chat_id:chat},requested);if(requested!==robot)return;
+    chatQuotes.delete(requested+':'+chat);
+    if(chatConfirm?.robot===requested&&chatConfirm.chat===chat){chatConfirm=null;$('#chat-send-dialog').close();}
     chatHistory.delete(requested+':'+chat);historyLoading.delete(requested+':'+chat);switchHint={chat,text:`已清空 ${cleared} 条记忆`};
   }catch(error){switchHint={chat,text:error.message};}
   chatListMarkup='';chatTimelineSignature='';renderChatWorkspace();
@@ -330,13 +374,15 @@ function sendFeedback(text, error=false) {
   $('#send-status').textContent=text;$('#send-status').classList.toggle('error',error);
 }
 function renderSendState() {
+  renderQuotePreview();
   const ready=serviceAvailable&&!!state?.connected&&!busy;
   $('#refresh-send-chats').disabled=!ready||sendLoading||!!pendingSend;
   $('#refresh-send-members').disabled=!ready||sendLoading||!!pendingSend||!$('#send-chat').value.endsWith('@chatroom');
   $('#send-chat').disabled=!ready||sendLoading||!!pendingSend;
   $('#send-content').disabled=!ready||!!pendingSend;
-  $('#send-text').disabled=!ready||sendLoading||!!pendingSend||!sendSession||!$('#send-chat').value||!$('#send-content').value.trim();
-  $('#send-text').textContent=pendingSend?'发送中…':'发送';
+  const quote=chatQuotes.get(robot+':'+$('#send-chat').value),quoteBlocked=quote&&(!quote.native||!quote.source);
+  $('#send-text').disabled=!ready||sendLoading||!!pendingSend||taskSending||!sendSession||!$('#send-chat').value||!$('#send-content').value.trim()||(!!quoteBlocked&&!taskMode);
+  $('#send-text').textContent=pendingSend?'发送中…':taskMode?'交代':'发送';
   $('#mention-count').textContent=`已选 ${mentionSelection.size} / 8`;
   $('#send-members').querySelectorAll('input').forEach(node=>node.disabled=!ready||!!pendingSend);
 }
@@ -376,15 +422,29 @@ async function selectSendChat() {
   sendMembers=[];mentionSelection.clear();$('#member-search').value='';
   $('#send-group').classList.toggle('hidden',!room.endsWith('@chatroom'));renderSendMembers();
   renderChatWorkspace();
-  if(!room){renderSendState();return;}
+  if(!room){sendSession='';sendLoading=false;renderSendState();return;}
   loadChatHistory(room);
   sendSession='';sendLoading=true;sendFeedback('正在读取…');renderSendState();
   try {
-    const data=await api(room.endsWith('@chatroom')?'group-members?room='+encodeURIComponent(room):'send-connection',undefined,requested);
+    const data=await api('send-connection',undefined,requested);
     if(requested!==robot||generation!==sendGeneration)return;
-    sendSession=data.session_id;sendMembers=data.members||[];sendFeedback('');renderSendMembers();
+    sendSession=data.session_id;sendFeedback('');
   } catch(error) {if(requested===robot&&generation===sendGeneration)sendFeedback(error.message,true);}
   finally {if(requested===robot&&generation===sendGeneration){sendLoading=false;renderSendState();renderChatWorkspace();}}
+  if(requested!==robot||generation!==sendGeneration||!sendSession||!room.endsWith('@chatroom'))return;
+  // 群成员仅服务于艾特选择。加载期间及失败后，普通文字仍可发送。
+  const session=sendSession;
+  try{
+    const data=await api('group-members?room='+encodeURIComponent(room),undefined,requested);
+    if(requested!==robot||generation!==sendGeneration||session!==sendSession)return;
+    if(data.session_id!==session){sendSession='';sendFeedback('连接已变化，请刷新会话',true);renderSendState();return;}
+    sendMembers=data.members||[];renderSendMembers();
+  }catch(error){
+    if(requested===robot&&generation===sendGeneration&&session===sendSession){
+      sendFeedback('艾特暂不可用：'+error.message+'；普通文字仍可发送',true);
+      renderSendMembers();
+    }
+  }
 }
 $('#refresh-send-chats').onclick=loadSendChats;
 $('#send-chat').onchange=()=>{restoreChatDraft($('#send-chat').value);selectSendChat();};$('#refresh-send-members').onclick=selectSendChat;
@@ -403,7 +463,7 @@ async function pollSendStatus() {
     if(pendingSend!==job||job.robot!==robot)return;
     if(result.status==='sending')return;
     pendingSend=null;
-    if(result.status==='sent'){$('#send-content').value='';chatDrafts.delete(job.robot+':'+job.chat);sendFeedback('已发送');}
+    if(result.status==='sent'){$('#send-content').value='';chatDrafts.delete(job.robot+':'+job.chat);chatQuotes.delete(job.robot+':'+job.chat);sendFeedback('已发送');}
     else sendFeedback(result.error||'发送未完成，请核对微信后再重发',true);
     renderSendState();
   } catch(error) {
@@ -417,7 +477,12 @@ async function pollSendStatus() {
 async function submitSendNow(event){
   event.preventDefault();if($('#send-text').disabled||pendingSend)return;
   const requested=robot,job={id:crypto.randomUUID(),robot:requested,chat:$('#send-chat').value};pendingSend=job;
-  const body={request_id:job.id,session_id:sendSession,chat_id:$('#send-chat').value,content:$('#send-content').value,at_list:[...mentionSelection]};
+  const body={request_id:job.id,session_id:sendSession,chat_id:$('#send-chat').value,content:composeSendText(),at_list:[...mentionSelection]};
+  const quote=chatQuotes.get(robot+':'+job.chat);
+  if(quote){
+    if(!quote.native||!quote.source){pendingSend=null;sendFeedback('引用信息无效，未发送；请取消后重新选择',true);renderSendState();return;}
+    body.quote_ref={...quote.source};
+  }
   sendFeedback('正在发送…');renderSendState();
   try {
     await api('send-text',body,requested);
@@ -429,18 +494,44 @@ async function submitSendNow(event){
     renderSendState();
   }
 };
+// “交代”模式：输入框写的是给智能体的一次性任务，不发到微信、不入库；智能体接着上下文在这个会话里主动说话。
+function renderTaskMode(){
+  $('#chat-task-toggle').setAttribute('aria-pressed',String(taskMode));
+  $('#send-content').placeholder=taskMode?'交代智能体做点什么，例如：跟大家自我介绍一下（这句不发到微信、不入库）':'输入文字';
+  if(taskMode)$('#chat-conversation').classList.remove('chat-mentions-open');
+  renderChatWorkspace();renderSendState();
+}
+$('#chat-task-toggle').onclick=()=>{taskMode=!taskMode;renderTaskMode();$('#send-content').focus();};
+async function submitTask(){
+  const requested=robot,chat=$('#send-chat').value,task=$('#send-content').value.trim();
+  if([...task].length>500){sendFeedback('任务最多 500 字',true);return;}
+  taskSending=true;sendFeedback('正在交代…');renderSendState();
+  try{
+    const result=await api('agent-task',{chat_id:chat,session_id:sendSession,task},requested);
+    if(result.ok!==true)throw new Error('任务未入队，请稍后重试');
+    if(requested===robot&&$('#send-chat').value===chat){
+      if($('#send-content').value.trim()===task){$('#send-content').value='';chatDrafts.delete(requested+':'+chat);}
+      sendFeedback('已入队，过程显示在聊天记录里的“智能体”卡片');
+    }
+  }catch(error){sendFeedback(error.message,true);}
+  finally{taskSending=false;renderSendState();}
+}
 $('#send-form').onsubmit=event=>{
   event.preventDefault();if($('#send-text').disabled||pendingSend)return;
-  chatConfirm={robot,session:sendSession,chat:$('#send-chat').value,text:$('#send-content').value,mentions:[...mentionSelection]};
+  if(taskMode){submitTask();return;}
+  const content=composeSendText();
+  if(new TextEncoder().encode(content).length>1023){sendFeedback('引用和正文合计超过 1023 字节，请缩短正文或取消引用',true);return;}
+  chatConfirm={robot,session:sendSession,chat:$('#send-chat').value,text:content,mentions:[...mentionSelection],quoteKey:quoteSelectionKey()};
   $('#chat-confirm-name').textContent=chatRows.find(row=>row.chat_id===chatConfirm.chat)?.name||chatConfirm.chat;
-  $('#chat-confirm-text').textContent=chatConfirm.text;
+  const quote=chatQuotes.get(robot+':'+chatConfirm.chat);
+  $('#chat-confirm-text').textContent=quote?.native?`${chatConfirm.text}\n\n[微信原生引用] ${quote.author}：${quote.content}`:chatConfirm.text;
   $('#chat-send-dialog').showModal();
 };
 $('#chat-confirm-cancel').onclick=()=>{chatConfirm=null;$('#chat-send-dialog').close();};
 $('#chat-send-dialog').addEventListener('cancel',()=>{chatConfirm=null;});
 $('#chat-confirm-send').onclick=()=>{
   const value=chatConfirm;chatConfirm=null;$('#chat-send-dialog').close();
-  if(!value||value.robot!==robot||value.session!==sendSession||value.chat!==$('#send-chat').value||value.text!==$('#send-content').value||JSON.stringify(value.mentions)!==JSON.stringify([...mentionSelection])){sendFeedback('账号、会话或内容已改变，未发送',true);return;}
+  if(!value||value.robot!==robot||value.session!==sendSession||value.chat!==$('#send-chat').value||value.text!==composeSendText()||value.quoteKey!==quoteSelectionKey()||JSON.stringify(value.mentions)!==JSON.stringify([...mentionSelection])){sendFeedback('账号、会话、引用或内容已改变，未发送',true);return;}
   submitSendNow({preventDefault(){}});
 };
 setInterval(pollSendStatus,1500);
@@ -509,9 +600,11 @@ function renderChatWorkspace(){
   $('#chat-memory').checked=!!row?.memory;$('#chat-reply').checked=!!row?.reply;
   $('#chat-forget').classList.toggle('hidden',!row?.memory);
   $('#chat-switch-hint').textContent=switchHint.chat===selected?switchHint.text:'';
-  $('#chat-mention-toggle').classList.toggle('hidden',!selected.endsWith('@chatroom'));
+  $('#chat-mention-toggle').classList.toggle('hidden',taskMode||!selected.endsWith('@chatroom'));  // 交代时不用手选艾特
   $('#chat-mention-toggle').textContent='@'+(mentionSelection.size?' '+mentionSelection.size:'');
-  const timeline=[...(chatHistory.get(robot+':'+selected)||[]),...messages.filter(message=>message.chat_id===selected)];
+  const timeline=mergeChatTimeline(chatHistory.get(robot+':'+selected)||[],messages.filter(message=>message.chat_id===selected));
+  chatRenderedTimeline=timeline;
+  renderQuotePreview();
   const signature=JSON.stringify([robot,selected,timeline,connected]);
   if(signature===chatTimelineSignature)return;
   chatTimelineSignature=signature;
@@ -519,22 +612,38 @@ function renderChatWorkspace(){
   const box=$('#chat-timeline'),atBottom=target!==chatTimelineTarget||box.scrollHeight-box.scrollTop-box.clientHeight<80,top=box.scrollTop;
   chatTimelineTarget=target;
   let lastTime='';
-  box.innerHTML=timeline.map(message=>{
+  box.innerHTML=timeline.map((message,index)=>{
     if(message.kind==='agent')return agentTrace(message);
     const time=[message.date,message.time].filter(Boolean).join(' '),showTime=time!==lastTime;lastTime=time;
     const own=message.direction==='outgoing';
     const label=own?'我':message.sender_name||(message.is_group?'群友':name)||'对方';  // 群里不拿群名当发言人
-    return `${showTime?`<div class="hc-time">${escape(time)}</div>`:''}<article class="hc-message ${own?'outgoing':''}">${chatAvatar(label)}<div class="hc-message-body">${message.is_group&&!own?`<div class="hc-sender">${escape(label)}</div>`:''}<div class="hc-bubble">${message.recalled?'<span class="hc-recalled">已撤回</span>':''}${escape(message.content)}</div></div></article>`;
+    const native=canNativeQuote(message,selected);
+    const quoteButton=connected&&!pendingSend&&(!message.type||message.type===1)&&!message.recalled&&!message.forwarded?`<button class="hc-quote-button" type="button" data-quote-index="${index}" ${native?'':'disabled'} title="${native?'原生引用；旧消息将先只读核对微信缓存，无法确认就不发送':'此消息暂不支持原生引用；不会改发拼接文字'}">${native?'引用':'引用不可用'}</button>`:'';
+    const quote=message.quote;
+    const content=(quote?.version===1&&quote.reference?`${escape(quote.reply)}<div class="hc-native-reference">${escape(quote.reference.sender_name)}：${escape(quote.reference.content)}</div>`:escape(message.content))+
+      (message.preview_truncated?'<div class="hc-native-reference">仅显示预览；已开启长期记忆的会话保留原文</div>':'');
+    return `${showTime?`<div class="hc-time">${escape(time)}</div>`:''}<article class="hc-message ${own?'outgoing':''}">${chatAvatar(label)}<div class="hc-message-body">${message.is_group&&!own?`<div class="hc-sender">${escape(label)}</div>`:''}<div class="hc-bubble">${message.recalled?'<span class="hc-recalled">已撤回</span>':''}${content}</div>${quoteButton}</div></article>`;
   }).join('')||`<div class="hc-welcome"><span class="hc-welcome-icon">↔</span><h2>${selected?'等待新消息':'选择一个会话'}</h2><p>${connected?'这里只显示本次连接收到的消息，不是完整历史记录':'前往账号管理启动机器人后，即可收发消息'}</p>${!connected?'<a href="#overview">前往账号管理 →</a>':''}</div>`;
   box.scrollTop=atBottom?box.scrollHeight:top;
 }
-const agentLabels={start:'收到',thought:'思考',tool:'调用工具',result:'工具结果',done:'完成',error:'出错'};
+const agentLabels={start:'收到',thought:'思考',say:'先说',tool:'调用工具',result:'工具结果',done:'完成',error:'出错'};
+$('#chat-quote-cancel').onclick=()=>{if(pendingSend)return;chatQuotes.delete(robot+':'+$('#send-chat').value);renderSendState();};
+$('#chat-timeline').addEventListener('click',event=>{
+  const button=event.target.closest('[data-quote-index]');if(!button||pendingSend)return;
+  const row=chatRenderedTimeline[Number(button.dataset.quoteIndex)],chat=$('#send-chat').value;
+  if(!row||row.chat_id!==chat||row.recalled||row.forwarded||row.kind==='agent')return;
+  if(!canNativeQuote(row,chat)){sendFeedback('此消息暂不支持原生引用，不会改发拼接文字',true);return;}
+  const author=row.direction==='outgoing'?'我':row.sender_name||'群友';
+  chatQuotes.set(robot+':'+chat,{author:String(author).replace(/[\r\n]/g,' ').slice(0,64),content:String(row.content||''),
+    native:true,messageId:typeof row.message_id==='string'?row.message_id:'',source:{id:row.id,history:!!row.history,token:row.quote_token}});
+  renderSendState();$('#send-content').focus();
+});
 const agentStatus={running:'进行中…',done:'已完成',error:'出错'};
 const openAgentRuns=new Set();
 function agentTrace(row){
   const steps=row.steps||[],tools=steps.filter(step=>step.kind==='tool').length;
   const open=row.status==='running'||openAgentRuns.has(row.run);
-  return `<details class="hc-agent ${escape(row.status)}" data-run="${escape(row.run)}" ${open?'open':''}><summary>智能体 · ${escape(agentStatus[row.status]||row.status)}${tools?` · 调用工具 ${tools} 次`:''}</summary><ol>${steps.map(step=>`<li class="${escape(step.kind)}"><span>${escape(agentLabels[step.kind]||step.kind)}</span>${escape(step.text||'')}</li>`).join('')}</ol></details>`;
+  return `<details class="hc-agent ${escape(row.status)}" data-run="${escape(row.run)}" ${open?'open':''}><summary>智能体 · ${escape(agentStatus[row.status]||row.status)}${tools?` · 调用工具 ${tools} 次`:''}</summary><ol>${steps.map(step=>`<li class="${escape(step.kind)}"><span>${escape(agentLabels[step.kind]||step.kind)}</span>${escape(step.text||'')}</li>`).join('')}</ol>${row.preview_truncated?'<p>过程内容较长，仅显示预览</p>':''}</details>`;
 }
 $('#chat-timeline').addEventListener('toggle',event=>{
   const run=event.target.dataset?.run;if(!run)return;
@@ -604,12 +713,18 @@ async function pollMessages(requested,generation) {
       tail=await api('messages?after=0',undefined,requested);
       if(requested!==robot||generation!==messageGeneration)return;
     }
+    const scope=JSON.stringify([tail.stream_id,tail.history_generation||'']);
+    const previousScope=chatHistoryScopes.get(requested);
+    const historyChanged=!!previousScope&&previousScope!==scope||!!tail.reset;
+    if(historyChanged)invalidateChatHistory(requested);
+    chatHistoryScopes.set(requested,scope);
     if((messageStream&&messageStream!==tail.stream_id)||tail.reset)messages=[];
     messageStream=tail.stream_id;messageCursor=tail.cursor;messageError='';
     const updated=new Map(tail.rows.map(row=>[row.id,row]));
     messages=messages.map(row=>{const next=updated.get(row.id);updated.delete(row.id);return next||row;});
     messages=[...messages,...updated.values()].slice(-1000);
     renderMessages();
+    if(historyChanged&&state?.connected&&serviceAvailable)await loadChatHistory($('#send-chat').value);
   } catch(error) {
     if(requested!==robot||generation!==messageGeneration)return;
     messageError=error.status===404?'消息监控尚未加载，请重启管理台后刷新。':'消息读取失败，请稍后重试。';

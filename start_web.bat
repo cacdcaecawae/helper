@@ -1,8 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul
-rem 已安装本机语音环境时在同一窗口后台启动 Qwen3-TTS（/b 不另开窗口，关掉本窗口会一起结束）；已在运行时新实例占不到端口会自行退出。须在设置 PYTHONUTF8 之前启动。
-if exist "%~dp0.venv-tts\Scripts\python.exe" start "helper-tts" /b "%~dp0.venv-tts\Scripts\python.exe" "%~dp0tools\local_tts_server.py"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 title helper - 本地管理台

@@ -1,7 +1,9 @@
 """helper 本地网页管理台：python web.py。"""
 import argparse
 import logging
+import os
 from pathlib import Path
+import subprocess
 import sys
 import json
 import threading
@@ -40,6 +42,7 @@ def main():
             server = PanelServer(controller, args.port)
             url = f'http://127.0.0.1:{server.server_address[1]}'
             print(f'管理台已启动：{url}\n在网页点击启动机器人；退出管理服务请按 Ctrl+C。', flush=True)
+            start_local_tts()
             if not args.no_browser:
                 webbrowser.open(url)
             with ShutdownHandlers(controller):
@@ -56,6 +59,25 @@ def main():
             server.server_close()
         if controller is not None:
             controller.close()
+
+
+def start_local_tts():
+    """装了本机语音环境（.venv-tts）就无窗口启动 Qwen3-TTS，并把本进程号交给它：管理台怎么退出（含直接关窗口），
+    它都等到本进程结束就跟着退出，不在后台占显存；已有实例占着端口时，新启动的自己退出。输出写 logs/tts.log。"""
+    python = ROOT / '.venv-tts/Scripts/pythonw.exe'
+    if not python.exists():
+        return None
+    env = {key: value for key, value in os.environ.items() if key != 'PYTHONUTF8'}  # 语音环境基于 conda，PYTHONUTF8 会让它出错
+    env['PYTHONIOENCODING'] = 'utf-8'
+    try:
+        (ROOT / 'logs').mkdir(exist_ok=True)
+        with open(ROOT / 'logs/tts.log', 'ab') as log:
+            # 不加 -s：torch 装在用户目录的 site-packages 里，-s 会把它挡掉
+            return subprocess.Popen([str(python), str(ROOT / 'tools/local_tts_server.py'), '--parent', str(os.getpid())],
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env)
+    except OSError as error:  # 语音只是附加功能，起不来也不影响管理台
+        logging.getLogger('WebPanel').warning('本机语音服务启动失败：%s', error)
+        return None
 
 
 def worker_main(workspace):

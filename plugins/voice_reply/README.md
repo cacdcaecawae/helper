@@ -4,7 +4,7 @@
 
 ## 启用
 
-1. 安装 `python -m pip install -r requirements-voice.txt`。
+1. 语音编码器（`requirements-voice.txt` 里锁定的 `silk-python`）在启用插件时自动安装进当前 Python；装不上时插件启用失败，并提示手动安装命令。没开本插件时，智能体加载时也会装（模型可自己选语音），装不上只是不发语音。
 2. 将根目录的 `tts_config.example.json` 复制为 `tts_config.json`，填写自己的 Fish Audio `api_key`；正常启动也会补齐缺失模板。
 3. 完成大模型和成员目录配置，把目标群加入成员配置；非空会话白名单中也要包含该群。
 4. 在程序控制台输入 `enable mention_chat` 和 `enable voice_reply`，或在 `bot_config.json` 中开启这两个插件。

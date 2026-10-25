@@ -23,6 +23,29 @@ ROOM = '12345678@chatroom'
 
 
 class BufferTests(unittest.TestCase):
+    def test_native_bot_echo_is_visible_without_a_send_notification(self):
+        buffer = MessageBuffer()
+        buffer.append(Message('机器人真的说过', ROOM, ACCOUNT, is_self=True, is_group=True,
+            session_id='one', sequence=1, data={'bot_generated': True}), account=ACCOUNT)
+        self.assertEqual([(r['content'], r['direction']) for r in buffer.rows], [('机器人真的说过','outgoing')])
+
+    def test_outgoing_and_echo_pair_once_in_either_order_and_per_session(self):
+        for reverse in (False, True):
+            buffer = MessageBuffer()
+            for sequence in (1, 2):
+                echo = Message('相同回复', ROOM, ACCOUNT, is_self=True, is_group=True, session_id='one',
+                    sequence=sequence, data={'bot_generated': True, 'native_message_id': str(sequence)})
+                send = Message('相同回复', ROOM, is_self=True, is_group=True, session_id='one',
+                    data={'monitor_outgoing': True, 'bot_generated': True})
+                for message in ((echo, send) if reverse else (send, echo)):
+                    buffer.append(message, account=ACCOUNT)
+                buffer.append(echo, account=ACCOUNT)  # 同一回显重复投递也不重复。
+            self.assertEqual(len(buffer.rows), 2)
+            self.assertEqual({r['message_id'] for r in buffer.rows}, {'1','2'})
+            buffer.append(Message('相同回复', ROOM, is_self=True, session_id='new',
+                data={'monitor_outgoing':True,'bot_generated':True}), account=ACCOUNT)
+            self.assertEqual(len(buffer.rows), 3)
+
     def test_text_keeps_conversation_sender_and_multiline_content(self):
         buffer = MessageBuffer(clock=lambda: 1792540800)
         buffer.append(Message('第一行\n第二行', ROOM, FRIEND, is_group=True), account=ACCOUNT, sender_name='群友甲')

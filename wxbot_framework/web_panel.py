@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 from .config import ConfigStore, EXAMPLE_ACCOUNT, account_is_unbound, initialize_configs, validate_name
 from .locking import InstanceLock
 from .message_monitor import MessageBuffer, beijing
+from .message_projection import preview_row
 from .runtime import BotApplication
 from .startup import scan_logged_accounts
 from .text import validate_target, validate_mentions
@@ -105,6 +106,7 @@ class PanelController:
         self.stop_event, self.stopped_event = threading.Event(), threading.Event()
         self.logs = LogBuffer()
         self.messages = MessageBuffer(sanitize=redact)
+        self.history_generation = secrets.token_hex(16)
         self.send_jobs = {}
         logging.getLogger().addHandler(self.logs)
 
@@ -189,6 +191,7 @@ class PanelController:
                     app.service.trace_observer = lambda message, run, step: self.messages.trace(
                         message, run, step, account=app.config.get('wechat_account') or '')
                 self.app, self.state, self.error, self.started = app, 'starting', '', time.time()
+                self.history_generation = secrets.token_hex(16)
 
                 def run():
                     try:
@@ -332,7 +335,9 @@ class PanelController:
             raise PanelError(str(error)) from None
 
     def message_tail(self, after=0):
-        return self.messages.tail(after)
+        with self.lock:
+            # 普通停/启不清掉实时窗口，但会创建新的 MemberStore，历史引用令牌因此换代。
+            return dict(self.messages.tail(after), history_generation=self.history_generation)
 
     def _save_many(self, changes):
         backup = self.workspace / '.runtime/web/backups' / str(time.time_ns())
@@ -473,9 +478,13 @@ class PanelController:
     @staticmethod
     def _history_row(chat, line):
         stamp = datetime.fromisoformat(line['at']).timestamp()
-        return {'id': 'h' + str(line['id']), 'history': True, 'chat_id': chat, 'is_group': chat.endswith('@chatroom'),
+        row = {'id': 'h' + str(line['id']), 'history': True, 'chat_id': chat, 'is_group': chat.endswith('@chatroom'),
                 'timestamp': stamp, 'date': beijing(stamp, '%Y-%m-%d'), 'time': beijing(stamp, '%H:%M:%S'),
                 'sender_name': line['name'], 'content': line['text'], 'direction': 'outgoing' if line['own'] else 'incoming'}
+        for key in ('message_id', 'sender_id', 'quote', 'native_type', 'event_keys', 'quote_token'):
+            if key in line:
+                row[key] = line[key]
+        return preview_row(row)
 
     def forget_chat(self, data):
         """聊天页“清空记忆”：清掉这个会话的长期记忆，开关不变。"""
@@ -493,7 +502,7 @@ class PanelController:
         before = float(before) if before not in (None, '') else None
         def query(app):
             members = getattr(app, 'members', None)
-            lines = members.chat_history(chat, before=before) if members is not None else []
+            lines = members.chat_history(chat, before=before, include_boundary=True) if members is not None else []
             return {'rows': [self._history_row(chat, line) for line in lines]}
         return self._call(query)
 
@@ -518,6 +527,30 @@ class PanelController:
             return setting
         return self._call(apply)
 
+    def agent_task(self, data):
+        """聊天页“交代”：把一次性任务只交给智能体，让它在这个会话里主动说话。任务不进聊天记录，
+        只显示在聊天页的智能体过程里；智能体在自己的线程里排队处理，这里立即返回。"""
+        from .sdk import Message
+        chat, task, session = validate_target(data.get('chat_id')), data.get('task'), data.get('session_id')
+        if not isinstance(task, str) or not task.strip() or len(task) > 500 or '\0' in task:
+            raise PanelError('任务应为 1–500 字')
+        def apply(app):
+            if not app._connection_ready or not app.service.session_is_current(session):
+                raise PanelError('微信连接已变化，请重新选择会话', 409)
+            allowed = app.config.get('chat_allowlist', [])
+            if allowed and chat not in allowed:
+                raise PanelError('该会话不在收发白名单中')
+            if not app.plugins.is_active('agent_chat'):
+                raise PanelError('请先在插件管理中开启“智能体”', 409)
+            # protocol=0 加 agent_task 标记：智能体据此认出是网页交代的任务，微信消息不会带这两样。
+            accepted = app.plugins.dispatch(Message(task.strip(), chat, sender_id=app.config.get('wechat_account') or '', protocol=0,
+                                         is_group=chat.endswith('@chatroom'), is_self=True, session_id=session,
+                                         data={'agent_task': True}), only='agent_chat')
+            if not accepted:
+                raise PanelError('智能体队列繁忙或已停用，任务未提交，请稍后重试', 503)
+            return {'ok': True}
+        return self._call(apply)
+
     def group_members(self, room):
         from .group_management import validate_group_id
         room = validate_group_id(room)
@@ -538,10 +571,49 @@ class PanelController:
                 raise PanelError('发送记录已失效，请查看消息监控确认结果', 404)
             return {key: job[key] for key in ('request_id', 'status', 'error')}
 
+    def _quote_source_row(self, app, chat, account, reference, identifier=None):
+        if reference is None:
+            return self.messages.quote_source(chat, identifier, account=account)
+        if reference['history']:
+            members = getattr(app, 'members', None)
+            if members is None or members.account != account:
+                return None
+            source = members.quote_source(chat, int(reference['id'][1:]))
+            if source and source['message_id'] and self.messages.quote_recalled(chat,source['message_id'],account=account):
+                return None
+        else:
+            source = self.messages.quote_row(chat, reference['id'], account=account)
+        if source is None or source.get('quote_token') != reference['token']:
+            return None
+        return source
+
+    @staticmethod
+    def _quote_source_identity(source):
+        return tuple(source.get(k) for k in ('id','account','chat_id','sender_id','content','timestamp','quote_token')) if source else None
+
     def send_text(self, data):
         """立即返回发送单号，等待节奏和原生回调在独立线程完成，HTTP 不重试发送。"""
         target = validate_target(data.get('chat_id'))
         content, mentions = data.get('content'), data.get('at_list', [])
+        quote_id = data.get('quote_id')
+        quote_ref = data.get('quote_ref')
+        if quote_ref is not None:
+            if (not isinstance(quote_ref, dict) or set(quote_ref) != {'id','history','token'} or
+                    type(quote_ref.get('history')) is not bool or quote_id is not None or
+                    not isinstance(quote_ref.get('token'), str) or not re.fullmatch(r'[0-9a-f]{64}', quote_ref['token'])):
+                raise PanelError('引用来源已失效，请刷新页面后重新选择', 409)
+            identifier = quote_ref.get('id')
+            valid = (isinstance(identifier,str) and bool(re.fullmatch(r'h[1-9][0-9]{0,18}',identifier))) if quote_ref['history'] else (
+                type(identifier) is int and 0 < identifier < 2**53)
+            if not valid or target.endswith('@chatroom') or mentions:
+                raise PanelError('原生引用暂限私聊普通文字，引用行号不能代替微信原消息 ID')
+            quote_ref = dict(quote_ref)
+        if quote_id is not None:
+            from .recall import message_id
+            if not isinstance(quote_id, str) or not message_id(quote_id):
+                raise PanelError('原生引用需要完整的微信消息 ID 字符串')
+            if target.endswith('@chatroom') or mentions:
+                raise PanelError('原生引用首版暂限私聊普通文字，不与艾特混用')
         identifier, session = data.get('request_id'), data.get('session_id')
         if not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,80}', identifier):
             raise PanelError('发送请求编号无效')
@@ -552,7 +624,8 @@ class PanelController:
         if not isinstance(mentions, list):
             raise PanelError('艾特成员必须为列表')
         mentions = validate_mentions(target, mentions) if mentions else ()
-        payload = (target, content, mentions, session)
+        payload = (target, content, mentions, session, quote_id,
+                   (quote_ref['id'],quote_ref['history'],quote_ref['token']) if quote_ref is not None else None)
         with self.lock:
             previous = self.send_jobs.get(identifier)
             if previous is not None:
@@ -569,6 +642,13 @@ class PanelController:
             allowed = app.config.get('chat_allowlist', [])
             if allowed and target not in allowed:
                 raise PanelError('该会话不在收发白名单中')
+            quote_source = None
+            quoting = quote_id is not None or quote_ref is not None
+            if quoting:
+                account = app.config.get('wechat_account', '')
+                quote_source = self._quote_source_row(app,target,account,quote_ref,quote_id)
+                if quote_source is None:
+                    raise PanelError('原消息已失效、已撤回或不是可引用的普通文字；不会改发文字引用', 409)
             self.send_jobs[identifier] = {'request_id': identifier, 'payload': payload,
                                           'status': 'sending', 'error': ''}
             while len(self.send_jobs) > 64:
@@ -576,7 +656,35 @@ class PanelController:
 
         def deliver():
             try:
-                if mentions:
+                if quoting:
+                    from .quotes import normalize_quote
+                    from .recall import message_id
+                    from .quote_references import QuoteReferenceError
+                    # HTTP 入队后可能刚好撤回；真正发送前再核对，过期就失败，不降级。
+                    source = self._quote_source_row(app,target,account,quote_ref,quote_id)
+                    if self._quote_source_identity(source) != self._quote_source_identity(quote_source):
+                        raise ValueError('原引用消息已变化')
+                    verified_id, created_at = message_id(source.get('message_id')), int(source['timestamp'])
+                    if not verified_id:
+                        resolved = app.service.resolve_quote_reference(source, expected_session=session)
+                        verified_id, created_at = message_id(resolved.get('message_id')), resolved.get('created_at')
+                        if not verified_id or type(created_at) is not int or not 0 <= created_at < 2**32:
+                            raise QuoteReferenceError('原消息 ID 未确认，未发送引用')
+                        if quote_ref['history']:
+                            attached = app.members.attach_quote_id(target,int(quote_ref['id'][1:]),source,verified_id)
+                        else:
+                            attached = self.messages.attach_quote_id(target,quote_ref['id'],source,verified_id,account=account)
+                        if not attached:
+                            raise QuoteReferenceError('原消息已变化，未发送引用')
+                    quote = normalize_quote({'version':1,'reply':content,'reference':{
+                        'message_id':verified_id,'sender_id':source['sender_id'],'sender_name':source['sender_name'] or '好友',
+                        'type':1,'content':source['content'][:1000]}})
+                    if quote is None:
+                        raise QuoteReferenceError('原消息引用信息不完整，未发送引用')
+                    result = app.service.send_quote(target,quote,created_at=created_at,expected_session=session,
+                        delivery_check=lambda: self._quote_source_identity(self._quote_source_row(
+                            app,target,account,quote_ref,quote_id)) == self._quote_source_identity(quote_source))
+                elif mentions:
                     rows = app.service.group_members(target, expected_session=session)
                     if rows is None:
                         raise ValueError('群成员缓存尚未就绪，请刷新成员后重试')
@@ -590,10 +698,12 @@ class PanelController:
                     result = app.service.send_text(target, content, expected_session=session)
                 if result is False:
                     raise RuntimeError('微信未确认发送')
-            except Exception:
+            except Exception as error:
                 # 不回显异常中的原生路径或请求内容，也不自动重发不确定的结果。
                 with self.lock:
-                    self.send_jobs[identifier].update(status='failed', error='发送未完成，请核对微信和消息监控后再决定是否重发')
+                    from .quote_references import QuoteReferenceError
+                    self.send_jobs[identifier].update(status='failed', error=str(error) if isinstance(error,QuoteReferenceError) else
+                        '发送未完成，请核对微信和消息监控后再决定是否重发；引用不会改发普通文字')
             else:
                 with self.lock:
                     self.send_jobs[identifier].update(status='sent')
@@ -690,6 +800,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                     return self.send(200, hub.start_selected(data))
                 if path == '/api/send-text':
                     return self.send(200, controller.send_text(data))
+                if path == '/api/agent-task':
+                    return self.send(200, controller.agent_task(data))
                 if path == '/api/llm-models':
                     return self.send(200, controller.llm_models(data))
                 if path == '/api/chat-settings':

@@ -37,6 +37,41 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(llm.calls[1][1]["steps"], [{"tool": "lookup", "args": {"q": "周六"}, "result": "小王：周六晚上八点 周六"}])
         self.assertEqual([kind for kind, _ in self.trace], ["thought", "tool", "result", "thought"])
 
+    def test_an_empty_reply_is_allowed_only_for_a_task_that_names_someone(self):
+        llm = ScriptedLLM({"reply": "", "at": "阿杰"}, {"reply": "", "at": "阿杰"}, {"reply": ""})
+        agent = Agent(llm, {}, self.record)
+        self.assertEqual((agent.run({"task": "只艾特他一下"}), agent.at), ("", ["阿杰"]))
+        for context in ({"current": "在吗"}, {"task": "说句话"}):  # 平时、或没点名时都不能空着
+            with self.subTest(context=context), self.assertRaises(LLMError):
+                agent.run(context)
+
+    def test_at_normalization_keeps_positions_and_caps_at_three(self):
+        cases = [(" 小王 ", ["小王"]), (["", None, " 阿杰 ", "第四人"], ["", "", "阿杰"]),
+                 ({"name":"小王"}, []), (False, []), ([], [])]
+        for at, expected in cases:
+            with self.subTest(at=at):
+                agent = Agent(ScriptedLLM({"reply":"正文", "at":at}), {}, self.record)
+                self.assertEqual(agent.run({"task":"发言"}), "正文")
+                self.assertEqual(agent.at, expected)
+
+    def test_it_says_one_line_before_a_slow_tool_and_may_stay_quiet_after_the_image(self):
+        events = []
+        def draw(args):
+            events.append("画")
+            return "图片已生成并发送到当前会话"
+        llm = ScriptedLLM({"say": "等我画画", "tool": "draw_image", "args": {}}, {"say": "再来一句", "tool": "draw_image", "args": {}},
+                          {"reply": ""})
+        agent = Agent(llm, {"draw_image": ("画图", draw)}, self.record, say=lambda text: events.append(text))
+        self.assertEqual((agent.run({"current": "画只猫"}), agent.sent_media), ("", True))
+        self.assertEqual(events, ["等我画画", "画", "画"])  # 先说再画；只说第一句
+        self.assertIn(("say", "等我画画"), self.trace)
+
+        def broken(args):
+            raise ToolError("画图服务没开")
+        agent = Agent(ScriptedLLM({"tool": "draw_image", "args": {}}, {"reply": ""}), {"draw_image": ("画图", broken)}, self.record)
+        with self.assertRaises(LLMError):  # 没画成就得说点什么
+            agent.run({"current": "画只猫"})
+
     def test_persona_goes_into_the_system_prompt_only_when_set(self):
         llm = ScriptedLLM({"reply": "嗯"}, {"reply": "嗯"})
         Agent(llm, {}, self.record, "二十岁，爱猫").run({"current": "在吗"})
@@ -77,6 +112,12 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(Agent(llm, tools, self.record).run({"current": "[图片#7]"}), "好胖的猫")
         self.assertEqual([call[2] for call in llm.calls], [(), (b"JPEG",), (b"JPEG",)])  # 看过之后每一步都带着
         self.assertEqual(llm.calls[1][1]["steps"][0]["result"], "#7 是小王发的图片，已附在请求里（第 1 张图）")
+
+    def test_reply_may_ask_to_be_spoken(self):
+        llm = ScriptedLLM({"reply": "好嘞", "format": "voice"}, {"reply": "在呢", "format": "text"})
+        agent = Agent(llm, {}, self.record)
+        self.assertEqual((agent.run({"current": "用语音说"}), agent.voice), ("好嘞", True))
+        self.assertEqual((agent.run({"current": "在吗"}), agent.voice), ("在呢", False))
 
     def test_skip_is_honoured_only_when_allowed(self):
         llm = ScriptedLLM({"skip": True}, {"skip": True}, {"reply": "在呢"})
@@ -238,12 +279,17 @@ class FakeTimeline:
     def has_newer(self, message):
         return bool(self.lines) and self.lines[-1]["text"] != message.text
 
-    def reply_guard(self, chat, epoch, inner=None):
+    def said_more(self, message):
+        return self.interrupted
+
+    interrupted = False
+
+    def reply_guard(self, chat, epoch, inner=None, *, auto=True):
         from contextlib import contextmanager
 
         @contextmanager
         def guard():
-            if chat not in self.reply_chats:
+            if auto and chat not in self.reply_chats:
                 raise SnapshotExpired("自动回复已关闭")
             if epoch != self.wipes:
                 raise SnapshotExpired("记忆已清空")
@@ -280,6 +326,10 @@ class AgentPluginConversationTests(unittest.TestCase):
         wait = patch("plugins.agent_chat.PRIVATE_WAIT", 0)  # 测试里私聊不真等
         wait.start()
         self.addCleanup(wait.stop)
+        self.pauses, self.real_pause = [], __import__("plugins.agent_chat", fromlist=["typing_pause"]).typing_pause
+        pause = patch("plugins.agent_chat.typing_pause", lambda text: self.pauses.append(text) or 0)  # 测试里分条不真停
+        pause.start()
+        self.addCleanup(pause.stop)
         self.plugin.tools, self.plugin.image, self.plugin.per_minute, self.plugin.recent = frozenset(), None, 5, {}
         self.plugin.wake_words, self.plugin.images = ("小雪",), {}
         self.traces = []
@@ -306,11 +356,189 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.say("推荐个电影")
         self.say("它讲什么的？")
         self.assertEqual(self.sent, ["推荐《星际穿越》。", "周末看正合适。", "讲的是穿越虫洞找新家园。"])
+        self.assertEqual(self.pauses, ["周末看正合适。"])  # 只在第二条起停顿，按那条的字数
+        self.assertEqual([self.real_pause("好"), self.real_pause("周" * 12), self.real_pause("周" * 100)], [1.5, 3.0, 5.0])
         second = self.llm.calls[1][1]
         self.assertEqual((second["scene"], second["name"], second["summary"], second["current"]), ("私聊", "小王", "", "它讲什么的？"))
         self.assertEqual(second["chat"], ["10-23 14:00 小王：推荐个电影", "10-23 14:00 你：推荐《星际穿越》。",
                                           "10-23 14:00 你：周末看正合适。"])
         self.assertEqual(self.timeline.compacted, [])
+
+    def test_voice_mode_reaches_the_model_and_its_choice_reaches_delivery(self):
+        sent = []
+        deliver = lambda ctx, message, text, **options: sent.append((text, options["voice"]))
+        self.ctx._speech = SimpleNamespace(mode=lambda chat: "optional")
+        self.llm = ScriptedLLM({"reply": "念给你听", "format": "voice"})
+        with patch("plugins.agent_chat.deliver_model_reply", deliver):
+            self.say("用语音说句话")
+        self.assertEqual((self.llm.calls[0][1]["voice_mode"], sent, self.traces[-1][:7]), ("optional", [("念给你听", True)], "1 条语音回复"))
+        sent.clear()
+        self.ctx._speech = SimpleNamespace(mode=lambda chat: "")  # 发不了语音：模型选了也按文字发
+        self.llm = ScriptedLLM({"reply": "现在发不了语音", "format": "voice"})
+        with patch("plugins.agent_chat.deliver_model_reply", deliver):
+            self.say("再用语音说")
+        self.assertEqual(sent, [("现在发不了语音", False)])
+
+    def task(self, text, chat="wxid_friend"):
+        """网页聊天页“交代”的任务：只分发给智能体，不进聊天记录。"""
+        self.plugin.on_message(Message(text, chat, "wxid_bot", protocol=0, is_group=chat.endswith("@chatroom"), is_self=True,
+                                       data={"agent_task": True}), self.ctx)
+
+    def test_a_task_from_the_panel_continues_the_chat_without_being_recorded_or_needing_auto_reply(self):
+        self.timeline.reply_chats.clear()  # 没开自动回复也照做
+        self.timeline.add("小王", "推荐个电影")
+        self.llm = ScriptedLLM({"thought": "主动打个招呼", "reply": "大家好呀，我是小雪"})
+        self.task("跟大家自我介绍一下")
+        seen = self.llm.calls[0][1]
+        self.assertEqual((seen["task"], seen["trigger"], seen["name"], seen["current"], seen["can_skip"]),
+                         ("跟大家自我介绍一下", "后台任务", "", "", True))
+        self.assertEqual(seen["chat"], ["10-23 14:00 小王：推荐个电影"])
+        self.assertEqual(self.sent, ["大家好呀，我是小雪"])
+        self.assertNotIn("跟大家自我介绍一下", [line["text"] for line in self.timeline.lines])  # 任务本身不入库
+        self.assertEqual(self.traces[0], "后台任务：跟大家自我介绍一下")
+
+    def test_a_task_mentions_the_person_it_names_and_refusing_or_failing_posts_nothing(self):
+        sent = []
+        deliver = lambda ctx, message, text, **options: sent.append((message.sender_id, options["display_name"], text))
+        self.timeline.speaker_wxid = lambda name, room: {"小王": "wxid_friend"}.get(name)
+        self.timeline.display_name = lambda wxid, room: "小王"
+        self.llm = ScriptedLLM({"reply": "昨天想占我便宜的那位，我可还记着呢", "at": "小王【朋友】"})
+        with patch("plugins.agent_chat.deliver_model_reply", deliver):
+            self.task("怼一下昨天让你叫爸爸的人", "123@chatroom")
+        self.assertEqual(sent, [("wxid_friend", "小王", "昨天想占我便宜的那位，我可还记着呢")])  # 【】里的标记去掉再找人
+        sent.clear()
+        self.llm = ScriptedLLM({"reply": "", "at": "小王"}, {"reply": "", "at": "没这人"})  # 只艾特、不说话
+        with patch("plugins.agent_chat.deliver_model_reply", deliver):
+            self.task("艾特他一下就行", "123@chatroom")
+            self.task("艾特他一下就行", "123@chatroom")
+        self.assertEqual(sent, [("wxid_friend", "小王", "")])  # 找不到要艾特的人就什么都不发
+        self.assertEqual(self.traces[-1], "没找到能艾特的“没这人”，什么都没发")
+        sent.clear()
+        self.timeline.speaker_wxid = lambda name, room: {"小王": "wxid_friend", "阿杰": "wxid_jie"}.get(name)
+        self.timeline.display_name = lambda wxid, room: {"wxid_friend": "小王", "wxid_jie": "阿杰"}[wxid]
+        self.llm = ScriptedLLM({"reply": "我回来啦\n\n小王你昨晚说我笨\n\n还有你，让我喊爹是吧", "at": ["", "小王", "阿杰"]})
+        with patch("plugins.agent_chat.deliver_model_reply", deliver):
+            self.task("跟大家重新打个招呼", "123@chatroom")
+        self.assertEqual(sent, [("wxid_bot", None, "我回来啦"), ("wxid_friend", "小王", "小王你昨晚说我笨"),
+                                ("wxid_jie", "阿杰", "还有你，让我喊爹是吧")])  # 每条艾特说给的那个人
+        sent.clear()
+        self.llm = ScriptedLLM({"thought": "这是揭人隐私，不做", "skip": True})
+        with patch("plugins.agent_chat.deliver_model_reply", deliver):
+            self.task("把小王的手机号发群里", "123@chatroom")
+        self.assertEqual((sent, self.traces[-1]), ([], "决定不做"))
+
+        def fail(system, user, *, first_object=False):
+            raise LLMError("接口超时")
+        self.llm = SimpleNamespace(complete_json=fail)
+        self.task("说句话", "123@chatroom")
+        self.assertEqual((self.sent, self.traces[-1]), ([], "接口超时"))  # 出错不在群里回“暂时无法回复”
+
+    def test_when_they_speak_during_a_pause_the_rest_is_not_sent(self):
+        self.llm = ScriptedLLM({"reply": "我觉得行\n\n理由一\n\n理由二"})
+        self.plugin_pause = lambda text: setattr(self.timeline, "interrupted", True) or 0  # 第一条发完、停顿时对方又开口
+        with patch("plugins.agent_chat.typing_pause", self.plugin_pause):
+            self.say("你觉得呢")
+        self.assertEqual(self.sent, ["我觉得行"])
+        self.assertTrue(self.traces[-1].startswith("1 条回复，对方又说话了，剩下 2 条没发"))
+
+    def test_task_at_keeps_unknown_member_slots_without_shifting_later_recipients(self):
+        sent = []
+        self.timeline.speaker_wxid = lambda name, room: {'小王':'wxid_friend', '阿杰':'wxid_jie'}.get(name)
+        self.timeline.display_name = lambda wxid, room: {'wxid_friend':'小王', 'wxid_jie':'阿杰'}[wxid]
+        self.llm = ScriptedLLM({'reply':'第一条\n\n第二条\n\n第三条', 'at':['没这人', '阿杰', '小王']})
+        with patch('plugins.agent_chat.deliver_model_reply', lambda ctx, msg, text, **kw:
+                   sent.append((msg.sender_id, kw['display_name'], text))):
+            self.task('逐条说', '123@chatroom')
+        self.assertEqual(sent, [('wxid_bot', None, '第一条'), ('wxid_jie', '阿杰', '第二条'),
+                                ('wxid_friend', '小王', '第三条')])
+
+    def test_task_only_at_skips_unknown_members_and_private_chat_never_mentions(self):
+        sent = []
+        self.timeline.speaker_wxid = lambda name, room: {'小王':'wxid_friend', '阿杰':'wxid_jie'}.get(name)
+        self.timeline.display_name = lambda wxid, room: {'wxid_friend':'小王', 'wxid_jie':'阿杰'}[wxid]
+        self.llm = ScriptedLLM({'reply':'', 'at':['小王', '没这人', '阿杰']},
+                               {'reply':'', 'at':['小王', '阿杰']}, {'reply':'私聊正文', 'at':['小王']})
+        with patch('plugins.agent_chat.deliver_model_reply', lambda ctx, msg, text, **kw:
+                   sent.append((msg.chat_id, msg.sender_id, kw['display_name'], text))):
+            self.task('只点名', '123@chatroom')
+            self.task('只点名', 'wxid_friend')
+            self.task('正常发言', 'wxid_friend')
+        self.assertEqual(sent, [('123@chatroom', 'wxid_friend', '小王', ''),
+                                ('123@chatroom', 'wxid_jie', '阿杰', ''),
+                                ('wxid_friend', 'wxid_bot', None, '私聊正文')])
+
+    def test_task_single_at_applies_only_to_first_part_and_extra_parts_are_kept(self):
+        sent = []
+        self.timeline.speaker_wxid = lambda name, room: 'wxid_friend' if name == '小王' else None
+        self.timeline.display_name = lambda wxid, room: '小王'
+        self.llm = ScriptedLLM({'reply':'一\n\n二\n\n三\n\n四', 'at':'小王'})
+        with patch('plugins.agent_chat.deliver_model_reply', lambda ctx, msg, text, **kw:
+                   sent.append((kw['display_name'], text))):
+            self.task('发言', '123@chatroom')
+        self.assertEqual(sent, [('小王', '一'), (None, '二'), (None, '三\n四')])
+
+    def test_group_chatter_goes_to_it_inside_the_window_and_to_the_router_outside(self):
+        from contextlib import nullcontext
+        from plugins.agent_chat import ROUTE_WITHIN
+        routed, answer = [], [{"reply": True}]
+
+        def route(system, user):
+            routed.append(json.loads(user))
+            if isinstance(answer[0], Exception):
+                raise answer[0]
+            return answer[0]
+        self.plugin.router, self.plugin.persona = SimpleNamespace(complete_json=route, model="gpt-6-luna"), "活泼"
+        self.timeline.reply_chats.add("123@chatroom")
+        self.timeline.conversation_snapshot = lambda message: SimpleNamespace(current=message.text)
+        self.timeline.others_after = lambda message: 0
+        self.ctx.response_guard = lambda snapshot, personality: nullcontext()
+        group = lambda text: self.say(text, chat="123@chatroom", sender="wxid_friend", is_group=True)
+
+        self.timeline.since_own = lambda message: 10  # 它 10 秒前刚说完：直接交给它自己看，不问路由
+        self.llm = ScriptedLLM({"reply": "那可不"}, {"reply": "我也想去"})
+        group("你这也太损了吧")
+        self.assertEqual((self.llm.calls[0][1]["trigger"], self.llm.calls[0][1]["can_skip"], routed), ("接着跟你聊", True, []))
+        self.timeline.since_own = lambda message: ROUTE_WITHIN + 1  # 窗口外：路由说可以插一句
+        group("周末去爬山吗")
+        self.assertEqual((self.llm.calls[1][1]["trigger"], self.sent), ("想插一句", ["那可不", "我也想去"]))
+        self.assertEqual((routed[0]["current"], routed[0]["persona"]), ("小王：周末去爬山吗", "活泼"))
+        starts = [text for text in self.traces if text.endswith(("你这也太损了吧", "周末去爬山吗"))]  # 聊天页看得出为什么开口
+        self.assertEqual(starts[0], "接着跟你聊 · 小王：你这也太损了吧")
+        self.assertRegex(starts[1], r"^想插一句（gpt-6-luna 判断，\d+\.\d 秒） · 小王：周末去爬山吗$")
+
+        for number, verdict in enumerate(({"reply": False}, LLMError("超时"))):  # 路由说不插、路由出错：都不回
+            answer[0] = verdict
+            group(f"哈哈哈{number}")
+        self.timeline.has_newer = lambda message: True  # 后面又有人说话：不看这条，也不问路由
+        group("嗯嗯")
+        self.plugin.router = None  # 没配路由：窗口外不插话
+        self.timeline.has_newer = lambda message: False
+        group("好的")
+        self.assertEqual((self.sent, len(routed)), (["那可不", "我也想去"], 3))
+
+    def test_router_options_map_effort_and_fast_onto_codex_request_fields(self):
+        ctx = SimpleNamespace(members=SimpleNamespace(history_enabled=True), logger=SimpleNamespace(warning=lambda *a: None), llm=None,
+                              config={"tools": [], "router": {"model": "gpt-6-luna", "effort": "high", "fast": True}})
+        plugin = Plugin()
+        with patch("plugins.agent_chat.ensure_encoder"):
+            plugin.on_load(ctx)
+        self.assertEqual((plugin.router.provider, plugin.router.model, plugin.router.extra_body),
+                         ("codex", "gpt-6-luna", {"reasoning": {"effort": "high"}, "service_tier": "priority"}))
+        ctx.config["router"] = "luna"
+        with patch("plugins.agent_chat.ensure_encoder"), self.assertRaisesRegex(ValueError, "router"):
+            Plugin().on_load(ctx)
+
+    def test_a_line_before_drawing_is_sent_first_and_nothing_follows_the_image(self):
+        self.plugin._toolbox = lambda message, ctx, guard: {"draw_image": ("画图", lambda args: self.sent.append("[图]") or "已发送")}
+        self.llm = ScriptedLLM({"say": "等我画画", "tool": "draw_image", "args": {"prompt": "猫"}}, {"reply": ""})
+        self.say("画只猫给我")
+        self.assertEqual(self.sent, ["等我画画", "[图]"])
+        self.assertTrue(self.traces[-1].startswith("图已发出，没再说话"))
+
+    def test_parts_beyond_three_are_merged_into_the_last_one_not_dropped(self):
+        self.llm = ScriptedLLM({"reply": "一\n\n二\n\n三\n\n四"})
+        self.say("讲讲黑洞")
+        self.assertEqual(self.sent, ["一", "二", "三\n四"])
 
     def test_private_chat_may_choose_not_to_reply(self):
         self.llm = ScriptedLLM({"thought": "话说完了", "skip": True})
@@ -356,6 +584,7 @@ class AgentPluginConversationTests(unittest.TestCase):
 
     def test_private_reply_waits_five_seconds_from_receipt_counting_time_already_queued(self):
         import time
+        self.llm = ScriptedLLM({"reply": "在"}, {"reply": "有空"})  # 一条的回复：这里只数私聊等待，不含分条停顿
         with patch("plugins.agent_chat.PRIVATE_WAIT", 5), patch("plugins.agent_chat.time.sleep") as sleep:
             for queued in (2, 10):  # 刚收到 2 秒：再等约 3 秒；在队列里已排了 10 秒：不再等
                 self.timeline.add("小王", f"排队{queued}秒")

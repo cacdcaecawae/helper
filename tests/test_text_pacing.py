@@ -42,6 +42,68 @@ class RecordingCancel:
 
 
 class TextPacingTests(unittest.TestCase):
+    def test_group_snapshot_does_not_wait_for_typing_send_lock(self):
+        service = ServiceFacade(text_delay={"enabled": False})
+        backend = Mock(session_id="snapshot")
+        backend.group_members.return_value = ({"wxid": "wxid_member"},)
+        service.bind(backend)
+        done, errors = threading.Event(), []
+        def query():
+            try:
+                self.assertEqual(service.group_members("12345678@chatroom"), backend.group_members.return_value)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                done.set()
+        service._send_lock.acquire()
+        thread = threading.Thread(target=query, daemon=True)
+        try:
+            thread.start()
+            self.assertTrue(done.wait(1), "只读名单被打字等待锁挡住")
+        finally:
+            service._send_lock.release()
+            thread.join(2)
+            service.close()
+        self.assertEqual(errors, [])
+
+    def test_close_releases_connection_lock_before_joining_receiver_callback(self):
+        service = ServiceFacade(text_delay={"enabled": False})
+        begin, done = threading.Event(), threading.Event()
+        backend = Mock(session_id="closing")
+        def receiver():
+            begin.wait(2)
+            try:
+                service.group_members("12345678@chatroom")
+            except RuntimeError:
+                pass
+            finally:
+                done.set()
+        thread = threading.Thread(target=receiver, daemon=True)
+        def stop():
+            begin.set()
+            thread.join(1)
+            self.assertFalse(thread.is_alive(), "stop 持连接锁等待回调，造成互等")
+            return {"dll_unloaded": True}
+        backend.stop.side_effect = stop
+        service.bind(backend)
+        thread.start()
+        self.assertEqual(service.close(), {"dll_unloaded": True})
+        self.assertTrue(done.is_set())
+        self.assertFalse(service.connected)
+
+    def test_failed_close_keeps_backend_unavailable_for_retry(self):
+        service = ServiceFacade(text_delay={"enabled": False})
+        backend = Mock(session_id="cleanup")
+        backend.stop.side_effect = [RuntimeError("busy"), {"dll_unloaded": True}]
+        service.bind(backend)
+        with self.assertRaises(RuntimeError):
+            service.close()
+        self.assertIs(service._backend, backend)
+        self.assertFalse(service.connected)
+        with self.assertRaises(RuntimeError):
+            service.bind(Mock())
+        self.assertEqual(service.close(), {"dll_unloaded": True})
+
     def test_character_groups_include_chinese_symbols_and_short_text(self):
         pacing = TextSendDelay.from_config()
         with patch("wxbot_framework.pacing.random.uniform", return_value=0.2):

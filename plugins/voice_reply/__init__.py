@@ -1,5 +1,6 @@
 """群音色菜单和切换；模型回复由共享语音层发送。"""
 from wxbot_framework.members import SnapshotExpired
+from wxbot_framework.speech import ensure_encoder
 from wxbot_framework.summary import split_text
 from wxbot_framework.tts import TTSError
 
@@ -23,6 +24,7 @@ def menu_query(value):
 class Plugin:
     def on_load(self, ctx):
         self.members = ctx.members
+        ensure_encoder(ctx.logger)  # 装不上就启用失败
         ctx.speech.reload()  # 只核对本地配置，首次使用时才请求音色。
 
     def on_message(self, message, ctx):
