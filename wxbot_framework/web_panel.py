@@ -178,8 +178,9 @@ class PanelController:
                     name = message.data.get('sender_wechat_name', '')
                     members = getattr(app, 'members', None)
                     if members is not None and message.is_group and message.sender_id and not message.is_self:
-                        try:
-                            name = members.display_name(message.sender_id, message.chat_id) or name
+                        try:  # 不知道名字的群友显示“群友·xxxx”，和模型看到的一样，分得清是几个人
+                            name = (members.display_name(message.sender_id, message.chat_id) or name or
+                                    members.speaker_name(message.sender_id, message.chat_id))
                         except Exception:
                             pass
                     self.messages.append(message, account=app.config.get('wechat_account') or '', sender_name=name)

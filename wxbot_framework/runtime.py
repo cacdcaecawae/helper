@@ -203,8 +203,9 @@ class BotApplication:
         for row in rows:
             if row.get("wechat_name"):
                 self.members.remember_wechat_name(row["wxid"], row["wechat_name"])
-            nickname = row.get("group_nickname", row.get("nickname", ""))
-            self.members.remember_group_nickname(row["wxid"], room, nickname[:64])
+            nickname = row.get("group_nickname") or row.get("nickname") or ""
+            if nickname:  # 名单里非好友常常没有名字：空的不覆盖已知的（比如从艾特里学到的）
+                self.members.remember_group_nickname(row["wxid"], room, nickname[:64])
 
     def _with_group_role(self, message):
         if not message.is_group:

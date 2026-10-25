@@ -520,7 +520,7 @@ function renderChatWorkspace(){
     if(message.kind==='agent')return agentTrace(message);
     const time=[message.date,message.time].filter(Boolean).join(' '),showTime=time!==lastTime;lastTime=time;
     const own=message.direction==='outgoing';
-    const label=own?'我':message.sender_name||name||'对方';
+    const label=own?'我':message.sender_name||(message.is_group?'群友':name)||'对方';  // 群里不拿群名当发言人
     return `${showTime?`<div class="hc-time">${escape(time)}</div>`:''}<article class="hc-message ${own?'outgoing':''}">${chatAvatar(label)}<div class="hc-message-body">${message.is_group&&!own?`<div class="hc-sender">${escape(label)}</div>`:''}<div class="hc-bubble">${message.recalled?'<span class="hc-recalled">已撤回</span>':''}${escape(message.content)}</div></div></article>`;
   }).join('')||`<div class="hc-welcome"><span class="hc-welcome-icon">↔</span><h2>${selected?'等待新消息':'选择一个会话'}</h2><p>${connected?'这里只显示本次连接收到的消息，不是完整历史记录':'前往账号管理启动机器人后，即可收发消息'}</p>${!connected?'<a href="#overview">前往账号管理 →</a>':''}</div>`;
   box.scrollTop=atBottom?box.scrollHeight:top;

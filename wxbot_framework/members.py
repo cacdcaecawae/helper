@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -706,6 +707,8 @@ class MemberStore:
         native_name = message.data.get("sender_wechat_name")
         if native_name:
             self.remember_wechat_name(message.sender_id, native_name)
+        if message.is_group:
+            self._learn_mentioned_name(message)
         with self._lock, self._connection() as db:
             self.rollover()
             if message.is_group:
@@ -736,6 +739,17 @@ class MemberStore:
                              (self.account, message.chat_id, message.session_id, message.sequence)).fetchone()
             return bool(row and db.execute("""SELECT 1 FROM messages WHERE account=? AND room=? AND is_self=0
                 AND received_at>? LIMIT 1""", (self.account, message.chat_id, row[0])).fetchone())
+
+    def _learn_mentioned_name(self, message):
+        """群友互相艾特时，微信把对方在群里的显示名写进正文（“@小王\u2005”）并附上对方 ID；
+        只艾特了一个人时，就把这个名字记成他的群昵称。非好友的名字微信内存里读不到，靠这样慢慢认识。"""
+        mentioned = [wxid for wxid in message.data.get("at_members", ()) if wxid != self.account]
+        labels = re.findall(r"@([^@\u2005\n]{1,64})\u2005", message.text)
+        if len(mentioned) == 1 and len(labels) == 1 and labels[0].strip():
+            try:
+                self.remember_group_nickname(mentioned[0], message.chat_id, labels[0].strip())
+            except MemberError:
+                pass
 
     def memory(self, chat, *, exclude=None):
         """智能体的记忆就是这个群或私聊的完整聊天记录：较早部分的摘要，加摘要之后的全部原文（按时间顺序）。

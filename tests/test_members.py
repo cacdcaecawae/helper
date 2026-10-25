@@ -267,6 +267,23 @@ class MemberTests(unittest.TestCase):
         self.store.remember_group_nickname(JING, ROOM, "小静")
         self.assertEqual(self.store.speaker_name(JING, ROOM), "小静")
 
+    def test_names_are_learned_from_single_mentions_and_kept_through_member_polling(self):
+        from types import SimpleNamespace
+        from wxbot_framework.runtime import BotApplication
+        at = lambda text, members, sequence: self.message(text, sequence=sequence, data={"at_members": members})
+        self.store.record(at("@小王 一起吃饭吗", ["wxid_wang"], 1))  # 只艾特一个人：记下他的群名
+        self.store.record(at("@甲 @乙 都来", ["wxid_a", "wxid_b"], 2))  # 艾特多人：对不上号，不记
+        self.store.record(at("@小雪 在吗", [ROBOT], 3))  # 艾特的是机器人自己，不记
+        self.assertEqual(self.store.speaker_name("wxid_wang", ROOM), "小王")
+        self.assertTrue(self.store.speaker_name("wxid_a", ROOM).startswith("群友·"))
+        self.assertIsNone(self.store.group_nickname(ROBOT, ROOM))
+        # 每 15 秒拉一次群成员名单：非好友在名单里常常没名字，空名字不能把学到的名字删掉
+        app = SimpleNamespace(backend=None, members=self.store, _group_roles={})
+        BotApplication._remember_group_members(app, ROOM, [{"wxid": "wxid_wang", "nickname": "", "group_nickname": ""}])
+        self.assertEqual(self.store.speaker_name("wxid_wang", ROOM), "小王")
+        BotApplication._remember_group_members(app, ROOM, [{"wxid": "wxid_wang", "group_nickname": "王老师"}])
+        self.assertEqual(self.store.speaker_name("wxid_wang", ROOM), "王老师")  # 名单里有真名时以名单为准
+
     def test_has_newer_sees_later_lines_from_the_friend_only(self):
         friend = "wxid_friend"
         clock = [datetime(2026, 10, 24, 4, 0, tzinfo=timezone.utc)]
