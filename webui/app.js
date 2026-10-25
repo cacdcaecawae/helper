@@ -227,6 +227,7 @@ async function loadConfig() {
     $('.key-state',form).textContent = config[name]?.api_key_configured ? '已配置' : local ? '本机服务无需密钥' : '尚未配置';
     $('.key-state',form).classList.toggle('missing', !config[name]?.api_key_configured && !local);
   }
+  fill($('#image-form'), {image_provider: config.llm?.image_provider || 'local'});
   fill($('#delay-form'), config.text_send_delay);
   loadModels();
 }
@@ -315,6 +316,8 @@ for (const name of ['llm','tts']) $('#'+name+'-form').onsubmit=e=>{
     return save({[name]:values});
   });
 };
+// 画图和聊天分开选，只提交画图方式，不动大模型的其他设置。
+$('#image-form').onsubmit=e=>{e.preventDefault();action(()=>save({llm:{image_provider:e.target.elements.image_provider.value}}));};
 $('#delay-form').onsubmit=e=>{e.preventDefault();const f=e.target.elements;action(()=>save({text_send_delay:{enabled:f.enabled.checked,characters_per_group:Number(f.characters_per_group.value),min_seconds:Number(f.min_seconds.value),max_seconds:Number(f.max_seconds.value)}}));};
 $('#discover-chats').onclick=()=>action(async()=>{
   const {chats}=await api('chats');const rooms=chats.filter(c=>c.is_group||c.chat_id?.endsWith('@chatroom'));

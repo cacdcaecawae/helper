@@ -259,6 +259,30 @@ class MemberTests(unittest.TestCase):
         self.assertEqual([(line["name"], line["text"]) for line in self.store.memory(friend)[1]],
                          [("小王", "推荐本书"), ("你", "推荐《白夜行》"), ("你", "我晚点看")])
 
+    def test_images_are_timeline_lines_looked_up_by_number_within_their_chat(self):
+        friend, photo = "wxid_friend", self.root / "photo.png"
+        self.store.set_chat(friend, memory=True, reply=True)
+        image = lambda chat, sender, sequence, **kwargs: Message("<msg>xml</msg>", chat, sender, session_id="first",
+                                                                  sequence=sequence, type=3, **kwargs)
+        self.assertTrue(self.store.record(image(friend, friend, 1, data={"image_path": str(photo)})))
+        self.assertFalse(self.store.record(image(friend, friend, 1, data={"image_path": str(photo)})))  # 同一条不重复记
+        self.assertFalse(self.store.record(image(friend, friend, 2)))  # 没下载好（没有本机路径）不记
+        self.assertTrue(self.store.record(image(ROOM, ROBOT, 3, is_group=True, is_self=True, data={"image_path": str(photo)})))
+        (line,) = self.store.memory(friend)[1]
+        number = int(line["text"][4:-1])
+        self.assertEqual(line["text"], f"[图片#{number}]")  # 正文带编号，模型按编号再看
+        self.assertEqual(self.store.stored_text(image(friend, friend, 1)), line["text"])
+        path, label = self.store.image(friend, number)
+        self.assertEqual(path, photo)
+        self.assertRegex(label, r"^\d{2}-\d{2} \d{2}:\d{2} 对方$")  # 北京时间 + 发图的人
+        with self.assertRaisesRegex(MemberError, "没有图片"):
+            self.store.image(ROOM, number)  # 群里取不到私聊的图
+        own = self.store.memory(ROOM)[1][-1]
+        self.assertEqual((own["name"], self.store.image(ROOM, int(own["text"][4:-1]))[1][-1:]), ("你", "你"))
+        self.store.forget(friend)
+        with self.assertRaisesRegex(MemberError, "没有图片"):
+            self.store.image(friend, number)  # 清空后就找不到了
+
     def test_unnamed_group_members_get_distinct_stable_labels(self):
         self.assertEqual(self.store.speaker_name(JING, ROOM), UNNAMED_JING)
         self.assertNotEqual(self.store.speaker_name("wxid_other", ROOM), UNNAMED_JING)  # 分得清是两个人

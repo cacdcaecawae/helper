@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-from wxbot_framework.llm import LLMClient, LLMError
+from wxbot_framework.llm import CODEX_ENDPOINT, LLMClient, LLMError
 from plugins.idiom_chain.judge import IdiomJudge
 
 
@@ -49,6 +49,14 @@ class LLMTests(unittest.TestCase):
         request = call.call_args.args[0]
         self.assertEqual(request.full_url, "https://gateway.example.test/v1/chat/completions")
         self.assertEqual(set(json.loads(request.data)), {"model", "messages", "response_format", "max_tokens", "stream"})
+
+    def test_images_go_in_as_image_url_parts(self):
+        jpeg = b"\xff\xd8\xff\xe0" + b"photo"
+        with patch("wxbot_framework.llm.urlopen", return_value=self.response('{"reply":"猫"}')) as call:
+            self.assertEqual(self.client.complete_json("JSON", "这是啥", images=[jpeg]), {"reply": "猫"})
+        content = json.loads(call.call_args.args[0].data)["messages"][1]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "这是啥"})
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
 
     def test_full_endpoint_is_not_appended_twice(self):
         client = LLMClient({**self.options, "base_url": "https://gateway.example.test/v1/chat/completions/"})
@@ -283,6 +291,22 @@ class ClaudeCodeTests(unittest.TestCase):
         self.assertEqual((command[command.index("--tools") + 1], command[command.index("--allowedTools") + 1]),
                          ("WebSearch", "WebSearch"))
 
+    def test_images_switch_to_stream_json_input(self):
+        import subprocess
+        events = [{"type": "system", "subtype": "init"}, {"type": "result", "is_error": False, "result": '{"reply":"红色"}'}]
+        output = subprocess.CompletedProcess([], 0, "\n".join(json.dumps(e) for e in events).encode() + b"\n", b"")
+        png = b"\x89PNG\r\n\x1a\n" + b"pixels"
+        with patch("wxbot_framework.llm.subprocess.run", return_value=output) as run:
+            self.assertEqual(self.client.complete_json("只返回 JSON", "什么颜色", images=[png]), {"reply": "红色"})
+        command, stdin = run.call_args.args[0], run.call_args.kwargs["input"]
+        self.assertEqual(command[2:4], ["--output-format", "stream-json"])
+        self.assertEqual(command[command.index("--input-format") + 1], "stream-json")
+        self.assertIn("--verbose", command)
+        self.assertEqual(command[command.index("--tools") + 1], "")  # 带图也不开任何工具
+        message = json.loads(stdin.decode("utf-8"))["message"]
+        self.assertEqual(message["content"][0], {"type": "text", "text": "什么颜色"})
+        self.assertEqual(message["content"][1]["source"]["media_type"], "image/png")
+
     def test_errors_become_llm_errors(self):
         with self.assertRaisesRegex(LLMError, "account is on hold"):
             self.run_with({"is_error": True, "result": "Your account is on hold"}, self.client.complete_json, "s", "u")
@@ -333,6 +357,14 @@ class CodexTests(unittest.TestCase):
         self.assertEqual(LLMClient({"provider": "codex"}).model, "gpt-6.1-sol")
         self.assertNotIn("private-refresh", request.data.decode())
 
+    def test_images_go_in_as_input_image(self):
+        events = [{"type": "response.output_text.done", "text": '{"reply":"猫"}'}, {"type": "response.completed"}]
+        with patch("wxbot_framework.llm.urlopen", return_value=self.stream(*events)) as call:
+            self.client.complete_json("JSON", "这是啥", images=[b"\xff\xd8\xff\xe0photo"])
+        content = json.loads(call.call_args.args[0].data)["input"][1]["content"]
+        self.assertEqual(content[0], {"type": "input_text", "text": "这是啥"})
+        self.assertTrue(content[1]["image_url"].startswith("data:image/jpeg;base64,"))
+
     def test_image_generation_returns_png_bytes(self):
         events = [{"type": "response.output_item.done", "item": {"type": "image_generation_call", "result": "UE5HREFUQQ=="}},
                   {"type": "response.completed"}]
@@ -346,6 +378,15 @@ class CodexTests(unittest.TestCase):
                 self.client.generate_image("橘猫")
         with self.assertRaisesRegex(LLMError, "Codex"):
             LLMClient({"api_key": "k", "model": "m"}).generate_image("橘猫")
+        # 聊天用兼容接口、画图选 Codex：生图请求走 Codex 后端和 Codex 默认模型，不带兼容接口的密钥
+        chat = LLMClient({"api_key": "k", "model": "m", "image_provider": "codex"})
+        with patch("wxbot_framework.llm.urlopen", return_value=self.stream(*events)) as call:
+            self.assertEqual(chat.generate_image("橘猫"), b"PNGDATA")
+        request = call.call_args.args[0]
+        self.assertEqual((request.full_url, json.loads(request.data)["model"]), (CODEX_ENDPOINT, "gpt-6.1-sol"))
+        self.assertNotIn("Bearer k", str(request.headers))
+        with self.assertRaisesRegex(ValueError, "image_provider"):
+            LLMClient({"provider": "codex", "image_provider": "dalle"})
 
     def test_image_edit_sends_the_original_as_input_image(self):
         events = [{"type": "response.output_item.done", "item": {"type": "image_generation_call", "result": "UE5HREFUQQ=="}},

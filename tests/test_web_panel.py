@@ -280,6 +280,13 @@ class ControllerTests(PanelFixture):
         self.controller.save_configuration({'llm':{'provider':'claude_code', 'model':'sonnet', 'claude_config_dir':directory}})
         saved = self.controller.configuration()['llm']
         self.assertEqual((saved['provider'], saved['model'], saved['claude_config_dir']), ('claude_code', 'sonnet', directory))
+        self.assertEqual(saved['image_provider'], 'local')  # 没单独选过：非 Codex 聊天默认本机画图
+        # “图片”卡片只提交画图方式：聊天仍是 Claude Code，画图改走 Codex
+        self.controller.save_configuration({'llm':{'image_provider':'codex'}})
+        saved = self.controller.configuration()['llm']
+        self.assertEqual((saved['provider'], saved['image_provider']), ('claude_code', 'codex'))
+        with self.assertRaises(ValueError):
+            self.controller.save_configuration({'llm':{'image_provider':'dalle'}})
 
     def test_compatible_llm_options_round_trip_without_changing_saved_key(self):
         path = self.root/'llm_config.json'

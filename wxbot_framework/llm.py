@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import math
@@ -43,8 +44,22 @@ def image_data_url(data):
     if kind is None:
         raise LLMError("图片格式不支持（只支持 PNG、JPEG、GIF、WebP）")
     if len(data) > 10 * 1024 * 1024:
-        raise LLMError("图片超过 10 MB，无法修改")
+        raise LLMError("图片超过 10 MB")
     return f"data:image/{kind};base64," + base64.b64encode(data).decode("ascii")
+
+
+def shrink_image(data, edge=1024):
+    """给模型看的图：长边缩到 edge 像素并转成 JPEG，上传快、占的 token 也少；动图只取第一帧。"""
+    from PIL import Image, ImageOps
+    try:
+        with Image.open(io.BytesIO(data)) as picture:
+            picture = ImageOps.exif_transpose(picture).convert("RGB")
+            picture.thumbnail((edge, edge))
+            output = io.BytesIO()
+            picture.save(output, "JPEG", quality=85)
+            return output.getvalue()
+    except Exception:  # PIL 对坏图、超大图抛的异常种类很多，一律当打不开
+        raise LLMError("图片打不开或格式不支持") from None
 
 
 def _codex_home():
@@ -87,6 +102,10 @@ class LLMClient:
                          else self.base_url + "/chat/completions")
         self._deepseek_official = (parsed.scheme == "https" and parsed.hostname == "api.deepseek.com"
                                   and parsed.port in (None, 443))
+        # 画图和聊天分开选：聊天用任何接入方式，画图都可以走本机 Codex 登录；没选过时 Codex 聊天就用 Codex 画，其余用本机 Z-Image。
+        self.image_provider = options.get("image_provider", "codex" if self.provider == "codex" else "local")
+        if self.image_provider not in ("codex", "local"):
+            raise ValueError("image_provider 应为 codex 或 local")
         self.model = options.get("model", {"codex": CODEX_DEFAULT_MODEL, "claude_code": "default"}.get(self.provider, "deepseek-flash"))
         self._api_key = options.get("api_key", "")
         if not isinstance(self.model, str) or not self.model.strip():
@@ -127,12 +146,15 @@ class LLMClient:
     def from_file(cls, path):
         return cls(json.loads(Path(path).read_text(encoding="utf-8-sig")))
 
-    def complete_json(self, system, user, *, first_object=False):
+    def complete_json(self, system, user, *, first_object=False, images=()):
+        """images：要一起给模型看的图片字节（看图工具用），三种接入方式各按自己的格式内嵌 base64。"""
         json_instruction = "\n\n请只返回一个有效的 JSON 对象，不要使用 Markdown 代码围栏或附加说明。"
         if not self.json_mode:
             system += json_instruction
+        content = [{"type": "text", "text": user}, *({"type": "image_url", "image_url": {"url": image_data_url(image)}}
+                                                      for image in images)] if images else user
         payload = {"model": self.model, "messages": [{"role": "system", "content": system},
-                                                       {"role": "user", "content": user}],
+                                                       {"role": "user", "content": content}],
                    self.token_limit_parameter: self.max_tokens, "stream": False, **self.extra_body}
         if self.json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -144,9 +166,9 @@ class LLMClient:
         allow_fenced = not self.json_mode
         try:
             if self.provider == "codex":
-                return self._parse_json(self._codex_text(system, user), allow_fenced, first_object)
+                return self._parse_json(self._codex_text(system, user, images), allow_fenced, first_object)
             if self.provider == "claude_code":  # 没有 JSON 模式，靠提示词并容忍代码围栏
-                return self._parse_json(self._claude(system + json_instruction, user), True, first_object)
+                return self._parse_json(self._claude(system + json_instruction, user, images=images), True, first_object)
             for attempt in range(2):
                 request = Request(self.endpoint,
                                   data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -247,19 +269,22 @@ class LLMClient:
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": query}]}]})
 
     def generate_image(self, prompt, image=None):
-        """用 Codex 后端自带的生图工具画一张图；给了 image（原图字节）就按 prompt 修改它。返回 PNG 字节；仅 Codex 接入方式可用。"""
-        if self.provider != "codex":
-            raise LLMError("Codex 生图需要使用本机 Codex 登录")
+        """用 Codex 后端自带的生图工具画一张图；给了 image（原图字节）就按 prompt 修改它。返回 PNG 字节；
+        image_provider 为 codex 时可用，聊天不是 Codex 时用 Codex 默认模型另发请求。"""
+        if self.image_provider != "codex":
+            raise LLMError("Codex 生图需要在“图片”设置里选择本机 Codex 登录")
         content = [{"type": "input_text", "text": prompt}]
         if image is not None:
             content.append({"type": "input_image", "image_url": image_data_url(image)})
-        return self._codex_stream({"tools": [{"type": "image_generation"}], "tool_choice": {"type": "image_generation"},
+        client = self if self.provider == "codex" else LLMClient({"provider": "codex"})
+        return client._codex_stream({"tools": [{"type": "image_generation"}], "tool_choice": {"type": "image_generation"},
                                    "input": [{"type": "message", "role": "user", "content": content}]}, image=True)
 
-    def _claude(self, system, user, *, tools=""):
+    def _claude(self, system, user, *, tools="", images=()):
         """调用本机 Claude Code（claude -p）：你自己的订阅登录、未修改的官方程序，用量算在订阅额度里。
         关掉内置工具、个人设置（插件、钩子）、MCP 和会话记录，在空目录里运行，模型碰不到本机文件；
-        正文走标准输入。不能用 --bare：它只认 API 密钥，不读订阅登录。"""
+        正文走标准输入。不能用 --bare：它只认 API 密钥，不读订阅登录。
+        带图片时改用 stream-json 输入：一行 Claude 消息格式的 JSON，图片是 base64 内容块；输出最后一行是结果。"""
         program = shutil.which("claude")
         if program is None:
             raise LLMError("没有找到 claude 命令，请先安装 Claude Code 并登录")
@@ -271,9 +296,19 @@ class LLMClient:
             command += ["--allowedTools", tools]
         if self.model != "default":
             command += ["--model", self.model]
+        stdin = user.encode("utf-8")
+        if images:
+            command[2:4] = ["--output-format", "stream-json"]
+            command += ["--input-format", "stream-json", "--verbose"]
+            content = [{"type": "text", "text": user}]
+            for image in images:
+                header, data = image_data_url(image).split(",", 1)
+                content.append({"type": "image", "source": {"type": "base64", "media_type": header[5:-7], "data": data}})
+            stdin = (json.dumps({"type": "user", "message": {"role": "user", "content": content}}, ensure_ascii=False)
+                     + "\n").encode("utf-8")
         try:
             with tempfile.TemporaryDirectory(prefix="helper-claude-") as directory:
-                result = subprocess.run(command, input=user.encode("utf-8"), capture_output=True, cwd=directory,
+                result = subprocess.run(command, input=stdin, capture_output=True, cwd=directory,
                                         env=dict(os.environ, CLAUDE_CONFIG_DIR=str(self.claude_config_dir)),
                                         timeout=max(self.timeout, 120),  # 每次都要启动程序，比直连接口慢
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -282,19 +317,22 @@ class LLMClient:
         except OSError:
             raise LLMError("无法启动 claude 命令，请在本机运行一次 claude 检查安装") from None
         try:
-            data = json.loads(result.stdout.decode("utf-8"))
+            raw = result.stdout.decode("utf-8")
+            data = json.loads(raw.strip().splitlines()[-1] if images else raw)
             text = data["result"]
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, IndexError):
             raise LLMError("Claude Code 没有返回有效结果，请在本机运行一次 claude 检查登录") from None
         if data.get("is_error") or not isinstance(text, str) or not text.strip():
             # 例如额度用完、账号暂停：原文只进日志和聊天页过程，不会发到群里。
             raise LLMError("Claude Code 返回错误：" + str(text).strip()[:200])
         return text
 
-    def _codex_text(self, system, user):
+    def _codex_text(self, system, user, images=()):
+        pictures = [{"type": "input_image", "image_url": image_data_url(image)} for image in images]
         payload = {"max_output_tokens": self.max_tokens,
-                   "input": [{"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]}
-                             for role, text in (("developer", system), ("user", user))], **self.extra_body}
+                   "input": [{"type": "message", "role": "developer", "content": [{"type": "input_text", "text": system}]},
+                             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": user}, *pictures]}],
+                   **self.extra_body}
         if self.json_mode:
             payload["text"] = {"format": {"type": "json_object"}}
         return self._codex_stream(payload)

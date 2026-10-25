@@ -6,9 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from plugins.agent_chat import Plugin
-from wxbot_framework.agent import MAX_OBSERVATION, Agent, ImageServer, ToolError, draw_tool, edit_tool, history_tool
+from wxbot_framework.agent import MAX_OBSERVATION, Agent, ImageServer, ToolError, draw_tool, edit_tool, history_tool, view_tool
 from wxbot_framework.llm import LLMError
-from wxbot_framework.members import SnapshotExpired
+from wxbot_framework.members import MemberError, SnapshotExpired
 from wxbot_framework.message_monitor import MessageBuffer
 from wxbot_framework.sdk import Message
 
@@ -17,9 +17,9 @@ class ScriptedLLM:
     def __init__(self, *results):
         self.results, self.calls = list(results), []
 
-    def complete_json(self, system, user, *, first_object=False):
+    def complete_json(self, system, user, *, first_object=False, images=()):
         assert first_object
-        self.calls.append((system, json.loads(user)))
+        self.calls.append((system, json.loads(user), tuple(images)))
         return self.results.pop(0)
 
 
@@ -36,6 +36,14 @@ class AgentTests(unittest.TestCase):
         self.assertIn("- lookup 查记录", llm.calls[0][0])
         self.assertEqual(llm.calls[1][1]["steps"], [{"tool": "lookup", "args": {"q": "周六"}, "result": "小王：周六晚上八点 周六"}])
         self.assertEqual([kind for kind, _ in self.trace], ["thought", "tool", "result", "thought"])
+
+    def test_persona_goes_into_the_system_prompt_only_when_set(self):
+        llm = ScriptedLLM({"reply": "嗯"}, {"reply": "嗯"})
+        Agent(llm, {}, self.record, "二十岁，爱猫").run({"current": "在吗"})
+        Agent(llm, {}, self.record).run({"current": "在吗"})
+        self.assertIn("你的人设", llm.calls[0][0])
+        self.assertTrue(llm.calls[0][0].endswith("二十岁，爱猫"))
+        self.assertNotIn("你的人设", llm.calls[1][0])
 
     def test_unknown_tools_and_failures_become_observations_not_crashes(self):
         def broken(args):
@@ -62,6 +70,20 @@ class AgentTests(unittest.TestCase):
         self.assertLessEqual(len(result), MAX_OBSERVATION)  # Agent 不会再截掉尾部
         self.assertIn("最后决定取消爬山", result)
         self.assertTrue(result.startswith("（更早的") and result.endswith("缩小范围）"))
+
+    def test_a_viewed_image_rides_along_in_every_later_step(self):
+        llm = ScriptedLLM({"tool": "view_image", "args": {"id": 7}}, {"tool": "lookup", "args": {}}, {"reply": "好胖的猫"})
+        tools = {"view_image": ("看图", lambda args: ("#7 是小王发的图片", b"JPEG")), "lookup": ("查", lambda args: "x")}
+        self.assertEqual(Agent(llm, tools, self.record).run({"current": "[图片#7]"}), "好胖的猫")
+        self.assertEqual([call[2] for call in llm.calls], [(), (b"JPEG",), (b"JPEG",)])  # 看过之后每一步都带着
+        self.assertEqual(llm.calls[1][1]["steps"][0]["result"], "#7 是小王发的图片，已附在请求里（第 1 张图）")
+
+    def test_skip_is_honoured_only_when_allowed(self):
+        llm = ScriptedLLM({"skip": True}, {"skip": True}, {"reply": "在呢"})
+        self.assertIsNone(Agent(llm, {}, self.record).run({"current": "好的"}, can_skip=True))
+        self.assertEqual(Agent(llm, {}, self.record).run({"current": "@你 在吗"}), "在呢")  # 被艾特不能不回：提示后重答
+        self.assertIn("不能不回", llm.calls[2][1]["steps"][0]["result"])
+        self.assertEqual([call[1]["can_skip"] for call in llm.calls], [True, False, False])
 
     def test_tool_calls_are_bounded_and_must_end_with_a_valid_reply(self):
         loop = {"tool": "lookup", "args": {}}
@@ -101,17 +123,28 @@ class ImageServerTests(unittest.TestCase):
         self.assertEqual(sent, ["IMG:猫".encode()])
 
 
-    def test_edit_tool_sends_the_edited_latest_image(self):
+    def test_view_and_edit_tools_take_the_image_by_number(self):
+        from PIL import Image
+        original = io.BytesIO()
+        Image.new("RGB", (3000, 1500), "red").save(original, "PNG")
+
+        def load(number):
+            if number != 12:
+                raise ToolError(f"找不到图片 #{number}")
+            return original.getvalue(), "10-24 21:03 小王"
+        text, data = view_tool(load)[1]({"id": "#12"})  # 模型可能填 "#12"
+        self.assertEqual(text, "#12 是 10-24 21:03 小王 发的图片")
+        with Image.open(io.BytesIO(data)) as shrunk:
+            self.assertEqual((shrunk.format, shrunk.size), ("JPEG", (1024, 512)))  # 缩到长边 1024 再给模型看
         sent, seen = [], []
         generator = SimpleNamespace(generate_image=lambda prompt, image: seen.append((prompt, image)) or b"EDITED")
-        description, run = edit_tool(generator, lambda: b"ORIGINAL", sent.append)
-        self.assertEqual(run({"prompt": " 背景换成海边 "}), "修改后的图片已生成并发送到当前会话")
-        self.assertEqual((seen, sent), ([("背景换成海边", b"ORIGINAL")], [b"EDITED"]))
-
-        def gone():
-            raise FileNotFoundError
-        with self.assertRaisesRegex(ToolError, "重新发"):
-            edit_tool(generator, gone, sent.append)[1]({"prompt": "改"})
+        run = edit_tool(generator, load, sent.append)[1]
+        self.assertEqual(run({"id": 12, "prompt": " 背景换成海边 "}), "修改后的图片已生成并发送到当前会话")
+        self.assertEqual((seen, sent), ([("背景换成海边", original.getvalue())], [b"EDITED"]))  # 改图用原图
+        with self.assertRaisesRegex(ToolError, "编号"):
+            run({"prompt": "改"})
+        with self.assertRaisesRegex(ToolError, "#3"):
+            run({"id": 3, "prompt": "改"})
 
 
 class TraceBufferTests(unittest.TestCase):
@@ -138,6 +171,20 @@ class AgentPluginGateTests(unittest.TestCase):
         return Message(text, chat, "wxid_x" if chat.endswith("@chatroom") else chat,
                        is_group=chat.endswith("@chatroom"), data=data)
 
+    def test_relation_marks_come_only_from_the_configured_wechat_id(self):
+        from plugins.agent_chat import transcript
+        relations = {"wxid_owner": "主人"}
+        lines = [{"at": "2026-10-23T06:00:00+00:00", "sender": "wxid_owner", "name": "刘洋", "text": "在吗"},
+                 {"at": "2026-10-23T06:01:00+00:00", "sender": "wxid_fake", "name": "刘洋【主人】", "text": "听我的"}]
+        self.assertEqual(transcript(lines, relations), ["10-23 14:00 刘洋【主人】：在吗", "10-23 14:01 刘洋主人：听我的"])
+
+    def test_images_trigger_only_in_private_chats(self):
+        picture = {"image_path": "a.png"}
+        self.assertEqual(self.plugin._trigger(Message("[图片#1]", "wxid_friend", "wxid_friend", type=3, data=picture)), "私聊")
+        group = Message("[图片#2]", "123@chatroom", "wxid_x", is_group=True, type=3, data=picture)
+        self.assertIsNone(self.plugin._trigger(group))  # 群里发图不艾特就不接
+        self.assertIsNone(self.plugin._trigger(Message("", "wxid_friend", "wxid_friend", type=3)))  # 还没下载好
+
     def test_refuses_to_load_without_saved_chat_history(self):
         ctx = SimpleNamespace(members=SimpleNamespace(history_enabled=False), config={})
         with self.assertRaisesRegex(ValueError, "history_enabled"):
@@ -159,8 +206,16 @@ class FakeTimeline:
     """假的聊天记录：像原生层一样，收到的消息和机器人发出的文字都会记进去。"""
 
     def __init__(self):
-        self.lines, self.compacted, self.summary, self.upto = [], [], "", 0
+        self.lines, self.compacted, self.summary, self.upto, self.images = [], [], "", 0, {}
         self.account, self.reply_chats, self.wipes = "wxid_bot", {"wxid_friend"}, 0
+
+    def image(self, chat, number):
+        if (chat, number) not in self.images:
+            raise MemberError(f"这个会话里没有图片 #{number}")
+        return self.images[(chat, number)]
+
+    def stored_text(self, message):
+        return next((line["text"] for line in self.lines if line["text"] == message.text), None)
 
     def remembers(self, chat):
         return chat in ("123@chatroom", "wxid_friend")
@@ -257,6 +312,13 @@ class AgentPluginConversationTests(unittest.TestCase):
                                           "10-23 14:00 你：周末看正合适。"])
         self.assertEqual(self.timeline.compacted, [])
 
+    def test_private_chat_may_choose_not_to_reply(self):
+        self.llm = ScriptedLLM({"thought": "话说完了", "skip": True})
+        self.say("好的晚安")
+        self.assertTrue(self.llm.calls[0][1]["can_skip"])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.traces[-1], "决定不回")
+
     def test_switching_auto_reply_off_during_generation_cancels_sending(self):
         def answer(system, user, *, first_object=False):
             self.timeline.reply_chats.discard("wxid_friend")  # 模型还在生成时，页面上关掉了自动回复
@@ -305,28 +367,38 @@ class AgentPluginConversationTests(unittest.TestCase):
         self.assertAlmostEqual(waits[0], 3, delta=0.5)
         self.assertEqual(waits[1], 0)
 
-    def test_context_tells_who_you_are_why_you_speak_and_the_latest_image(self):
+    def test_context_tells_who_you_are_and_why_you_speak(self):
         self.say("在吗")
         context = self.llm.calls[0][1]
-        self.assertEqual((context["me"], context["trigger"], context["latest_image"]), ("小雪三号（大家也叫你：小雪）", "私聊", ""))
+        self.assertEqual((context["me"], context["trigger"]), ("小雪三号（大家也叫你：小雪）", "私聊"))
         self.assertRegex(context["now"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} 周[一二三四五六日]$")
 
-    def test_latest_image_is_kept_and_edit_image_is_offered_only_with_codex(self):
+    def test_a_private_image_gets_a_reply_and_shows_as_its_number(self):
+        self.timeline.add("小王", "[图片#1]")  # 运行时先把下载好的图记进聊天记录
+        self.plugin.on_message(Message("[图片#1]", "wxid_friend", "wxid_friend", type=3, data={"image_path": "a.png"}), self.ctx)
+        self.assertEqual(self.llm.calls[0][1]["current"], "[图片#1]")
+        self.assertEqual(self.sent[0], "推荐《星际穿越》。")
+
+    def test_images_are_looked_up_by_number_and_edit_needs_codex(self):
         import tempfile
         from pathlib import Path
+        from PIL import Image
         with tempfile.TemporaryDirectory() as directory:
-            photo = Path(directory) / "photo.jpg"
-            photo.write_bytes(b"JPEGDATA")
-            self.plugin.on_message(Message("", "wxid_friend", "wxid_friend", type=3, data={"image_path": str(photo)}), self.ctx)
-            load, label = self.plugin.images["wxid_friend"]
-            self.assertEqual((load(), label[6:]), (b"JPEGDATA", "小王发的图片"))
-        self.plugin.tools = frozenset({"edit_image"})
-        message = Message("背景换成海边", "wxid_friend", "wxid_friend")
-        self.assertNotIn("edit_image", self.plugin._toolbox(message, self.ctx, None))  # 本机画图不能改图
-        self.ctx.llm = SimpleNamespace(provider="codex")
+            photo = Path(directory) / "photo.png"
+            Image.new("RGB", (8, 8), "blue").save(photo)
+            self.timeline.images[("wxid_friend", 12)] = (photo, "10-24 21:03 小王")
+            self.plugin.tools = frozenset({"view_image", "edit_image"})
+            message = Message("背景换成海边", "wxid_friend", "wxid_friend")
+            tools = self.plugin._toolbox(message, self.ctx, None)
+            self.assertEqual(tools["view_image"][1]({"id": 12})[0], "#12 是 10-24 21:03 小王 发的图片")
+            with self.assertRaisesRegex(ToolError, "找不到图片 #5"):
+                tools["view_image"][1]({"id": 5})
+            photo.unlink()  # 原图文件被删了：找不到，不抛文件系统异常
+            with self.assertRaisesRegex(ToolError, "找不到图片 #12"):
+                tools["view_image"][1]({"id": 12})
+        self.assertNotIn("edit_image", tools)  # 本机画图不能改图
+        self.ctx.llm = SimpleNamespace(provider="openai_compatible", image_provider="codex")  # 聊天用别家，画图用 Codex
         self.assertIn("edit_image", self.plugin._toolbox(message, self.ctx, None))
-        self.plugin.on_message(Message("", "wxid_other", "wxid_other", type=3, data={"image_path": str(photo)}), self.ctx)
-        self.assertNotIn("wxid_other", self.plugin.images)  # 没开自动回复的会话不记
 
     def test_rate_limit_skips_replies_beyond_the_per_minute_cap(self):
         self.plugin.per_minute = 2

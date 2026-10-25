@@ -298,10 +298,12 @@ class PanelController:
             if name in ('llm', 'tts'):
                 result[name] = {key: value[key] for key in
                     ('provider', 'base_url', 'model', 'timeout_seconds', 'max_tokens', 'json_mode',
-                     'token_limit_parameter', 'extra_body', 'claude_config_dir', 'default_voice', 'max_chars_per_clip') if key in value}
+                     'token_limit_parameter', 'extra_body', 'claude_config_dir', 'image_provider', 'default_voice', 'max_chars_per_clip') if key in value}
                 if name == 'llm':
                     for key, default in (('provider', 'openai_compatible'), ('json_mode', True), ('token_limit_parameter', 'max_tokens'), ('extra_body', {})):
                         result[name].setdefault(key, default)
+                    # 没单独选过画图时与 LLMClient 的默认一致：Codex 聊天用 Codex 画，其余用本机 Z-Image。
+                    result[name].setdefault('image_provider', 'codex' if result[name]['provider'] == 'codex' else 'local')
                 result[name]['api_key_configured'] = bool(value.get('api_key'))
             else:
                 result['groups'] = list(value.get('groups', {}))
@@ -371,7 +373,7 @@ class PanelController:
                 value = read_json(paths[name])
                 saved_url = value.get('base_url')
                 fields = {'base_url', 'model', 'timeout_seconds'} | ({'provider', 'max_tokens', 'json_mode', 'token_limit_parameter', 'extra_body',
-                                                                       'claude_config_dir'} if name == 'llm'
+                                                                       'claude_config_dir', 'image_provider'} if name == 'llm'
                             else {'default_voice', 'max_chars_per_clip'})
                 for key in fields:
                     if key in data[name]:

@@ -204,8 +204,11 @@ class MemberStore:
             """)
             if "self_named" not in {row["name"] for row in db.execute("PRAGMA table_info(people)")}:
                 db.execute("ALTER TABLE people ADD COLUMN self_named INTEGER NOT NULL DEFAULT 0")
-            if "bot_generated" not in {row["name"] for row in db.execute("PRAGMA table_info(messages)")}:
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(messages)")}
+            if "bot_generated" not in columns:
                 db.execute("ALTER TABLE messages ADD COLUMN bot_generated INTEGER NOT NULL DEFAULT 0")
+            if "image" not in columns:  # 图片消息的原图路径（接收器保存的文件），文字消息为空
+                db.execute("ALTER TABLE messages ADD COLUMN image TEXT")
             if "upto" not in {row["name"] for row in db.execute("PRAGMA table_info(agent_summaries)")}:
                 db.execute("ALTER TABLE agent_summaries ADD COLUMN upto INTEGER NOT NULL DEFAULT 0")
             if "cleared_at" not in {row["name"] for row in db.execute("PRAGMA table_info(chat_settings)")}:
@@ -690,7 +693,10 @@ class MemberStore:
         return self.chat_setting(chat)
 
     def record(self, message):
-        if not self.history_enabled or message.type != 1 or not self.remembers(message.chat_id) \
+        """记一条文字或图片。图片在下载好后才分发过来，正文记成“[图片#编号]”，原图路径另存，
+        需要时智能体按编号再看；不复制原图，文件仍归接收器管。"""
+        image = message.type == 3 and message.image_path
+        if not self.history_enabled or not (message.type == 1 or image) or not self.remembers(message.chat_id) \
                 or message.is_group != message.chat_id.endswith("@chatroom"):
             return False
         if message.data.get("self_wxid", self.account) != self.account:
@@ -702,7 +708,7 @@ class MemberStore:
         else:
             validate_account(message.chat_id)
             validate_account(message.sender_id or message.chat_id)
-        if not isinstance(message.text, str) or not message.session_id:
+        if not (image or isinstance(message.text, str)) or not message.session_id:
             raise MemberError("群记录缺少正文或连接标识")
         native_name = message.data.get("sender_wechat_name")
         if native_name:
@@ -715,11 +721,33 @@ class MemberStore:
                 db.execute("INSERT OR IGNORE INTO room_members VALUES(?,?,?)",
                            (self.account, message.chat_id, message.sender_id))
             result = db.execute("""INSERT OR IGNORE INTO messages
-                (account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated) VALUES(?,?,?,?,?,?,?,?,?)""",
-                (self.account, message.chat_id, message.sender_id or message.chat_id, message.text,
+                (account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated,image) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (self.account, message.chat_id, message.sender_id or message.chat_id, "[图片]" if image else message.text,
                  self._now().astimezone(timezone.utc).isoformat(), message.session_id, message.sequence,
-                 int(message.is_self), int(bool(message.data.get("bot_generated")))))
+                 int(message.is_self), int(bool(message.data.get("bot_generated"))), str(image) if image else None))
+            if image and result.rowcount:
+                db.execute("UPDATE messages SET text=? WHERE id=?", (f"[图片#{result.lastrowid}]", result.lastrowid))
             return result.rowcount > 0
+
+    def stored_text(self, message):
+        """这条消息记在库里的正文（图片是“[图片#编号]”）；没记上返回 None。"""
+        with self._lock:
+            row = self._connection().execute(
+                "SELECT text FROM messages WHERE account=? AND room=? AND session_id=? AND sequence=? AND sequence>0",
+                (self.account, message.chat_id, message.session_id, message.sequence)).fetchone()
+            return row["text"] if row else None
+
+    def image(self, chat, number):
+        """这个会话里编号为 number 的图片：(原图路径, “10-24 21:03 小王”)。别的会话的、清空了的都找不到，
+        群里看不到私聊的图。"""
+        with self._lock:
+            row = self._connection().execute(
+                "SELECT sender_id,received_at,is_self,image FROM messages WHERE account=? AND room=? AND id=? AND image IS NOT NULL",
+                (self.account, chat, number)).fetchone()
+            if row is None:
+                raise MemberError(f"这个会话里没有图片 #{number}")
+            name = "你" if row["is_self"] else self.speaker_name(row["sender_id"], chat)
+            return Path(row["image"]), datetime.fromisoformat(row["received_at"]).astimezone(BEIJING).strftime("%m-%d %H:%M ") + name
 
     def recorded(self, message):
         """这条消息还在记录里：排队期间被清空就不在了，不再回复它。没有原生序号的无法核对，按在。"""
@@ -753,7 +781,7 @@ class MemberStore:
 
     def memory(self, chat, *, exclude=None):
         """智能体的记忆就是这个群或私聊的完整聊天记录：较早部分的摘要，加摘要之后的全部原文（按时间顺序）。
-        每条含 id、at、name（本账号说的为“你”）、text；exclude 传当前消息时不含它。重启后仍在。"""
+        每条含 id、at、sender（微信 ID）、name（本账号说的为“你”）、text；exclude 传当前消息时不含它。重启后仍在。"""
         from .summary import CONTROL
         with self._lock:
             self.rollover()
@@ -773,7 +801,7 @@ class MemberStore:
                 if row["sender_id"] not in names:
                     names[row["sender_id"]] = self.speaker_name(row["sender_id"], chat)
                 lines.append({"id": row["id"], "at": row["received_at"], "text": text[:MEMORY_LINE_CHARS],
-                              "name": "你" if row["is_self"] else names[row["sender_id"]]})
+                              "sender": row["sender_id"], "name": "你" if row["is_self"] else names[row["sender_id"]]})
             return summary, lines
 
     def memory_size(self, chat):
