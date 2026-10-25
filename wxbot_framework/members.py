@@ -768,6 +768,16 @@ class MemberStore:
             return bool(row and db.execute("""SELECT 1 FROM messages WHERE account=? AND room=? AND is_self=0
                 AND received_at>? LIMIT 1""", (self.account, message.chat_id, row[0])).fetchone())
 
+    def others_after(self, message):
+        """这条之后别人（不算发这条的人和本账号）又说了几条：插话多了，回复才需要艾特对方，免得对不上在回谁。
+        和 has_newer 一样按收到时间比，补记进来的旧消息不算。"""
+        with self._lock:
+            db = self._connection()
+            row = db.execute("SELECT received_at FROM messages WHERE account=? AND room=? AND session_id=? AND sequence=? AND sequence>0",
+                             (self.account, message.chat_id, message.session_id, message.sequence)).fetchone()
+            return db.execute("""SELECT COUNT(*) FROM messages WHERE account=? AND room=? AND is_self=0
+                AND sender_id!=? AND received_at>?""", (self.account, message.chat_id, message.sender_id, row[0])).fetchone()[0] if row else 0
+
     def _learn_mentioned_name(self, message):
         """群友互相艾特时，微信把对方在群里的显示名写进正文（“@小王\u2005”）并附上对方 ID；
         只艾特了一个人时，就把这个名字记成他的群昵称。非好友的名字微信内存里读不到，靠这样慢慢认识。"""

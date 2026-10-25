@@ -28,6 +28,7 @@ from wxbot_framework.speech import deliver_model_reply
 
 TOOLS = ("view_image", "draw_image", "edit_image", "search_history", "web_search")
 MAX_PARTS = 3
+MENTION_AFTER = 3  # 群里对方那条之后别人插了几条，回复才艾特对方；插一两句不艾特
 PRIVATE_WAIT = 5  # 私聊收到后等几秒再回，对方连发的几条合成一次回复
 # 记忆超过 MEMORY_CHARS 字时，像 Codex 的自动压缩一样，把较早部分（连同旧摘要）压成摘要，最近约 KEEP_CHARS 字保留原文。
 # 每次回复都把记忆整份发给模型：发多少只取决于这个上限，与群里聊多少无关，聊得多只会压缩得更勤。
@@ -172,8 +173,10 @@ class Plugin:
             # 像真人一样可以分几条发：空行分隔，最多三条；群里只有第一条艾特对方。
             parts = [personality_text(part.strip(), personality.name)
                      for part in re.split(r"\n\s*\n", reply) if part.strip()][:MAX_PARTS]
-            # 群里第一条艾特对方；不知道对方在群里叫什么时不艾特，免得显示成“@群友”。
-            display = self.members.display_name(message.sender_id, message.chat_id) if message.is_group else None
+            # 群里一般不艾特，像真人接话；对方那条之后别人已经插了 MENTION_AFTER 条以上，第一条才艾特对方，免得对不上在回谁。
+            # 不知道对方在群里叫什么时也不艾特，免得显示成“@群友”。
+            display = (self.members.display_name(message.sender_id, message.chat_id)
+                       if message.is_group and self.members.others_after(message) >= MENTION_AFTER else None)
             # 发出的话都会进聊天记录：群里文字由原生层回传，私聊文字在发送时补记，语音由语音模块补记。
             for index, part in enumerate(parts):
                 deliver_model_reply(ctx, message, part, display_name=display if index == 0 else None, delivery_guard=guard)

@@ -127,7 +127,7 @@
   "api_key": "YOUR_API_KEY",
   "model": "deepseek-flash",
   "timeout_seconds": 20,
-  "max_tokens": 512,
+  "max_tokens": 4096,
   "json_mode": true,
   "token_limit_parameter": "max_tokens",
   "extra_body": {}
@@ -157,7 +157,7 @@
 | --- | --- | --- |
 | `json_mode` | `true` | 发送 `response_format: {"type":"json_object"}`；接口不支持时改为 `false` |
 | `token_limit_parameter` | `max_tokens` | 可改为 `max_completion_tokens`，请求只发送选中的一种令牌参数 |
-| `max_tokens` | `512` | 上述令牌参数的数值，支持 128–4096 |
+| `max_tokens` | `4096` | 上述令牌参数的数值，支持 128–4096；是上限不是目标长度，Codex 的思考也计入，记忆压缩要输出约 1500 字摘要，太小会被截断 |
 | `extra_body` | `{}` | 可选扩展请求参数；其他兼容服务默认不发送 DeepSeek 的 `thinking` 等专属字段 |
 
 关闭 JSON 模式后，程序会通过提示词要求模型返回 JSON，并允许完整包在代码围栏中的 JSON 对象；成语接龙、总结和对话仍需要模型正确输出 JSON，普通文字不能作为结构化结果使用。网页中的这三项设置位于“大模型 → 高级选项”。

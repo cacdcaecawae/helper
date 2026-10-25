@@ -113,7 +113,7 @@ class LLMClient:
         if not self.subscription and (not isinstance(self._api_key, str) or not self._api_key.strip()):
             raise ValueError("请在大模型配置文件中填写 api_key")
         self.timeout = options.get("timeout_seconds", 20)
-        self.max_tokens = options.get("max_tokens", 512)
+        self.max_tokens = options.get("max_tokens", 4096)
         if type(self.timeout) not in (int, float) or not math.isfinite(self.timeout) or not 1 <= self.timeout <= 60:
             raise ValueError("timeout_seconds 应为 1–60 秒")
         if type(self.max_tokens) is not int or not 128 <= self.max_tokens <= 4096:

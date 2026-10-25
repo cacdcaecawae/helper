@@ -8,10 +8,10 @@ $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-# 已安装本机语音环境时后台启动 Qwen3-TTS；须在设置 PYTHONUTF8 之前启动。
+# 已安装本机语音环境时在同一窗口后台启动 Qwen3-TTS（不另开窗口，关掉本窗口会一起结束）；须在设置 PYTHONUTF8 之前启动。
 $ttsPython = Join-Path $PSScriptRoot '.venv-tts\Scripts\python.exe'
 if (Test-Path -LiteralPath $ttsPython) {
-    Start-Process -WindowStyle Minimized -FilePath $ttsPython -ArgumentList ('"' + (Join-Path $PSScriptRoot 'tools\local_tts_server.py') + '"')
+    Start-Process -NoNewWindow -FilePath $ttsPython -ArgumentList ('"' + (Join-Path $PSScriptRoot 'tools\local_tts_server.py') + '"')
 }
 $env:PYTHONUTF8 = '1'
 

@@ -259,6 +259,14 @@ class MemberTests(unittest.TestCase):
         self.assertEqual([(line["name"], line["text"]) for line in self.store.memory(friend)[1]],
                          [("小王", "推荐本书"), ("你", "推荐《白夜行》"), ("你", "我晚点看")])
 
+    def test_others_after_counts_only_other_people_after_the_message(self):
+        clock = iter(datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc) + timedelta(seconds=n) for n in range(100))
+        self.store._now = lambda: next(clock)
+        for sender, sequence in ((JING, 1), (JING, 2), (ROBOT, 3), (SMALL, 4), ("wxid_other", 5)):
+            self.store.record(self.message("随便聊", sender=sender, sequence=sequence, is_self=sender == ROBOT))
+        self.assertEqual(self.store.others_after(self.message(sender=JING, sequence=1)), 2)  # 自己追问、机器人说的都不算
+        self.assertEqual(self.store.others_after(self.message(sender=JING, sequence=99)), 0)  # 没记过的消息
+
     def test_images_are_timeline_lines_looked_up_by_number_within_their_chat(self):
         friend, photo = "wxid_friend", self.root / "photo.png"
         self.store.set_chat(friend, memory=True, reply=True)
