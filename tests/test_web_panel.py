@@ -273,6 +273,14 @@ class ControllerTests(PanelFixture):
         self.assertEqual(seen[1][1], 'https://gateway.example.test/v1/chat/completions')
         self.assertEqual(read_json(path)['api_key'], 'private-model-key')
 
+    def test_claude_code_needs_no_key_and_keeps_its_config_dir(self):
+        result = self.controller.llm_models({'provider':'claude_code', 'base_url':'https://changed.example.test/v1'})
+        self.assertEqual(result, {'models':['default', 'opus', 'sonnet', 'haiku'], 'default':'default'})
+        directory = str(self.root)
+        self.controller.save_configuration({'llm':{'provider':'claude_code', 'model':'sonnet', 'claude_config_dir':directory}})
+        saved = self.controller.configuration()['llm']
+        self.assertEqual((saved['provider'], saved['model'], saved['claude_config_dir']), ('claude_code', 'sonnet', directory))
+
     def test_compatible_llm_options_round_trip_without_changing_saved_key(self):
         path = self.root/'llm_config.json'
         original = read_json(path)

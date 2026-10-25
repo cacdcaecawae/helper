@@ -233,18 +233,19 @@ async function loadConfig() {
 let modelRequest = 0;
 async function loadModels(switched = false) {
   const f = $('#llm-form').elements, select = $('#llm-model-select'), hint = $('#llm-model-hint');
-  const codex = f.provider.value === 'codex', request = ++modelRequest;
+  // 订阅登录（Codex、Claude Code）不用接口地址和密钥，只能选列表里的模型。
+  const subscription = ['codex','claude_code'].includes(f.provider.value), request = ++modelRequest;
   $('#llm-form').dataset.provider = f.provider.value;
-  f.base_url.disabled = f.api_key.disabled = codex;
+  f.base_url.disabled = f.api_key.disabled = subscription;
   select.innerHTML = '<option value="">正在获取模型列表…</option>'; hint.textContent = '';
   let models = [], preferred = '';
   try { ({models, default:preferred} = await api('llm-models', {provider:f.provider.value, base_url:f.base_url.value, api_key:f.api_key.value})); }
   catch (error) { if (request === modelRequest) hint.textContent = error.message; }
   if (request !== modelRequest) return;
-  // Codex 只接受列表内的模型；兼容接口保留列表外的自定义模型名，切换接入方式时选第一个。
+  // 订阅登录只接受列表内的模型；兼容接口保留列表外的自定义模型名，切换接入方式时选第一个。
   const current = f.model.value.trim();
   const fallback = models.includes(preferred) ? preferred : models[0];
-  const value = models.includes(current) ? current : models.length && (codex || switched || !current) ? fallback : '';
+  const value = models.includes(current) ? current : models.length && (subscription || switched || !current) ? fallback : '';
   select.innerHTML = models.map(m => `<option>${escape(m)}</option>`).join('') + '<option value="">手动填写…</option>';
   select.value = value;
   if (value) f.model.value = value;

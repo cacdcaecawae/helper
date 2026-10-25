@@ -1,4 +1,4 @@
-"""通过配置接入 OpenAI 兼容接口或本机 Codex 登录，不记录密钥或聊天正文。"""
+"""通过配置接入 OpenAI 兼容接口、本机 Codex 登录或本机 Claude Code 登录，不记录密钥或聊天正文。"""
 from __future__ import annotations
 
 import base64
@@ -8,6 +8,9 @@ import math
 import os
 from ipaddress import ip_address
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -29,6 +32,7 @@ class LLMError(RuntimeError):
 CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_DEFAULT_MODEL = "gpt-6.1-sol"
 CODEX_DEFAULT_REASONING = {"effort": "medium"}
+CLAUDE_MODELS = ("default", "opus", "sonnet", "haiku")  # default：不传 --model，由 Claude Code 按订阅选
 
 
 def image_data_url(data):
@@ -52,8 +56,14 @@ class LLMClient:
         if not isinstance(options, dict):
             raise ValueError("大模型配置必须是 JSON 对象")
         self.provider = options.get("provider", "openai_compatible")
-        if self.provider not in ("openai_compatible", "codex"):
-            raise ValueError("provider 应为 openai_compatible 或 codex")
+        if self.provider not in ("openai_compatible", "codex", "claude_code"):
+            raise ValueError("provider 应为 openai_compatible、codex 或 claude_code")
+        # 订阅登录：Codex 读 ~/.codex，Claude Code 由 claude 命令自己读配置目录里的登录，都不用 API 密钥。
+        self.subscription = self.provider in ("codex", "claude_code")
+        directory = options.get("claude_config_dir") or str(Path.home() / ".claude")
+        if not isinstance(directory, str) or "\0" in directory or not Path(directory).is_absolute():
+            raise ValueError("claude_config_dir 应为 Claude 配置目录的完整路径，例如 C:\\Users\\你\\.claude")
+        self.claude_config_dir = Path(directory)
         base_url = options.get("base_url", "https://api.deepseek.com")
         if not isinstance(base_url, str):
             raise ValueError("大模型 base_url 必须是接口地址字符串")
@@ -77,11 +87,11 @@ class LLMClient:
                          else self.base_url + "/chat/completions")
         self._deepseek_official = (parsed.scheme == "https" and parsed.hostname == "api.deepseek.com"
                                   and parsed.port in (None, 443))
-        self.model = options.get("model", CODEX_DEFAULT_MODEL if self.provider == "codex" else "deepseek-flash")
+        self.model = options.get("model", {"codex": CODEX_DEFAULT_MODEL, "claude_code": "default"}.get(self.provider, "deepseek-flash"))
         self._api_key = options.get("api_key", "")
         if not isinstance(self.model, str) or not self.model.strip():
             raise ValueError("大模型 model 不能为空")
-        if self.provider != "codex" and (not isinstance(self._api_key, str) or not self._api_key.strip()):
+        if not self.subscription and (not isinstance(self._api_key, str) or not self._api_key.strip()):
             raise ValueError("请在大模型配置文件中填写 api_key")
         self.timeout = options.get("timeout_seconds", 20)
         self.max_tokens = options.get("max_tokens", 512)
@@ -135,6 +145,8 @@ class LLMClient:
         try:
             if self.provider == "codex":
                 return self._parse_json(self._codex_text(system, user), allow_fenced, first_object)
+            if self.provider == "claude_code":  # 没有 JSON 模式，靠提示词并容忍代码围栏
+                return self._parse_json(self._claude(system + json_instruction, user), True, first_object)
             for attempt in range(2):
                 request = Request(self.endpoint,
                                   data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -191,7 +203,9 @@ class LLMClient:
         return data
 
     def list_models(self):
-        """可选模型 ID：Codex 读本机 models_cache.json（Codex 自己维护），兼容接口请求标准 /models。"""
+        """可选模型 ID：Codex 读本机 models_cache.json（Codex 自己维护），Claude Code 用它认的别名，兼容接口请求标准 /models。"""
+        if self.provider == "claude_code":
+            return list(CLAUDE_MODELS)
         if self.provider == "codex":
             try:
                 models = json.loads((_codex_home() / "models_cache.json").read_text(encoding="utf-8-sig"))["models"]
@@ -221,9 +235,12 @@ class LLMClient:
             raise LLMError("该接口没有提供标准模型列表，请手动填写模型名称") from None
 
     def web_search(self, query):
-        """用 Codex 后端自带的联网搜索回答问题，返回带来源的简短摘要；仅 Codex 接入方式可用。"""
+        """用 Codex 后端或 Claude Code 自带的联网搜索回答问题，返回带来源的简短摘要；仅这两种订阅登录可用。"""
+        if self.provider == "claude_code":  # 只放开 WebSearch 这一个工具
+            return self._claude("联网搜索后用不超过 300 字的中文回答，列出关键事实和来源网站名；搜不到就直说。",
+                                query, tools="WebSearch")
         if self.provider != "codex":
-            raise LLMError("联网搜索需要使用本机 Codex 登录")
+            raise LLMError("联网搜索需要使用本机 Codex 或 Claude Code 登录")
         return self._codex_stream({"tools": [{"type": "web_search"}], "max_output_tokens": 2048, "input": [
             {"type": "message", "role": "developer", "content": [{"type": "input_text", "text":
                 "联网搜索后用不超过 300 字的中文回答，列出关键事实和来源网站名；搜不到就直说。"}]},
@@ -238,6 +255,41 @@ class LLMClient:
             content.append({"type": "input_image", "image_url": image_data_url(image)})
         return self._codex_stream({"tools": [{"type": "image_generation"}], "tool_choice": {"type": "image_generation"},
                                    "input": [{"type": "message", "role": "user", "content": content}]}, image=True)
+
+    def _claude(self, system, user, *, tools=""):
+        """调用本机 Claude Code（claude -p）：你自己的订阅登录、未修改的官方程序，用量算在订阅额度里。
+        关掉内置工具、个人设置（插件、钩子）、MCP 和会话记录，在空目录里运行，模型碰不到本机文件；
+        正文走标准输入。不能用 --bare：它只认 API 密钥，不读订阅登录。"""
+        program = shutil.which("claude")
+        if program is None:
+            raise LLMError("没有找到 claude 命令，请先安装 Claude Code 并登录")
+        if not self.claude_config_dir.is_dir():
+            raise LLMError("找不到 Claude 配置目录，请在模型设置里核对路径")
+        command = [program, "-p", "--output-format", "json", "--tools", tools, "--setting-sources", "",
+                   "--strict-mcp-config", "--no-session-persistence", "--system-prompt", system]
+        if tools:
+            command += ["--allowedTools", tools]
+        if self.model != "default":
+            command += ["--model", self.model]
+        try:
+            with tempfile.TemporaryDirectory(prefix="helper-claude-") as directory:
+                result = subprocess.run(command, input=user.encode("utf-8"), capture_output=True, cwd=directory,
+                                        env=dict(os.environ, CLAUDE_CONFIG_DIR=str(self.claude_config_dir)),
+                                        timeout=max(self.timeout, 120),  # 每次都要启动程序，比直连接口慢
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired:
+            raise LLMError("Claude Code 响应超时，请稍后再试") from None
+        except OSError:
+            raise LLMError("无法启动 claude 命令，请在本机运行一次 claude 检查安装") from None
+        try:
+            data = json.loads(result.stdout.decode("utf-8"))
+            text = data["result"]
+        except (ValueError, KeyError, TypeError):
+            raise LLMError("Claude Code 没有返回有效结果，请在本机运行一次 claude 检查登录") from None
+        if data.get("is_error") or not isinstance(text, str) or not text.strip():
+            # 例如额度用完、账号暂停：原文只进日志和聊天页过程，不会发到群里。
+            raise LLMError("Claude Code 返回错误：" + str(text).strip()[:200])
+        return text
 
     def _codex_text(self, system, user):
         payload = {"max_output_tokens": self.max_tokens,

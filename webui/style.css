@@ -250,7 +250,8 @@ input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px;
 .model-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-6); align-items: start; }
 .key-state { display: inline-block; margin-left: var(--space-2); font-size: 13px; color: var(--accent-text); }
 .key-state.missing { color: var(--warning); }
-#llm-form[data-provider="codex"] .openai-only { display: none; }
+#llm-form[data-provider="codex"] .openai-only, #llm-form[data-provider="claude_code"] .openai-only,
+#llm-form:not([data-provider="claude_code"]) .claude-only { display: none; }
 .model-picker { display: flex; gap: var(--space-2); align-items: flex-end; }
 .model-picker select { flex: 1; min-width: 0; }
 .model-picker button { min-height: 36px; flex-shrink: 0; }

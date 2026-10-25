@@ -214,6 +214,6 @@ class Plugin:
             tools["edit_image"] = edit_tool(ctx.llm, latest[0], send)
         if "search_history" in self.tools:
             tools["search_history"] = history_tool(self.members, message.chat_id)
-        if "web_search" in self.tools and codex:
+        if "web_search" in self.tools and getattr(ctx.llm, "provider", "") in ("codex", "claude_code"):
             tools["web_search"] = search_tool(ctx.llm)
         return tools

@@ -237,6 +237,71 @@ class LLMTests(unittest.TestCase):
                 self.client.complete_json("JSON", "测试")
 
 
+class ClaudeCodeTests(unittest.TestCase):
+    """claude -p 用模拟的命令输出测试，不真正启动 Claude Code、不消耗额度。"""
+
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        self.client = LLMClient({"provider": "claude_code", "claude_config_dir": self.home.name})
+        which = patch("wxbot_framework.llm.shutil.which", return_value="C:/fake/claude.exe")
+        which.start()
+        self.addCleanup(which.stop)
+
+    def run_with(self, result, call, *args, **kwargs):
+        import subprocess
+        output = subprocess.CompletedProcess([], 0, json.dumps(result).encode("utf-8"), b"")
+        with patch("wxbot_framework.llm.subprocess.run", return_value=output) as run:
+            value = call(*args, **kwargs)
+        return value, run.call_args
+
+    def test_runs_claude_print_isolated_with_your_own_login(self):
+        value, call = self.run_with({"type": "result", "is_error": False, "result": '```json\n{"reply":"你好"}\n```'},
+                                    self.client.complete_json, "只返回 JSON", "中文正文")
+        self.assertEqual(value, {"reply": "你好"})
+        command = call.args[0]
+        self.assertEqual(command[:4], ["C:/fake/claude.exe", "-p", "--output-format", "json"])
+        for flag, expected in (("--tools", ""), ("--setting-sources", "")):  # 关掉内置工具和个人设置（插件、钩子）
+            self.assertEqual(command[command.index(flag) + 1], expected)
+        self.assertIn("--strict-mcp-config", command)
+        self.assertIn("--no-session-persistence", command)
+        self.assertNotIn("--bare", command)  # --bare 不读订阅登录
+        self.assertNotIn("--model", command)  # default：由 Claude Code 按订阅选
+        self.assertTrue(command[command.index("--system-prompt") + 1].startswith("只返回 JSON"))
+        self.assertEqual(call.kwargs["input"], "中文正文".encode("utf-8"))  # 正文走标准输入
+        self.assertEqual(call.kwargs["env"]["CLAUDE_CONFIG_DIR"], self.home.name)
+        self.assertIn("helper-claude-", call.kwargs["cwd"])  # 空的临时目录
+        self.assertEqual(self.client.list_models(), ["default", "opus", "sonnet", "haiku"])
+        sonnet = LLMClient({"provider": "claude_code", "claude_config_dir": self.home.name, "model": "sonnet"})
+        _, call = self.run_with({"is_error": False, "result": '{"reply":"x"}'}, sonnet.complete_json, "s", "u")
+        self.assertEqual(call.args[0][call.args[0].index("--model") + 1], "sonnet")
+
+    def test_web_search_only_opens_the_web_search_tool(self):
+        value, call = self.run_with({"is_error": False, "result": "北京今天晴"}, self.client.web_search, "北京天气")
+        command = call.args[0]
+        self.assertEqual(value, "北京今天晴")
+        self.assertEqual((command[command.index("--tools") + 1], command[command.index("--allowedTools") + 1]),
+                         ("WebSearch", "WebSearch"))
+
+    def test_errors_become_llm_errors(self):
+        with self.assertRaisesRegex(LLMError, "account is on hold"):
+            self.run_with({"is_error": True, "result": "Your account is on hold"}, self.client.complete_json, "s", "u")
+        import subprocess
+        with patch("wxbot_framework.llm.subprocess.run", return_value=subprocess.CompletedProcess([], 1, b"not json", b"")):
+            with self.assertRaisesRegex(LLMError, "没有返回有效结果"):
+                self.client.complete_json("s", "u")
+        with patch("wxbot_framework.llm.subprocess.run", side_effect=subprocess.TimeoutExpired("claude", 120)):
+            with self.assertRaisesRegex(LLMError, "超时"):
+                self.client.complete_json("s", "u")
+        with patch("wxbot_framework.llm.shutil.which", return_value=None), self.assertRaisesRegex(LLMError, "没有找到 claude"):
+            self.client.complete_json("s", "u")
+        missing = LLMClient({"provider": "claude_code", "claude_config_dir": str(Path(self.home.name) / "missing")})
+        with self.assertRaisesRegex(LLMError, "配置目录"):
+            missing.complete_json("s", "u")
+        with self.assertRaises(ValueError):
+            LLMClient({"provider": "claude_code", "claude_config_dir": "relative/.claude"})
+
+
 class CodexTests(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.TemporaryDirectory()

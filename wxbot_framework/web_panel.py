@@ -297,7 +297,7 @@ class PanelController:
             if name in ('llm', 'tts'):
                 result[name] = {key: value[key] for key in
                     ('provider', 'base_url', 'model', 'timeout_seconds', 'max_tokens', 'json_mode',
-                     'token_limit_parameter', 'extra_body', 'default_voice', 'max_chars_per_clip') if key in value}
+                     'token_limit_parameter', 'extra_body', 'claude_config_dir', 'default_voice', 'max_chars_per_clip') if key in value}
                 if name == 'llm':
                     for key, default in (('provider', 'openai_compatible'), ('json_mode', True), ('token_limit_parameter', 'max_tokens'), ('extra_body', {})):
                         result[name].setdefault(key, default)
@@ -316,14 +316,15 @@ class PanelController:
         key = data.get('api_key', '')
         if isinstance(key, str) and key.strip():
             options['api_key'] = key.strip()
-        elif options.get('provider') != 'codex' and options.get('base_url') != saved.get('base_url'):
+        elif options.get('provider') not in ('codex', 'claude_code') and options.get('base_url') != saved.get('base_url'):
             # 页面改地址会自动拉列表；已保存的密钥只发给保存时的地址，防止发到新填（可能填错）的地址。
             raise PanelError('接口地址已更改，请先填写该地址的 API 密钥再获取模型列表')
         options['model'] = options.get('model') or 'list-only'
         from .llm import CODEX_DEFAULT_MODEL, LLMClient, LLMError
         try:
             client = LLMClient(options)
-            return {'models': client.list_models(), 'default': CODEX_DEFAULT_MODEL if client.provider == 'codex' else None}
+            return {'models': client.list_models(),
+                    'default': {'codex': CODEX_DEFAULT_MODEL, 'claude_code': 'default'}.get(client.provider)}
         except (LLMError, ValueError) as error:  # 配置不完整时 LLMClient 抛 ValueError
             raise PanelError(str(error)) from None
 
@@ -368,7 +369,8 @@ class PanelController:
                     raise PanelError('模型配置格式不正确')
                 value = read_json(paths[name])
                 saved_url = value.get('base_url')
-                fields = {'base_url', 'model', 'timeout_seconds'} | ({'provider', 'max_tokens', 'json_mode', 'token_limit_parameter', 'extra_body'} if name == 'llm'
+                fields = {'base_url', 'model', 'timeout_seconds'} | ({'provider', 'max_tokens', 'json_mode', 'token_limit_parameter', 'extra_body',
+                                                                       'claude_config_dir'} if name == 'llm'
                             else {'default_voice', 'max_chars_per_clip'})
                 for key in fields:
                     if key in data[name]:
